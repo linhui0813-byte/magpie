@@ -1,0 +1,61 @@
+{
+  "summary": "供应商页多了 Google Vertex AI 预设：添加面板里选中它，编辑器用「项目 ID / 位置 / 凭据文件 / 服务账号」四栏取代 API 密钥，未填项目 ID 时保存被拒，填好后下方的「端点」显示该项目与位置对应的地址；列表里该供应商的徽标显示签名用的凭据（服务账号、凭据文件或 Google 默认凭据）。用量「请求」列表也把 Gemini 的 streamGenerateContent 请求标为 Gemini。",
+  "scenes": [
+    {
+      "title": "添加 Google Vertex AI 供应商",
+      "shots": [
+        {
+          "file": "01-add-sheet.png",
+          "caption": "添加面板中的预设列表",
+          "width": 2496
+        },
+        {
+          "file": "02-vertex-editor.png",
+          "caption": "Google Vertex AI 的编辑器：项目 ID、位置、凭据文件、服务账号",
+          "width": 1296
+        },
+        {
+          "file": "03-vertex-needs-project.png",
+          "caption": "点「添加」之后的编辑器",
+          "width": 1296
+        },
+        {
+          "file": "04-vertex-endpoints.png",
+          "caption": "填入项目 ID 后编辑器下方的「端点」",
+          "width": 1120
+        },
+        {
+          "file": "05-provider-row.png",
+          "caption": "添加后的供应商列表",
+          "width": 2496
+        }
+      ]
+    },
+    {
+      "title": "用量「请求」列表的协议标记",
+      "shots": [
+        {
+          "file": "06-requests-protocol.png",
+          "caption": "「请求」列表：每行「供应商 · 账号」旁的协议标记",
+          "width": 2560
+        },
+        {
+          "file": "07-requests-proto-detail.png",
+          "caption": "列表首行的协议标记与「实际模型」列",
+          "width": 2560
+        }
+      ]
+    }
+  ],
+  "video": "preview.mp4",
+  "poster": "poster.png",
+  "errors": [
+    "用量「请求」列表的协议标记 · shot #usagePane: nothing visible matches #usagePane (1 in the page)"
+  ],
+  "leak": false,
+  "skipped": null,
+  "mismatch": "",
+  "unseen": "沙箱里没有 Google 凭据，也没有已存在的 google-vertex 供应商，因此用令牌签名的真实请求、徽标显示服务账号或凭据文件（以及没有项目时的「需要项目」徽标）、用量里 Vertex 的端点名，以及 CLI/TUI（`magpie provider add google-vertex`、TUI 的 `a`）都看不到；「请求」列表里是否出现 Gemini 标记，取决于种子日志里是否真有 streamGenerateContent 的请求。",
+  "interactive": true,
+  "pages": 2
+}

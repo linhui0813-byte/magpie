@@ -1,0 +1,29 @@
+{
+  "summary": "app.js 的 pluginMethod 在「已迁移的内置 Agent、其插件提供多种登录方式、又没有可区分它们的 site 标签」时不再固定返回 0，而是返回 undefined，让 startPluginSignIn 弹出登录方式选择器；site 命中的方式与只有一种方式的插件行为不变。",
+  "scenes": [
+    {
+      "title": "供应商面板中的登录方式位置",
+      "shots": [
+        {
+          "file": "01-providers-list.png",
+          "caption": "供应商页面：沙盒里只有 DeepSeek 一个供应商",
+          "width": 2560
+        },
+        {
+          "file": "02-provider-editor.png",
+          "caption": "供应商面板的账号区——提供多种登录方式的内置插件，每种方式会在这里依次列出",
+          "width": 2560
+        }
+      ]
+    }
+  ],
+  "video": "preview.mp4",
+  "poster": "poster.png",
+  "errors": [],
+  "leak": false,
+  "skipped": null,
+  "mismatch": "",
+  "unseen": "登录方式选择器只在「已迁移的内置 Agent 的插件提供多种登录方式」时出现（如 WorkBuddy 的 browser 与 desktop 两种 sign-in）。沙盒里只有 DeepSeek 一个供应商、没有任何插件 provider，也没有这类 Agent，所以选择器本身无法真实弹出，只能展示它会出现的那个位置（供应商面板的账号区）。",
+  "interactive": true,
+  "pages": 1
+}

@@ -1,0 +1,47 @@
+{
+  "summary": "供应商编辑器里每个模型那一行，在「Accepts images」旁新增了一个「Searches the web by itself」勾选（是否由供应商自己回答联网搜索），答案按 <provider>/<model> 存进设置的 modelSearches，随 Save 提交、随「恢复默认」清掉，与图片的处理一致；「恢复默认」的提示文案也一并更新（中文/日文/德文）。",
+  "scenes": [
+    {
+      "title": "模型行里的联网搜索答案",
+      "shots": [
+        {
+          "file": "01-provider-editor.png",
+          "caption": "Sub2API Relay 的编辑器",
+          "width": 2560
+        },
+        {
+          "file": "02-model-prefs.png",
+          "caption": "「名称与推理档位」：每个模型一行，行内是名称、推理档位、图片和联网搜索",
+          "width": 2560
+        },
+        {
+          "file": "03-model-row.png",
+          "caption": "模型行：Accepts images 旁多了 Searches the web by itself",
+          "width": 1120
+        },
+        {
+          "file": "04-model-search-tick.png",
+          "caption": "Sub2API Relay 的 gpt-5.5 行：图片勾选旁多出的「自己能联网搜索」",
+          "width": 1120
+        },
+        {
+          "file": "05-model-search-ticked.png",
+          "caption": "勾选后这一行，行尾多出未保存的改动标记",
+          "width": 1120
+        }
+      ]
+    }
+  ],
+  "video": "preview.mp4",
+  "poster": "poster.png",
+  "errors": [
+    "模型行里的联网搜索答案 · scroll : nothing visible matches div.mname (0 in the page)",
+    "模型行里的联网搜索答案 · click label: nothing visible matches label with \"Searches the web by itself\" (0 in the page)"
+  ],
+  "leak": false,
+  "skipped": null,
+  "mismatch": "描述说这个答案点一下即通过 POST /api/provider/search 立即生效，但界面代码里这个勾选只改编辑器的草稿（prefs[id].search / ownSearch），要按 Save 才写进设置，app.js 里没有任何地方调用该接口；此外描述里的 <provider id>/*（整个供应商的答案）在界面上没有入口，只能改设置文件。",
+  "unseen": "勾选之后的实际路由——请求里的联网搜索是原样交给供应商，还是改由 magpie 用自己的代搜模型发出——界面不显示，要真实客户端发出 WebSearch/web_search 请求并看网关与供应商两端才看得出来，沙盒里没有这样的请求。",
+  "interactive": true,
+  "pages": 1
+}

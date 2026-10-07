@@ -1,0 +1,62 @@
+{
+  "summary": "本机预设（Ollama、LM Studio、oMLX）的添加/编辑编辑器在密钥下方新增折叠的「服务器地址」一节，可填别的端口或另一台电脑的地址：端点预览随输入变化，地址非法时报错并聚焦该字段；同时 LM Studio / oMLX 的预设说明从「:1234 / :8000」改为「默认端口 1234 / 8000」。",
+  "scenes": [
+    {
+      "title": "新增 Ollama 时填写服务器地址",
+      "shots": [
+        {
+          "file": "01-add-sheet.png",
+          "caption": "添加供应商面板里的预设",
+          "width": 2560
+        },
+        {
+          "file": "02-editor-address-folded.png",
+          "caption": "新增 Ollama 的编辑器：密钥下方折叠的「服务器地址」",
+          "width": 1296
+        },
+        {
+          "file": "03-editor-address-folded.png",
+          "caption": "新增 Ollama 的编辑器：密钥下方折叠的「服务器地址」",
+          "width": 1296
+        },
+        {
+          "file": "04-address-open.png",
+          "caption": "展开后的地址输入框与提示",
+          "width": 1296
+        },
+        {
+          "file": "05-address-typed.png",
+          "caption": "填入 192.168.1.5:11434 之后的编辑器",
+          "width": 1296
+        },
+        {
+          "file": "06-endpoints-follow.png",
+          "caption": "端点预览",
+          "width": 1120
+        }
+      ]
+    },
+    {
+      "title": "地址不是地址时新增被拒",
+      "shots": [
+        {
+          "file": "07-address-refused.png",
+          "caption": "填 ftp://box 后按「添加」的编辑器",
+          "width": 1296
+        }
+      ]
+    }
+  ],
+  "video": "preview.mp4",
+  "poster": "poster.png",
+  "errors": [
+    "新增 Ollama 时填写服务器地址 · click details.more summary: nothing visible matches details.more summary (0 in the page)",
+    "地址不是地址时新增被拒 · click button#addProvider: nothing visible matches button#addProvider (1 in the page)"
+  ],
+  "leak": false,
+  "skipped": null,
+  "mismatch": "",
+  "unseen": "沙盒里没有保存过任何本机预设（Ollama / LM Studio / oMLX）供应商（只有 DeepSeek、Sub2API Relay、Acme Cloud、Codex），因此「编辑已保存的本机供应商」时的地址预填、非默认地址时默认展开，以及 Test / Refresh 使用新地址后再保存这些只能在已有本机预设时看到；保存后 URL 是否真的移到新地址（以及只在地址变化时才发送）也无法在这里验证。",
+  "interactive": true,
+  "pages": 1
+}

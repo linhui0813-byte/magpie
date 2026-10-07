@@ -1,0 +1,46 @@
+{
+  "summary": "「设置 → 同步与备份」把 GitHub 加入为第三种同步后端：未开启时该行名称改为「WebDAV / S3 / GitHub 同步」，编辑表单的「同步到」多了 GitHub 选项，选中后出现仓库、分支、文件夹、GitHub Token 四个字段及说明（含中/日/德翻译），已保存的非当前后端设置继续保留。",
+  "scenes": [
+    {
+      "title": "同步与备份表单里的 GitHub",
+      "shots": [
+        {
+          "file": "01-sync-row-off.png",
+          "caption": "未开启同步时的同步与备份一行",
+          "width": 2492
+        },
+        {
+          "file": "02-sync-form-webdav.png",
+          "caption": "表单打开时「同步到」的选项与字段",
+          "width": 2492
+        },
+        {
+          "file": "03-github-fields.png",
+          "caption": "选中 GitHub 后出现的仓库、分支、文件夹与 Token 字段",
+          "width": 2492
+        }
+      ]
+    },
+    {
+      "title": "GitHub 表单的输入校验",
+      "shots": [
+        {
+          "file": "04-github-repo-validation.png",
+          "caption": "仓库名不合法时表单下方显示的内容",
+          "width": 2492
+        }
+      ]
+    }
+  ],
+  "video": "preview.mp4",
+  "poster": "poster.png",
+  "errors": [
+    "GitHub 表单的输入校验 · click #syncList .sync-form .segs .opt: nothing visible matches #syncList .sync-form .segs .opt with \"GitHub\" (0 in the page)"
+  ],
+  "leak": false,
+  "skipped": null,
+  "mismatch": "描述里说可在界面上完成恢复（restore）、撤销（undo）、自动/手动同步与可选用量共享——diff 只在命令行（magpie github restore/undo/auto）和后台加了这些，Settings 里没有新增恢复、撤销或同步间隔的控件；界面新增的只有 GitHub 表单项和同步行的名称。",
+  "unseen": "真实的 GitHub 同步本身（首次同步初始化空仓库、提交加密备份、Token 权限不足或分支不存在的报错、同步状态）需要真实的 GitHub 仓库和 Token，沙盒没有配置 GitHub 同步，只能展示表单和输入校验，无法展示一次成功的同步或提交历史。",
+  "interactive": true,
+  "pages": 1
+}

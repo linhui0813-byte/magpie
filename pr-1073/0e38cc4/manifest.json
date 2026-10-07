@@ -1,0 +1,44 @@
+{
+  "summary": "这个 PR 只改了服务端校验：设置里 Codex 会话标题、图像识别、图像生成三个模型选择在保存时，改为按各自选择器实际列出的模型（provider.Served / gateway.Drawers）来检查，选到已不再提供的模型会返回 400 并保留原值。界面上没有新增控件或页面，变化在于可保存的模型范围与拒绝保存的行为。",
+  "scenes": [
+    {
+      "title": "Codex 会话标题的模型选择",
+      "shots": [
+        {
+          "file": "01-settings-codex-titles.png",
+          "caption": "设置「常规」中的 Codex 会话标题一行与它当前的选择",
+          "width": 2492
+        },
+        {
+          "file": "02-codex-titles-picker.png",
+          "caption": "点开后列出的可选模型",
+          "width": 2560
+        }
+      ]
+    },
+    {
+      "title": "模型标签页里的图像模型选择",
+      "shots": [
+        {
+          "file": "03-settings-models-tab.png",
+          "caption": "设置「模型」标签页",
+          "width": 2560
+        },
+        {
+          "file": "04-settings-models-tab-lower.png",
+          "caption": "「模型」标签页向下滚动后的内容",
+          "width": 2560
+        }
+      ]
+    }
+  ],
+  "video": "preview.mp4",
+  "poster": "poster.png",
+  "errors": [],
+  "leak": false,
+  "skipped": null,
+  "mismatch": "描述里说「设置页每次保存都会重新提交自己的选择」，但 diff 只改了 internal/gui/api.go 的校验（外加文档与测试），没有改设置页的提交逻辑，也没有新增任何设置项、页面、按钮或专门的错误提示控件——被拒绝时沿用的是现有的报错方式，视频里看不到新的提示 UI。",
+  "unseen": "沙盒里的供应商都在正常提供各自模型，也没有「先选过、之后被供应商改名/下架」的历史选择，因此新的 400 拒绝（no model … to describe images / to generate images / to write Codex's titles）无法在这里触发；能展示的只是这些校验所对应的三个模型选择器本身。",
+  "interactive": true,
+  "pages": 1
+}

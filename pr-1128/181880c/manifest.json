@@ -1,0 +1,29 @@
+{
+  "summary": "这个 PR 给 magpie 内置的 Agent 列表里新增了一个 Agent「Bub」（~/.bub/config.yml），它会像其他 Agent 一样出现在 Agents 页的已接入列表里，带 model（写成 magpie:<provider>/<model>）和 effort 两个可选字段，并配有 Bub 的图标。",
+  "scenes": [
+    {
+      "title": "Agent 页：已接入列表与未安装 Agent 清单",
+      "shots": [
+        {
+          "file": "01-agents-list.png",
+          "caption": "展开后的 Agent 页列表",
+          "width": 2496
+        },
+        {
+          "file": "02-agents-install.png",
+          "caption": "未安装 Agent 的清单",
+          "width": 2496
+        }
+      ]
+    }
+  ],
+  "video": "preview.mp4",
+  "poster": "poster.png",
+  "errors": [],
+  "leak": false,
+  "skipped": null,
+  "mismatch": "",
+  "unseen": "沙盒里没有装 Bub（HOME 下没有 ~/.bub，PATH 上也没有 bub），所以 Bub 的已接入行、它的 model / effort 选择菜单、旧版 Bub 被拒绝时和 Check 报告配置漂移时的提示都无法出现；只能在 Agents 页上指认它会出现在哪里。",
+  "interactive": true,
+  "pages": 1
+}

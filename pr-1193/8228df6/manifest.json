@@ -1,0 +1,49 @@
+{
+  "summary": "让网关页的「网关密钥」区块在未开启局域网共享时也一直显示，并在设置 →「网络与共享」的共享开关旁加上跳转到网关密钥的入口；没有已启用密钥时开启共享会被拒绝并给出创建提示（含中/日/德翻译）。切换共享本身不再创建、轮换或重新启用任何网关密钥。",
+  "scenes": [
+    {
+      "title": "没有密钥时开启局域网共享",
+      "shots": [
+        {
+          "file": "01-network-share-row.png",
+          "caption": "「网络与共享」里的局域网共享开关与「网关密钥」入口",
+          "width": 2496
+        },
+        {
+          "file": "02-share-without-enabled-key.png",
+          "caption": "在还没有已启用的网关密钥时点击「开启」后的设置页",
+          "width": 2560
+        },
+        {
+          "file": "03-gateway-after-link.png",
+          "caption": "从「网络与共享」跳到网关页面后的样子",
+          "width": 2496
+        }
+      ]
+    },
+    {
+      "title": "共享关闭时的网关密钥区块",
+      "shots": [
+        {
+          "file": "04-gateway-keys-before-sharing.png",
+          "caption": "局域网共享未开启时的网关页面与「网关密钥」区块",
+          "width": 2496
+        },
+        {
+          "file": "05-gateway-key-draft.png",
+          "caption": "点击「添加网关密钥」后的网关密钥区块",
+          "width": 2496
+        }
+      ]
+    }
+  ],
+  "video": "preview.mp4",
+  "poster": "poster.png",
+  "errors": [],
+  "leak": false,
+  "skipped": null,
+  "mismatch": "",
+  "unseen": "沙盒里目前一个网关密钥都没有：切换共享时保留已有密钥的名称/凭据/ID/启用状态、停用或已删除的默认密钥不被重新创建、遗留凭据的迁移与吊销标记不被重置、以及旧 newKey 请求不再轮换密钥，这些行为在界面上都看不出来；能看到的只有「共享关闭时仍显示网关密钥区块」和「没有已启用密钥时开启共享被拒绝」两条。",
+  "interactive": true,
+  "pages": 2
+}

@@ -1,0 +1,14 @@
+<!doctype html><html lang="zh"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>#1093 界面预览 · 48a6a86</title>
+<style>:root{color-scheme:light dark;--bg:#f6f6f7;--fg:#1d1d1f;--muted:#6e6e73;--card:#fff;--line:#e5e5ea}
+@media (prefers-color-scheme:dark){:root{--bg:#111113;--fg:#f2f2f4;--muted:#9a9aa0;--card:#1c1c1f;--line:#2c2c30}}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.6 -apple-system,"Segoe UI","PingFang SC","Noto Sans CJK SC",sans-serif}
+main{max-width:1100px;margin:0 auto;padding:28px 16px 60px}h1{font-size:20px;margin:0 0 4px}.m{color:var(--muted);font-size:13px;margin:0 0 20px}
+video,img{display:block;width:100%;border-radius:10px;border:1px solid var(--line);background:var(--card)}figure{margin:0 0 28px}figcaption{color:var(--muted);font-size:13px;margin-top:8px}
+a{color:inherit}</style>
+<main><h1>#1093 界面预览</h1><p class="m">commit 48a6a86 · <a href="https://github.com/yetone/magpie/pull/1093">回到 PR</a> · 保存路由组时不再同步等待一次供应商额度读取（Codex 的账号状态改为只读已缓存的值），保存变快；保存后编辑器收起时，刚保存的那一行会被滚回视野，而不是留在列表底部。</p>
+<figure><video src="preview.mp4" controls autoplay muted playsinline poster="poster.png"></video><figcaption>红线是鼠标走过的轨迹，红色圆环是一次点击；底部文字是这一步在做什么。空格暂停，← → 逐段查看。</figcaption></figure>
+<figure><img src="01-group-editor-open.png" alt="Coding 那一行的位置上打开了组编辑器"><figcaption>保存路由组后那一行回到视野 · Coding 那一行的位置上打开了组编辑器</figcaption></figure>
+<figure><img src="02-editor-save-in-view.png" alt="保存前：编辑器的高度与「保存」的位置"><figcaption>保存路由组后那一行回到视野 · 保存前：编辑器的高度与「保存」的位置</figcaption></figure>
+<figure><img src="03-after-save-list-position.png" alt="保存后，编辑器收起时的列表位置"><figcaption>保存路由组后那一行回到视野 · 保存后，编辑器收起时的列表位置</figcaption></figure>
+</main></html>

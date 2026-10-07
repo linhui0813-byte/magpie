@@ -1,0 +1,13 @@
+<!doctype html><html lang="zh"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>#777 界面预览 · 1cf3d4a</title>
+<style>:root{color-scheme:light dark;--bg:#f6f6f7;--fg:#1d1d1f;--muted:#6e6e73;--card:#fff;--line:#e5e5ea}
+@media (prefers-color-scheme:dark){:root{--bg:#111113;--fg:#f2f2f4;--muted:#9a9aa0;--card:#1c1c1f;--line:#2c2c30}}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.6 -apple-system,"Segoe UI","PingFang SC","Noto Sans CJK SC",sans-serif}
+main{max-width:1100px;margin:0 auto;padding:28px 16px 60px}h1{font-size:20px;margin:0 0 4px}.m{color:var(--muted);font-size:13px;margin:0 0 20px}
+video,img{display:block;width:100%;border-radius:10px;border:1px solid var(--line);background:var(--card)}figure{margin:0 0 28px}figcaption{color:var(--muted);font-size:13px;margin-top:8px}
+a{color:inherit}</style>
+<main><h1>#777 界面预览</h1><p class="m">commit 1cf3d4a · <a href="https://github.com/yetone/magpie/pull/777">回到 PR</a> · app.js 的 pluginMethod 在「已迁移的内置 Agent、其插件提供多种登录方式、又没有可区分它们的 site 标签」时不再固定返回 0，而是返回 undefined，让 startPluginSignIn 弹出登录方式选择器；site 命中的方式与只有一种方式的插件行为不变。</p>
+<figure><video src="preview.mp4" controls autoplay muted playsinline poster="poster.png"></video><figcaption>红线是鼠标走过的轨迹，红色圆环是一次点击；底部文字是这一步在做什么。空格暂停，← → 逐段查看。</figcaption></figure>
+<figure><img src="01-providers-list.png" alt="供应商页面：沙盒里只有 DeepSeek 一个供应商"><figcaption>供应商面板中的登录方式位置 · 供应商页面：沙盒里只有 DeepSeek 一个供应商</figcaption></figure>
+<figure><img src="02-provider-editor.png" alt="供应商面板的账号区——提供多种登录方式的内置插件，每种方式会在这里依次列出"><figcaption>供应商面板中的登录方式位置 · 供应商面板的账号区——提供多种登录方式的内置插件，每种方式会在这里依次列出</figcaption></figure>
+</main></html>

@@ -1,0 +1,29 @@
+{
+  "summary": "这个 diff 把 OpenClaw 注册进 Agent 页：未安装时在「安装其他 Agent」里出现，带官方彩色图标和 shell/PowerShell 与 npm 两条安装命令；接入后按 /model 提示选模型，并新增了中/日/德三条错误文案。",
+  "scenes": [
+    {
+      "title": "Agent 页的 OpenClaw 安装入口",
+      "shots": [
+        {
+          "file": "01-agents-install-collapsed.png",
+          "caption": "展开前的「安装其他 Agent」入口",
+          "width": 2560
+        },
+        {
+          "file": "02-openclaw-install-commands.png",
+          "caption": "安装列表中的 OpenClaw：图标与两条安装命令",
+          "width": 2496
+        }
+      ]
+    }
+  ],
+  "video": "preview.mp4",
+  "poster": "poster.png",
+  "errors": [],
+  "leak": false,
+  "skipped": null,
+  "mismatch": "",
+  "unseen": "沙盒里没有 OpenClaw CLI，也没有 ~/.openclaw 配置，所以看不到已接入的 OpenClaw 行（彩色图标、「已接入」状态、模型选择与 /model 提示），只能看到未安装时的安装入口；「OpenClaw 配置为只读」「使用了 $include」两条错误文案需要一份只读或带 $include 的 OpenClaw 配置才会弹出，这里也无法触发；Windows 的 PowerShell 命令在本次渲染的平台上看不到。",
+  "interactive": true,
+  "pages": 1
+}

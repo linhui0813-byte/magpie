@@ -1,0 +1,44 @@
+{
+  "summary": "这次改动在保存设置里的代理时，先同步把更新检查置为「检查中」再返回，于是页面紧随其后读取 /api/update 时看到的是检查进行中，而不是上一次失败留下的「无法检查更新」；「关于」/更新检查区域的状态因此会在改代理后立刻变成检查中。",
+  "scenes": [
+    {
+      "title": "「关于」里更新检查当前的状态",
+      "shots": [
+        {
+          "file": "01-update-check-before.png",
+          "caption": "「关于」里更新检查当前的状态",
+          "width": 2560
+        }
+      ]
+    },
+    {
+      "title": "改代理后更新检查立即变为检查中",
+      "shots": [
+        {
+          "file": "02-network-before.png",
+          "caption": "「网络与共享」里的代理一栏",
+          "width": 2496
+        },
+        {
+          "file": "03-network-typed.png",
+          "caption": "填入代理地址后的输入框",
+          "width": 2496
+        },
+        {
+          "file": "04-update-check-after.png",
+          "caption": "改代理后「关于」里更新检查的状态",
+          "width": 2560
+        }
+      ]
+    }
+  ],
+  "video": "preview.mp4",
+  "poster": "poster.png",
+  "errors": [],
+  "leak": false,
+  "skipped": null,
+  "mismatch": "",
+  "unseen": "只有当下这台机器的更新检查此刻正处于失败（error）状态、并且这次保存确实改变了代理值时，重试才会被触发；若更新检查本来就能成功，或代理值没变，这一改动在界面上就只是「保存返回后那一刻状态先后」的差别，截图不一定能截到旧错误。另外 outline 只展开了设置的「常规」标签，代理输入框与「关于」里的更新检查状态元素没有出现在其中，相关选择器是按现有命名约定推断的。",
+  "interactive": true,
+  "pages": 2
+}

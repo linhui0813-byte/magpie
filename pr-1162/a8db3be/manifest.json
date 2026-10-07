@@ -1,0 +1,26 @@
+{
+  "summary": "这个 PR 只改了窄窗口媒体查询里 Claude Code 分级模型选择器的宽度：`.ag-vl .field.ag-pick` 从随行自适应改为固定 220px，使 Opus、Sonnet、Haiku 等各行的选择器等宽，另加了一个窄窗口回归测试。",
+  "scenes": [
+    {
+      "title": "Claude Code 详情里的分级模型选择器",
+      "shots": [
+        {
+          "file": "01-claude-code-tier-pickers.png",
+          "caption": "Claude Code 详情展开后，Opus、Sonnet、Haiku、Fable 与子代理各行的模型选择器",
+          "width": 2492
+        }
+      ]
+    }
+  ],
+  "video": "preview.mp4",
+  "poster": "poster.png",
+  "errors": [
+    "Claude Code 详情里的分级模型选择器 · click div.row.agent[data-id=\"claude-code\"] button.ag-link: nothing visible matches div.row.agent[data-id=\"claude-code\"] button.ag-link (0 in the page)"
+  ],
+  "leak": false,
+  "skipped": null,
+  "mismatch": "",
+  "unseen": "改动只在窗口宽度不超过 600px 的媒体查询里生效，而沙盒浏览器固定在 1280x800，窄窗口规则不会被应用，因此截图里看不出等宽与不等宽的实际差别；下面展示的是改动所在的位置——Claude Code 详情中 Opus/Sonnet/Haiku 等各行的分级模型选择器。",
+  "interactive": true,
+  "pages": 1
+}

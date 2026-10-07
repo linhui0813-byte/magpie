@@ -1,0 +1,39 @@
+{
+  "summary": "「路由」页实时舞台下方新增了一块「当前额度」区：它读「用量」页的 /api/usage/quotas，把舞台上那些供应商的账号/Key 额度卡片（窗口、已用/剩余、重置时间、陈旧读数）单独列出来，跟随「已用 / 剩余」偏好，可见时最多一分钟读一次；选中历史请求、过去日期或重放时隐藏并停止轮询。",
+  "scenes": [
+    {
+      "title": "路由实时舞台与其下的当前额度区",
+      "shots": [
+        {
+          "file": "01-routing-live-stage.png",
+          "caption": "「路由」页顶部：实时舞台，紧邻其下的「当前额度」区",
+          "width": 2560
+        }
+      ]
+    },
+    {
+      "title": "选中较早的请求",
+      "shots": [
+        {
+          "file": "02-routing-historical-selection.png",
+          "caption": "选中较早请求后，再看舞台及其下方的区域",
+          "width": 2560
+        },
+        {
+          "file": "03-routing-back-live.png",
+          "caption": "回到最新请求后，舞台下方的区域",
+          "width": 2560
+        }
+      ]
+    }
+  ],
+  "video": "preview.mp4",
+  "poster": "poster.png",
+  "errors": [],
+  "leak": false,
+  "skipped": null,
+  "mismatch": "",
+  "unseen": "沙盒里最新的实时请求由 Acme Cloud 提供，而 /api/usage/quotas 只对 Sub2API Relay（5 小时/1 天/7 天美元窗口）和 Codex 返回带窗口的卡片——Acme Cloud 没有额度卡片，DeepSeek 只有余额、没有窗口，都不满足代码里「有窗口或出错」的条件，所以当前实时舞台下「当前额度」区不会渲染；只有当舞台上恰好是 Sub2API Relay 或 Codex 的请求时它才会出现。沙盒也没有 Kimi Code 账号、没有正应答或休息中的实时请求，因此单 Key、answering/resting 时保留卡片、读取失败保留旧值并显示不可用提示、一分钟后刷新这些状态同样看不到。",
+  "interactive": true,
+  "pages": 1
+}

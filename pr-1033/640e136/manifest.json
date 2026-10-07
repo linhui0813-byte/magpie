@@ -1,0 +1,39 @@
+{
+  "summary": "为 Reasonix 本地会话接入读取后，会话列表（会话页与「用量 › 会话」）会显示 Reasonix 会话及其模型名与 token；当本地用量记录不完整时，行内多出一行「用量历史不完整」小字，详情顶部多一行说明，并补齐 zh/ja/de 文案。",
+  "scenes": [
+    {
+      "title": "用量 › 会话的列表",
+      "shots": [
+        {
+          "file": "01-usage-sessions-list.png",
+          "caption": "用量 › 会话：会话列表，每行带模型与 token；Reasonix 会话会出现在这里",
+          "width": 2560
+        }
+      ]
+    },
+    {
+      "title": "会话页的会话与详情",
+      "shots": [
+        {
+          "file": "02-sessions-page.png",
+          "caption": "会话页：本机各 Agent 的本地会话列表",
+          "width": 2560
+        },
+        {
+          "file": "03-session-detail.png",
+          "caption": "会话详情：用量不完整的会话会在顶部多一行提示",
+          "width": 2560
+        }
+      ]
+    }
+  ],
+  "video": "preview.mp4",
+  "poster": "poster.png",
+  "errors": [],
+  "leak": false,
+  "skipped": null,
+  "mismatch": "",
+  "unseen": "沙盒里的 Reasonix Studio 只是新装上的 Agent，没有 ~/.reasonix 的本地会话与 turn/wire 记录，所以本次新增的 Reasonix 会话行（native 模型名、wire token）以及只在用量不完整时出现的「用量历史不完整」小字和详情提示都不会真的出现，只能展示它们会出现的位置（会话列表与「用量 › 会话」）。",
+  "interactive": true,
+  "pages": 2
+}

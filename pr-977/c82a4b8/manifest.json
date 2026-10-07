@@ -1,0 +1,49 @@
+{
+  "summary": "用量页与托盘额度卡片新增额度预测：每个完整额度窗口上方一行结论（撑得到重置/用完等）与领先落后值，下面单独画该窗口的剩余走势（实际剩余、匀速消耗、按当前速度预测），图例和走势范围选择移到额度栏；托盘卡片加了同款紧凑结论行。",
+  "scenes": [
+    {
+      "title": "用量页 Codex 卡片的额度预测与走势",
+      "shots": [
+        {
+          "file": "01-usage-forecast-card.png",
+          "caption": "用量页 Codex 卡片：每个额度窗口的预测行与其走势图",
+          "width": 1120
+        },
+        {
+          "file": "02-usage-legend-head.png",
+          "caption": "额度栏右上的共享图例与走势范围选择",
+          "width": 2560
+        },
+        {
+          "file": "03-usage-range-menu.png",
+          "caption": "展开的走势范围菜单",
+          "width": 1120
+        },
+        {
+          "file": "04-usage-curves-off.png",
+          "caption": "选择「关闭」后的 Codex 卡片",
+          "width": 1120
+        }
+      ]
+    },
+    {
+      "title": "托盘额度卡片里的同一结论",
+      "shots": [
+        {
+          "file": "05-panel-quota-verdicts.png",
+          "caption": "托盘额度卡片：每个窗口一行的预测",
+          "width": 2560
+        }
+      ]
+    }
+  ],
+  "video": "preview.mp4",
+  "poster": "poster.png",
+  "errors": [],
+  "leak": false,
+  "skipped": null,
+  "mismatch": "",
+  "unseen": "沙盒里现有读数的结论都是「撑得到重置」，所以「已用完」「预计用完」这类状态和射向零点的预测虚线看不到；Sub2API Relay 的 Key 窗口在这台机器上没有历史读数，卡片只有额度条、没有预测行；界面语言为 zh-CN，新增文案的日文/德文版本不会出现。",
+  "interactive": true,
+  "pages": 2
+}

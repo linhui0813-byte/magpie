@@ -1,0 +1,39 @@
+{
+  "summary": "插件页「已安装」列表的订阅名改为读缓存（不再每次逐个插件去问厂商要模型列表），名字还没到时那一行不再显示「没有 magpie 能用的登录」（并删掉该文案）；资源库 RTK 页读取时不再等包管理器，包管理器改到后台查并缓存，agent 探测也由两遍改为一遍。",
+  "scenes": [
+    {
+      "title": "资源库 RTK 页：首屏不再等包管理器",
+      "shots": [
+        {
+          "file": "01-rtk-tab-first-open.png",
+          "caption": "第一次打开 RTK 标签后的版本卡片",
+          "width": 2560
+        },
+        {
+          "file": "02-rtk-tab-second-open.png",
+          "caption": "第二次打开 RTK 标签后的版本卡片",
+          "width": 2560
+        }
+      ]
+    },
+    {
+      "title": "插件页「已安装」列表",
+      "shots": [
+        {
+          "file": "03-plugins-installed-list.png",
+          "caption": "插件页，「已安装」列表所在的这一页",
+          "width": 2560
+        }
+      ]
+    }
+  ],
+  "video": "preview.mp4",
+  "poster": "poster.png",
+  "errors": [],
+  "leak": false,
+  "skipped": null,
+  "mismatch": "",
+  "unseen": "沙盒里没有可查的 rtk（未安装，或不是用包管理器装的、也不落后于最新版），所以 RTK 页上包管理器那个等待灰标看不到，只能展示 RTK 页本身；插件页「已安装」列表里也没有「刚装上、缓存里还没有名字」的那种插件，因此看不到那一行不再显示「没有 magpie 能用的登录」；两处改动省下的打开时间（约 3.9 秒→1.6 秒、2.2 秒→13 毫秒）是耗时差别，静态截图看不出来。",
+  "interactive": true,
+  "pages": 2
+}

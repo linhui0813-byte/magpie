@@ -1,0 +1,44 @@
+{
+  "summary": "路由页的环节头部此前对「按权重」路由的供应商会退回显示「智能」：routing.js 的 MODES 表缺少 weight 项。此 diff 只在 MODES 中加入 weight 条目（复用供应商编辑器已有的「按权重」及说明文案），使环节头部的标签、下面的模式说明，以及「账号与密钥」下该供应商的路由名都按权重的说法显示；其余不变。",
+  "scenes": [
+    {
+      "title": "环节头部的路由标签与模式说明",
+      "shots": [
+        {
+          "file": "01-routing-stage-default.png",
+          "caption": "路由页环节：请求列表里当前打开的这条请求",
+          "width": 2560
+        },
+        {
+          "file": "02-routing-stage-relay.png",
+          "caption": "环节头部：magpie 节点上的路由标签与它下面的模式说明",
+          "width": 2560
+        },
+        {
+          "file": "03-routing-stage-acme.png",
+          "caption": "换成另一家供应商后，同一处的路由标签与模式说明",
+          "width": 2560
+        }
+      ]
+    },
+    {
+      "title": "账号与密钥里各供应商的路由名",
+      "shots": [
+        {
+          "file": "04-routing-accounts-routing-words.png",
+          "caption": "「账号与密钥」里每个供应商名后面的路由名",
+          "width": 1120
+        }
+      ]
+    }
+  ],
+  "video": "preview.mp4",
+  "poster": "poster.png",
+  "errors": [],
+  "leak": false,
+  "skipped": null,
+  "mismatch": "",
+  "unseen": "沙盒里的供应商是按「轮流」和「智能」路由的（Sub2API Relay 三个密钥轮换），没有按权重路由的供应商，也没有 routing 为 weight 的请求轨迹，所以「按权重」的标签与模式说明本身在这里无法复现；只能展示它会出现的两处位置：环节头部的标签/模式说明，以及「账号与密钥」中供应商名后的路由名。",
+  "interactive": true,
+  "pages": 1
+}

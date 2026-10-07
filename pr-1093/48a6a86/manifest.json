@@ -1,0 +1,34 @@
+{
+  "summary": "保存路由组时不再同步等待一次供应商额度读取（Codex 的账号状态改为只读已缓存的值），保存变快；保存后编辑器收起时，刚保存的那一行会被滚回视野，而不是留在列表底部。",
+  "scenes": [
+    {
+      "title": "保存路由组后那一行回到视野",
+      "shots": [
+        {
+          "file": "01-group-editor-open.png",
+          "caption": "Coding 那一行的位置上打开了组编辑器",
+          "width": 2560
+        },
+        {
+          "file": "02-editor-save-in-view.png",
+          "caption": "保存前：编辑器的高度与「保存」的位置",
+          "width": 2560
+        },
+        {
+          "file": "03-after-save-list-position.png",
+          "caption": "保存后，编辑器收起时的列表位置",
+          "width": 2560
+        }
+      ]
+    }
+  ],
+  "video": "preview.mp4",
+  "poster": "poster.png",
+  "errors": [],
+  "leak": false,
+  "skipped": null,
+  "mismatch": "",
+  "unseen": "「保存不再等一次供应商额度读取」只有耗时上的差别，界面上没有可直接截图的对照，沙盒里也不便计时比较。另外这一行的滚动效果取决于编辑器高度是否超过窗口：本沙盒里组编辑器的模型数与 Coding 组成员数不同，页面收缩量可能小到看不出滚回视野与浏览器自身夹取的差别。",
+  "interactive": true,
+  "pages": 1
+}

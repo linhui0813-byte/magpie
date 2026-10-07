@@ -1,0 +1,36 @@
+{
+  "summary": "Agents 页里 Codex 行的版本号上多了一句悬停说明：app.js 把后端新给的 note 拼到版本号元素的 title 末尾，i18n 为它补了中文、日文、德文；其余改动（Windows 上从原生 .exe 旁的 npm .cmd 认出安装方式、更新后把 .exe 重新硬链接到 npm 装的文件）都在后端，界面上没有新增元素或按钮。",
+  "scenes": [
+    {
+      "title": "Codex 版本号上的悬停说明",
+      "shots": [
+        {
+          "file": "01-agents-list.png",
+          "caption": "Agent 页列表：先看这里有哪些 Agent",
+          "width": 2560
+        },
+        {
+          "file": "02-agents-unrolled.png",
+          "caption": "展开后的 Agent 列表，看 Codex 这一行",
+          "width": 2560
+        },
+        {
+          "file": "03-codex-row-no-version.png",
+          "caption": "Codex 行：本机没有检测到 Codex CLI，所以只有名字和模型选择，没有版本号（也就没有那句悬停说明）",
+          "width": 2492
+        }
+      ]
+    }
+  ],
+  "video": "preview.mp4",
+  "poster": "poster.png",
+  "errors": [
+    "Codex 版本号上的悬停说明 · hover div.row.agent[data-id=\"codex\"] .ag-ver: nothing visible matches div.row.agent[data-id=\"codex\"] .ag-ver (0 in the page)"
+  ],
+  "leak": false,
+  "skipped": null,
+  "mismatch": "",
+  "unseen": "这句话只写进版本号元素的 title（浏览器原生悬停提示），截图/录屏里看不到文字本身，只能看到悬停状态；PR 描述真正的现象——Windows 上 npm 安装的 Codex 出现「更新到 x」按钮、以及更新后 .exe 重新硬链接——需要 Windows 上的 codex.exe 与 npm 的 codex.cmd 并排这套布局，这台 Linux 沙盒里没有，看不到。另外如果沙盒里 Codex CLI 没被检测到，版本号本身不会出现，这句说明也就无从显示。",
+  "interactive": true,
+  "pages": 1
+}

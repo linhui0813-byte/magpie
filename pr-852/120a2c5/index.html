@@ -1,0 +1,18 @@
+<!doctype html><html lang="zh"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>#852 界面预览 · 120a2c5</title>
+<style>:root{color-scheme:light dark;--bg:#f6f6f7;--fg:#1d1d1f;--muted:#6e6e73;--card:#fff;--line:#e5e5ea}
+@media (prefers-color-scheme:dark){:root{--bg:#111113;--fg:#f2f2f4;--muted:#9a9aa0;--card:#1c1c1f;--line:#2c2c30}}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.6 -apple-system,"Segoe UI","PingFang SC","Noto Sans CJK SC",sans-serif}
+main{max-width:1100px;margin:0 auto;padding:28px 16px 60px}h1{font-size:20px;margin:0 0 4px}.m{color:var(--muted);font-size:13px;margin:0 0 20px}
+video,img{display:block;width:100%;border-radius:10px;border:1px solid var(--line);background:var(--card)}figure{margin:0 0 28px}figcaption{color:var(--muted);font-size:13px;margin-top:8px}
+a{color:inherit}</style>
+<main><h1>#852 界面预览</h1><p class="m">commit 120a2c5 · <a href="https://github.com/yetone/magpie/pull/852">回到 PR</a> · 设置 › 网络与共享 的代理栏在「自定义」模式下，socks5://、socks5h:// 地址旁新增了可选的用户名、密码输入框与「保存」按钮；凭据从地址中拆出单独保存和回填，密码打码，代理状态文案与无效地址错误都不再带出凭据。</p>
+<figure><video src="preview.mp4" controls autoplay muted playsinline poster="poster.png"></video><figcaption>红线是鼠标走过的轨迹，红色圆环是一次点击；底部文字是这一步在做什么。空格暂停，← → 逐段查看。</figcaption></figure>
+<figure><img src="01-proxy-row-before.png" alt="代理栏：地址输入框和「自动 / 关闭 / 自定义」"><figcaption>设置 › 网络与共享：SOCKS5 用户名与密码 · 代理栏：地址输入框和「自动 / 关闭 / 自定义」</figcaption></figure>
+<figure><img src="02-proxy-auth-fields.png" alt="socks5:// 地址下的用户名、密码输入框与「保存」"><figcaption>设置 › 网络与共享：SOCKS5 用户名与密码 · socks5:// 地址下的用户名、密码输入框与「保存」</figcaption></figure>
+<figure><img src="03-proxy-credentials-filled.png" alt="用户名与密码都填好后的代理栏"><figcaption>设置 › 网络与共享：SOCKS5 用户名与密码 · 用户名与密码都填好后的代理栏</figcaption></figure>
+<figure><img src="04-proxy-saved.png" alt="保存之后的代理栏与代理状态文案"><figcaption>设置 › 网络与共享：SOCKS5 用户名与密码 · 保存之后的代理栏与代理状态文案</figcaption></figure>
+<figure><img src="05-proxy-invalid-address.png" alt="无效地址后页面上出现的提示"><figcaption>地址栏里的凭据与无效地址 · 无效地址后页面上出现的提示</figcaption></figure>
+<figure><img src="06-proxy-url-split.png" alt="地址里带用户名密码时的代理栏"><figcaption>地址栏里的凭据与无效地址 · 地址里带用户名密码时的代理栏</figcaption></figure>
+<figure><img src="07-proxy-http.png" alt="http:// 地址下的代理栏"><figcaption>地址栏里的凭据与无效地址 · http:// 地址下的代理栏</figcaption></figure>
+</main></html>

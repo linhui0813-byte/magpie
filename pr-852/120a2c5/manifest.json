@@ -1,0 +1,59 @@
+{
+  "summary": "设置 › 网络与共享 的代理栏在「自定义」模式下，socks5://、socks5h:// 地址旁新增了可选的用户名、密码输入框与「保存」按钮；凭据从地址中拆出单独保存和回填，密码打码，代理状态文案与无效地址错误都不再带出凭据。",
+  "scenes": [
+    {
+      "title": "设置 › 网络与共享：SOCKS5 用户名与密码",
+      "shots": [
+        {
+          "file": "01-proxy-row-before.png",
+          "caption": "代理栏：地址输入框和「自动 / 关闭 / 自定义」",
+          "width": 1120
+        },
+        {
+          "file": "02-proxy-auth-fields.png",
+          "caption": "socks5:// 地址下的用户名、密码输入框与「保存」",
+          "width": 1120
+        },
+        {
+          "file": "03-proxy-credentials-filled.png",
+          "caption": "用户名与密码都填好后的代理栏",
+          "width": 1120
+        },
+        {
+          "file": "04-proxy-saved.png",
+          "caption": "保存之后的代理栏与代理状态文案",
+          "width": 2560
+        }
+      ]
+    },
+    {
+      "title": "地址栏里的凭据与无效地址",
+      "shots": [
+        {
+          "file": "05-proxy-invalid-address.png",
+          "caption": "无效地址后页面上出现的提示",
+          "width": 2560
+        },
+        {
+          "file": "06-proxy-url-split.png",
+          "caption": "地址里带用户名密码时的代理栏",
+          "width": 1120
+        },
+        {
+          "file": "07-proxy-http.png",
+          "caption": "http:// 地址下的代理栏",
+          "width": 1120
+        }
+      ]
+    }
+  ],
+  "video": "preview.mp4",
+  "poster": "poster.png",
+  "errors": [],
+  "leak": false,
+  "skipped": null,
+  "mismatch": "",
+  "unseen": "界面语言是 zh-CN，看不到本次新增的日语、德语标签；沙盒里没有预先保存的、带非 UTF-8 编码凭据的代理（如 socks5://name:p%FFss@…），其原样保留无法演示；1280×800 的录制也看不到窄窗口下的折行布局。",
+  "interactive": true,
+  "pages": 1
+}

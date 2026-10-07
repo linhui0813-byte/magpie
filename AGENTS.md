@@ -1,5 +1,13 @@
 # Notes for coding agents
 
+## Commit and push
+
+After every upgrade or change, automatically commit the task's changes and
+push to `origin` on the current branch once the checks required by this
+repository pass. Treat commit and push as part of completing the task,
+without waiting for another request from Hui. Keep unrelated work out of
+the commit. If commit or push is blocked, report the blocker and what remains.
+
 ## Subsystem design and review
 
 Before changing a documented subsystem, read its

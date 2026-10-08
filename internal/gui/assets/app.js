@@ -10885,6 +10885,7 @@ function loginUsageOf(agent) {
 // no Cloud project named can't be used at all until one is, so that is
 // said outright; anything else is in the tooltip.
 function quotaError(err) {
+  if (/^Qwen Token Plan needs a Bailian console sign-in/.test(err)) return t("Sign in to Bailian with bl auth login --console, then refresh this card");
   if (/sign-in has expired/.test(err)) return t("Signed out — add this account again to use it");
   if (/no longer supported for Gemini Code Assist for individuals/.test(err)) return t("Google no longer serves personal accounts to Gemini CLI — hover for more");
   if (/magpie accounts project/.test(err)) return t("Needs a Google Cloud project — hover for how");

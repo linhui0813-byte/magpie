@@ -4,6 +4,7 @@
 // works. {name} slots are filled by t(str, vars).
 const I18N = {
   zh: {
+    "Sign in to Bailian with bl auth login --console, then refresh this card": "请运行 bl auth login --console 登录百炼，然后刷新这张卡片",
     "No installed fonts found": "未找到已安装字体",
     "Interface font": "界面字体",
     "Code font": "代码字体",
@@ -3613,6 +3614,7 @@ const I18N = {
     "credits": "积分",
   },
   ja: {
+    "Sign in to Bailian with bl auth login --console, then refresh this card": "bl auth login --console で Bailian にサインインしてから、このカードを更新してください",
     "No installed fonts found": "インストール済みフォントが見つかりません",
     "Interface font": "インターフェースのフォント",
     "Code font": "コードのフォント",
@@ -7207,6 +7209,7 @@ const I18N = {
     "Main navigation": "メインナビゲーション",
   },
   de: {
+    "Sign in to Bailian with bl auth login --console, then refresh this card": "Mit bl auth login --console bei Bailian anmelden, dann diese Karte aktualisieren",
     "No installed fonts found": "Keine installierten Schriften gefunden",
     "Interface font": "Oberflächenschrift",
     "Code font": "Codeschrift",

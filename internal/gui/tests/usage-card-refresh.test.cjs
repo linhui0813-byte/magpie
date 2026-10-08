@@ -37,6 +37,7 @@ function serve(lang, state) {
     if (url.pathname === "/wails/runtime.js") return route.fulfill({ contentType: "text/javascript", body: "export const Window = {};" });
     if (url.pathname === "/api/state") return json({ agents: [], profiles: [], settings });
     if (url.pathname === "/api/settings") return json(settings);
+    if (url.pathname === "/api/settings/quota-left") { settings.quotaLeft = route.request().postDataJSON().on; return json(settings); }
     if (url.pathname === "/api/providers") return json({ providers: [], presets: [], excluded: [], gateway: { running: true, window: true } });
     if (url.pathname === "/api/usage/quotas") { state.gets++; return json(state.quotas); }
     if (url.pathname === "/api/usage/quotas/refresh") {
@@ -45,7 +46,7 @@ function serve(lang, state) {
       await state.gate;
       const q = state.quotas.find((x) => x.provider === url.searchParams.get("provider") && (x.user || "") === (url.searchParams.get("user") || ""));
       if (q?.windows?.length) { q.windows[0].used = 61; q.readAt = iso(Date.now()); }
-      if (q?.error) { delete q.error; q.windows = [{ name: "Week", used: 10 }]; q.readAt = iso(Date.now()); }
+      if (q?.error) { delete q.error; q.windows = [{ name: q.provider === "qwen-token-plan" ? "Month" : "Week", used: q.provider === "qwen-token-plan" ? 25 : 10 }]; q.readAt = iso(Date.now()); }
       return json(state.quotas);
     }
     if (url.pathname === "/api/usage/quotas/history") return json([]);
@@ -57,6 +58,42 @@ function serve(lang, state) {
     const contentType = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".svg": "image/svg+xml", ".png": "image/png" }[path.extname(file)];
     try { await route.fulfill({ body: await fs.readFile(file), contentType }); } catch { await route.fulfill({ status: 404, body: "" }); }
   };
+}
+
+const qwenSignIn = {
+  en: "Sign in to Bailian with bl auth login --console, then refresh this card",
+  zh: "请运行 bl auth login --console 登录百炼，然后刷新这张卡片",
+  ja: "bl auth login --console で Bailian にサインインしてから、このカードを更新してください",
+  de: "Mit bl auth login --console bei Bailian anmelden, dann diese Karte aktualisieren",
+};
+
+for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium", "webkit"])) {
+  for (const lang of ["en", "zh", "ja", "de"]) {
+    test(`${engine} ${lang}: Qwen explains console sign-in and shows the monthly allowance after refresh`, async (t) => {
+      const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: "chromium" }));
+      t.after(() => browser.close());
+      const page = await (await browser.newContext({ viewport: { width: 560, height: 600 }, reducedMotion: "reduce" })).newPage();
+      page.setDefaultTimeout(5000);
+      const state = { quotas: [{ provider: "qwen-token-plan", name: "Qwen Token Plan", icon: "qwen-color", user: "Bailian console", windows: [], error: "Qwen Token Plan needs a Bailian console sign-in; run bl auth login --console" }], gets: 0, refreshes: [], gate: Promise.resolve() };
+      await page.route("**/*", serve(lang, state));
+      await page.goto("http://magpie.test/?view=usage");
+      const card = page.locator(".subscription-card", { hasText: "Qwen Token Plan" });
+      const error = card.locator(".subscription-error");
+      await error.waitFor();
+      assert.equal(await error.textContent(), qwenSignIn[lang]);
+      assert.equal(await card.locator(".quota-n").count(), 0, "unknown quota is not shown as zero");
+      await card.hover();
+      await card.locator(".quota-refresh").click();
+      await card.locator(".quota-n").waitFor();
+      assert.match(await card.locator(".quota-n").textContent(), /25%/);
+      assert.deepEqual(state.refreshes, ["?provider=qwen-token-plan&user=Bailian%20console"]);
+      assert.equal(await card.locator(".subscription-error").count(), 0);
+      await page.locator("#quotaMode button").nth(1).click();
+      await page.waitForFunction(() => document.querySelector(".quota-n")?.textContent.includes("75%"));
+      assert.match(await card.locator(".quota-n").textContent(), /75%/, "remaining allowance uses the vendor's share");
+      assert.equal(await card.evaluate((e) => e.scrollWidth > e.clientWidth), false, "fits a narrow window");
+    });
+  }
 }
 
 const words = {

@@ -41,6 +41,30 @@ keys and accounts per request is in [Gateway routing and fallback](gateway-routi
 
 ## Constraints and failure behavior
 
+Qwen Token Plan's personal allowance is read by
+[`qwenquota.go`](../../internal/provider/qwenquota.go), through the same
+Bailian console gateway as the [official CLI](https://github.com/modelstudioai/cli/blob/main/packages/commands/src/commands/usage/token-plan.ts).
+Its model API key cannot authenticate the console lookup. Sign in to the
+account that owns the plan with `bl auth login --console` (install the CLI
+with `npm install -g bailian-cli`), then refresh the card. Magpie reads the
+CLI's `~/.bailian/config.json`, or `BAILIAN_CONFIG_DIR/config.json`, following
+`active_config` for a named profile. It never changes or copies that sign-in.
+The profile must use the domestic Beijing console. A missing or expired
+session leaves the Qwen card visible with a sign-in instruction.
+
+The card says **Bailian console**: this is that console account's shared
+personal allowance, not a verified allowance for each saved API key. It is
+shown once, on the first enabled provider using
+`token-plan.maas.qianwenaiapi.com`; ordinary Qwen/DashScope and Coding Plan
+endpoints are excluded. The reported fractional `per1MonthPercentage` is
+shown as the monthly used or remaining percentage, with its reset time in
+milliseconds. Older `per5HourPercentage` and `per1WeekPercentage` windows
+are shown only when present. Missing fields never imply zero usage or an
+unlimited plan. These console windows do not control individual keys'
+routing, since the key and console account have not been matched. Readings
+share the plan cache and per-card refresh; transient failures can show a
+dated last reading of the same session, while an expired session cannot.
+
 - Each refresh token has exactly one holder. Vendors rotate tokens on refresh, so two copies of one token would sign each other out. `savedTokenMu` stops two requests refreshing one saved account at once.
 - A Claude subscription account is used only for Claude Code, through the genuine Claude Code binary (see [Claude subscription bridge](claude-subscription-bridge.md)).
 - An unreadable `providers.json` is an error, never an empty list. Saving over an empty list would lose every provider.
@@ -56,6 +80,8 @@ keys and accounts per request is in [Gateway routing and fallback](gateway-routi
 ```sh
 go test -tags nogui ./internal/provider -run 'TestAccount|TestCodex|TestGroup|TestQuota|TestLogin|TestSignIn|TestSeveralKeys|TestKeyProtocol|TestSetKeyWeight|TestReadSub2APIKeyLimits|TestSub2APIKeyLimitsOnItsCard|TestKeyAllowance|TestPlanKeyAllowance|TestPayAsYouGoKeyAskedSeldom'
 go test -tags nogui ./internal/provider
+go test -tags nogui ./internal/provider -run 'TestQwen|TestReadQwenPlan'
+node --test internal/gui/tests/usage-card-refresh.test.cjs
 ```
 
 The package's tests use a home of their own (`testenv`). Never point them at

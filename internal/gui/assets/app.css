@@ -926,15 +926,17 @@ body.window .field.solo { grid-column: auto; }
 #ledRoute { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; }
 #ledRoute[hidden] { display: none; }
 #ledRouteClear { font-size: 18px; padding: 2px 6px; }
-.led .model, .led .where { max-width: 200px; overflow: hidden; text-overflow: ellipsis; }
+/* Only the account name is shortened; its source badges still need their
+   full width in a narrow table. */
+.led .model, .led .where-name { max-width: 200px; overflow: hidden; text-overflow: ellipsis; }
 /* a window too narrow for every column leaves out those the row's details
    say (#860), and narrows the names */
 .led.tight .lc-opt, .led:not(.tight) .led-dl .lc-opt { display: none; }
 .led.tight .led-dl .lc-opt { display: block; }
-.led.tight .model, .led.tight .where { max-width: 160px; }
+.led.tight .model, .led.tight .where-name { max-width: 160px; }
 .led.tight th, .led.tight td { padding-left: 6px; padding-right: 6px; }
 .led.tighter .price-reference { display: none; }
-.led.tighter .model, .led.tighter .where { max-width: 110px; }
+.led.tighter .model, .led.tighter .where-name { max-width: 110px; }
 .led.tighter th, .led.tighter td { padding-left: 4px; padding-right: 4px; }
 .led.tighter th { white-space: normal; }
 .led-tight { font-size: 11.5px; color: var(--muted); }

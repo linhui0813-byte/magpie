@@ -7836,9 +7836,12 @@ function drawEditor(p, presetID) {
   // — or a custom provider's, whose Balance URL may not be named yet: a
   // token pasted there says at once which URL it wants (balanceFix)
   let balFix = null;
-  if (p?.balanceToken?.takes || custom) {
+  const arkBalance = p?.balanceToken?.kind === "volcengine" || (isNew && pr?.id === "volcengine");
+  if (p?.balanceToken?.takes || custom || arkBalance) {
     const saved = !!p?.balanceToken?.set;
-    const tok = input(draft.balanceToken || "", saved && !draft.clearBalanceToken ? t("saved · paste a new one to replace it") : t("optional · the account's system access token"), "password");
+    const placeholder = arkBalance ? t("optional · Access Key ID:Secret Access Key") : t("optional · the account's system access token");
+    const tok = input(draft.balanceToken || "", saved && !draft.clearBalanceToken ? t("saved · paste a new one to replace it") : placeholder, "password");
+    tok.classList.add("balance-token");
     tok.oninput = () => { draft.balanceToken = tok.value.trim(); };
     tok.onkeydown = (e) => { e.stopPropagation(); if (e.key === "Escape") cancelEdit(); };
     const pair = el("div", "pair");
@@ -7846,15 +7849,17 @@ function drawEditor(p, presetID) {
     if (saved && !draft.clearBalanceToken) {
       const side = el("div", "side");
       const drop = el("button", "text", t("Remove"));
-      drop.onclick = () => { draft.clearBalanceToken = true; draft.balanceToken = ""; tok.value = ""; tok.placeholder = t("optional · the account's system access token"); drop.remove(); balFix?.refresh(); };
+      drop.onclick = () => { draft.clearBalanceToken = true; draft.balanceToken = ""; tok.value = ""; tok.placeholder = placeholder; drop.remove(); balFix?.refresh(); };
       side.append(drop);
       pair.append(side);
     }
-    const tokHelp = custom || p.balanceURL
+    const tokHelp = arkBalance
+      ? t("The Ark model API key cannot read billing. Enter Access Key ID:Secret Access Key from the same Volcengine account, with permission to call QueryBalanceAcct. Used only to read that account's available balance, including any credit limit, on Usage; this is not a Coding Plan or Agent Plan allowance.")
+      : custom || p.balanceURL
       ? t("What the Balance URL is asked with in place of the key, when it wants the account's own token: a new-api relay's System Access Token, or a sub2api panel's login token (a JWT, sent as a Bearer); it is used for nothing else.")
       : t("A key tells only what is left on itself. For the whole account's balance on the Usage page, generate a System Access Token in {p}'s settings and paste it here; it is used for nothing else.", { p: pr?.name || p.name });
     const [label, wrap] = field(t("Account balance"), pair, tokHelp);
-    if (custom) {
+    if (custom && !arkBalance) {
       balFix = balanceFix(p);
       wrap.append(balFix);
       // whatever is typed — the token, the Balance URL, a header — may
@@ -10885,6 +10890,7 @@ function loginUsageOf(agent) {
 // no Cloud project named can't be used at all until one is, so that is
 // said outright; anything else is in the tooltip.
 function quotaError(err) {
+  if (/^Volcengine account balance needs billing credentials/.test(err)) return t("Set billing credentials in this provider's Account balance field");
   if (/^Qwen Token Plan needs a Bailian console sign-in/.test(err)) return t("Sign in to Bailian with bl auth login --console, then refresh this card");
   if (/sign-in has expired/.test(err)) return t("Signed out — add this account again to use it");
   if (/no longer supported for Gemini Code Assist for individuals/.test(err)) return t("Google no longer serves personal accounts to Gemini CLI — hover for more");

@@ -211,6 +211,8 @@ type Provider struct {
 	// access token, or a new-api relay's for its /api/user/self named in
 	// BalanceURL (see TakesBalanceToken). It is asked with nothing else but
 	// the provider's headers, when the endpoint is one named.
+	// Ark's account balance instead uses AccessKeyID:SecretAccessKey to
+	// sign only the Volcengine billing lookup (volcengine_balance.go).
 	BalanceToken string `json:"balanceToken,omitempty"`
 	// ZhipuTeam, for a Zhipu or Z.ai key on a team's GLM Coding Plan, is
 	// the team's organization and project, from the BigModel console: the

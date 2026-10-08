@@ -43,6 +43,9 @@ func balanceSourceOf(p Provider) (balanceSource, bool) {
 		// instead of the key
 		return balanceSource{p.BalanceURL, func(b []byte) (string, error) { return readBalancePath(b, path) }, p.BalanceToken}, true
 	}
+	if UsesVolcengineBilling(p) {
+		return balanceSource{volcengineBalanceURL, readVolcengineBalance, p.BalanceToken}, true
+	}
 	hosts := []string{hostOf(p.Chat), hostOf(p.Responses), hostOf(p.Anthropic)}
 	for _, h := range hosts {
 		switch h {
@@ -173,7 +176,7 @@ func newAPIUserHint(msg string) string {
 // TakesBalanceToken says the provider's vendor tells the account's balance
 // to a token of its own (BalanceToken), which the editor then asks for.
 func TakesBalanceToken(p Provider) bool {
-	if p.BalanceURL != "" {
+	if p.BalanceURL != "" || UsesVolcengineBilling(p) {
 		return true
 	}
 	for _, h := range []string{hostOf(p.Chat), hostOf(p.Responses), hostOf(p.Anthropic)} {
@@ -689,6 +692,10 @@ func balanceRead(ctx context.Context, p Provider) (amount string, parts []Balanc
 	if !ok || p.Account != nil || p.Key == "" {
 		return "", nil, nil, false, nil
 	}
+	if UsesVolcengineBilling(p) {
+		amount, err = volcengineBalance(ctx, src.token)
+		return amount, nil, nil, true, err
+	}
 	if src.token != "" && p.BalanceURL != "" && balanceURLPath(p.BalanceURL) == newAPIKeyUsage {
 		return "", nil, nil, true, errKeyUsageWithToken(p.BalanceURL)
 	}
@@ -833,7 +840,7 @@ func KeyBalances(ctx context.Context) []SubscriptionQuota {
 			continue
 		}
 		others := 0
-		if src.token != "" {
+		if src.token != "" || UsesVolcengineBilling(p) {
 			// the account's balance is the same whichever key asks
 			jobs = append(jobs, job{p, ""})
 			continue
@@ -899,7 +906,13 @@ func KeyBalances(ctx context.Context) []SubscriptionQuota {
 				noteKeyAllowance(j.p, ws, now)
 			}
 			// the vendor failing a while shows the balance last read
-			out[i] = keepReading(ctx, q, keyTag("balance", j.p.Key))
+			tag := keyTag("balance", j.p.Key)
+			if UsesVolcengineBilling(j.p) {
+				// Billing credentials changed means a different account's
+				// reading, even when the Ark model key stayed the same.
+				tag = keyTag("volcengine-balance", j.p.BalanceToken)
+			}
+			out[i] = keepReading(ctx, q, tag)
 		}()
 	}
 	wg.Wait()

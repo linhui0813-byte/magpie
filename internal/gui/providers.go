@@ -97,8 +97,9 @@ type providerJSON struct {
 	// an account-wide balance token (provider.BalanceToken): whether the
 	// vendor takes one, and whether one is saved; never the token itself
 	BalanceToken struct {
-		Takes bool `json:"takes"`
-		Set   bool `json:"set"`
+		Takes bool   `json:"takes"`
+		Set   bool   `json:"set"`
+		Kind  string `json:"kind,omitempty"`
 	} `json:"balanceToken"`
 	// a StepFun provider's Step Plan windows, told only to a platform
 	// sign-in: which site's, and whether one is kept
@@ -425,6 +426,9 @@ func providerInfo(p provider.Provider, agents []agentUse) providerJSON {
 		out.Key.Optional = pr.NoKey
 	}
 	out.BalanceToken.Takes, out.BalanceToken.Set = provider.TakesBalanceToken(p), p.BalanceToken != ""
+	if provider.UsesVolcengineBilling(p) {
+		out.BalanceToken.Kind = "volcengine"
+	}
 	if provider.TakesZhipuTeam(p) {
 		out.ZhipuTeam = &provider.ZhipuTeam{}
 		if p.ZhipuTeam != nil {

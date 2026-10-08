@@ -41,6 +41,29 @@ keys and accounts per request is in [Gateway routing and fallback](gateway-routi
 
 ## Constraints and failure behavior
 
+Volcengine Ark's account balance is read by
+[`volcengine_balance.go`](../../internal/provider/volcengine_balance.go),
+through the official billing
+[`QueryBalanceAcct` API](https://www.volcengine.com/docs/6269/1223898). The model API key
+cannot authenticate that query. In the provider editor's **Account balance**
+field, enter `Access Key ID:Secret Access Key` for the same Volcengine account,
+with permission to read the account balance through `QueryBalanceAcct`. This pair is stored in
+`Provider.BalanceToken`; the providers API returns only whether it is set
+and `balanceToken.kind = "volcengine"`, never the credentials. It is used
+only to sign the billing lookup, without the model key or provider headers.
+
+The Usage page shows `AvailableBalance` in the returned currency (CNY by
+default), once per enabled Ark provider, shared across its model keys. It
+includes available credit, so it is not necessarily cash. Coding Plan and
+Agent Plan endpoints show this same account balance, not plan allowance.
+Ark endpoints are recognized by host, including imports; a custom Balance
+URL still overrides the built-in reader. Missing billing credentials leave
+the card visible with setup instructions. Reads share the balance cache,
+history and per-card refresh. Temporary failures can show a dated last
+reading; changing the billing credentials cannot reuse another account's
+reading. Billing refusals and invalid or missing balances remain errors,
+never zero. Neither balance lookup nor its failure affects model routing.
+
 Qwen Token Plan's personal allowance is read by
 [`qwenquota.go`](../../internal/provider/qwenquota.go), through the same
 Bailian console gateway as the [official CLI](https://github.com/modelstudioai/cli/blob/main/packages/commands/src/commands/usage/token-plan.ts).
@@ -81,6 +104,8 @@ dated last reading of the same session, while an expired session cannot.
 go test -tags nogui ./internal/provider -run 'TestAccount|TestCodex|TestGroup|TestQuota|TestLogin|TestSignIn|TestSeveralKeys|TestKeyProtocol|TestSetKeyWeight|TestReadSub2APIKeyLimits|TestSub2APIKeyLimitsOnItsCard|TestKeyAllowance|TestPlanKeyAllowance|TestPayAsYouGoKeyAskedSeldom'
 go test -tags nogui ./internal/provider
 go test -tags nogui ./internal/provider -run 'TestQwen|TestReadQwenPlan'
+go test -tags nogui ./internal/provider -run 'TestVolcengine|TestReadVolcengine'
+node --test internal/gui/tests/volcengine-balance.test.cjs
 node --test internal/gui/tests/usage-card-refresh.test.cjs
 ```
 

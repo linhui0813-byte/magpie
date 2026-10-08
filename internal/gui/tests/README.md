@@ -1,5 +1,14 @@
 # Dropdown browser regression
 
+`volcengine-balance.test.cjs` checks Volcengine Ark's account balance on Usage
+and its separate billing credentials in the provider editor. Saved credentials
+are never returned to the form; unchanged saves preserve them, replacement
+and removal leave the model key alone, and missing setup shows an instruction
+instead of a zero balance. It covers preset and imported providers, English
+and Chinese, wide and narrow layouts, Chromium and WebKit. The API and
+credentials are fixtures. Run with
+`node --test internal/gui/tests/volcengine-balance.test.cjs`.
+
 ## Installed desktop fonts
 
 `fonts.test.cjs` exercises the interface/code font controls with installed

@@ -49,8 +49,8 @@ function server(lang, calls) {
 }
 
 const words = {
-  en: { overwrite: "Overwrite?", del: "Delete?", close: "Close" },
-  zh: { overwrite: "覆盖？", del: "删除？", close: "关闭" },
+  en: { overwrite: "Overwrite?", del: "Delete?", close: "Close", deleted: "Deleted work" },
+  zh: { overwrite: "覆盖？", del: "删除？", close: "关闭", deleted: "已删除 work" },
 };
 
 for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium", "webkit"])) {
@@ -117,6 +117,9 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await del.click();
         await page.waitForFunction(() => ![...document.querySelectorAll("#profiles .chip")].some((c) => /^work/.test(c.textContent)));
         assert.deepEqual(calls, ["delete work"]);
+        // Removal is optimistic. Its response redraws the chips, so finish
+        // that redraw before measuring one for the details' close check.
+        await page.waitForFunction(message => document.querySelector("#status").textContent === message, w.deleted);
         calls.length = 0;
 
         // the details: their × closes them, the chip staying where it is

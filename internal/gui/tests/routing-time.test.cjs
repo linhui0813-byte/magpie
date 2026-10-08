@@ -123,7 +123,12 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await tm2.waitFor();
       const dayBtn2 = row2.locator("button.rt-cond", { hasText: w.every });
       assert.equal(await dayBtn2.isVisible(), false, "no days until hours are typed");
-      const at = () => page.evaluate(() => [...document.querySelectorAll("*")].filter((e) => e.scrollTop).map((e) => [e.id || e.className, e.scrollTop]).join(";") + "|" + Math.round(document.querySelector(".rt-gedit").getBoundingClientRect().top));
+      // The click guard restores WebKit's native focus scroll before
+      // painting. Measure the rendered position after its frame work.
+      const at = async () => {
+        await page.evaluate(() => new Promise(done => requestAnimationFrame(() => requestAnimationFrame(done))));
+        return page.evaluate(() => [...document.querySelectorAll("*")].filter((e) => e.scrollTop).map((e) => [e.id || e.className, e.scrollTop]).join(";") + "|" + Math.round(document.querySelector(".rt-gedit").getBoundingClientRect().top));
+      };
       await tm2.scrollIntoViewIfNeeded(); // by the test, as the reader would
       await page.waitForTimeout(200);
       const before = await at();

@@ -63,7 +63,8 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       const page = await context.newPage();
       page.setDefaultTimeout(5000);
       page.on("pageerror", (e) => errors.push(e.message));
-      await page.route("**/*", serve(lang, posts, fail));
+      const handler = serve(lang, posts, fail);
+      await page.route("**/*", handler);
       await page.goto("http://magpie.test/?mode=panel");
       await page.waitForFunction(() => document.querySelectorAll("#panelQuota .pq-card").length >= 3);
       const tr = (s, v) => page.evaluate(([s, v]) => t(s, v), [s, v]);
@@ -134,6 +135,11 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       assert(await page.evaluate(() => document.activeElement?.matches('.pq-arow[data-key="claude"] .pq-ahandle')));
 
       // a drag by the logo: DeepSeek to the top
+      // Put the handles in view again after the translated arrangement
+      // note and hide/show controls have changed the list's height.
+      await page.mouse.move(220, 150);
+      await page.mouse.wheel(0, 1000);
+      await page.waitForFunction(() => { const v = document.querySelector("#view-agents"); return v.scrollTop >= v.scrollHeight - v.clientHeight - 1; });
       const from = await page.locator('#panelQuota .pq-arow[data-key="deepseek"] .pq-ahandle').boundingBox();
       const to = await page.locator('#panelQuota .pq-arow[data-key="codex"]').boundingBox();
       await page.mouse.move(from.x + from.width / 2, from.y + from.height / 2);
@@ -165,10 +171,17 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       // the Usage page keeps every card, in the shared order
       const win = await context.newPage();
       win.on("pageerror", (e) => errors.push(e.message));
-      await win.route("**/*", serve(lang, [], {}));
+      // The second window reads the preferences the first one saved. A
+      // manual state edit here raced the initial /api/state response.
+      let releaseInitial;
+      const initial = new Promise(done => releaseInitial = done);
+      await win.route("**/*", async route => {
+        if (new URL(route.request().url()).pathname === "/api/state") await initial;
+        return handler(route);
+      });
       await win.goto("http://magpie.test/?view=usage&tab=usage");
-      await win.evaluate((s) => { state.settings = { ...state.settings, ...s }; renderQuotas(); }, { usageOrder: ["deepseek", "codex", "claude", "kimi"], panelUsageHidden: ["deepseek"] });
-      await win.waitForFunction(() => document.querySelectorAll("#subscriptionUsage > [data-key]").length >= 4);
+      releaseInitial();
+      await win.waitForFunction(() => document.querySelectorAll("#subscriptionUsage > [data-key]").length >= 4 && document.querySelector("#subscriptionUsage > [data-key]")?.dataset.key === "deepseek");
       assert.deepEqual(await win.evaluate(() => [...new Set([...document.querySelectorAll("#subscriptionUsage > [data-key]")].map((c) => c.dataset.key))]), ["deepseek", "codex", "claude", "kimi"]);
 
       assert.deepEqual(errors, []);

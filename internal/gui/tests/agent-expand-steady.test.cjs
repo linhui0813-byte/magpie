@@ -67,6 +67,9 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await page.route("**/*", serve);
       await page.goto("http://magpie.test/?view=agents");
       await page.locator(`${row} .ag-conn`).waitFor();
+      // The view's entrance translates fractional coordinates. Let it
+      // finish before taking the baseline for the row's own animation.
+      await page.waitForFunction(() => !document.querySelector("#view-agents").getAnimations().some(a => a.playState === "running"));
 
       const shut = await where(page);
       const opening = await heights(page, 800);

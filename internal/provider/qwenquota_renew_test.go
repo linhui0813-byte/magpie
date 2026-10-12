@@ -18,6 +18,10 @@ import (
 
 const qwenExpiredReply = `{"data":{"success":false,"errorCode":"BailianGateway.Login.NotLogined"}}`
 
+// The live gateway can accept the regenerated token but refuse its RAM
+// user's workspace permissions. The CLI then exits after saving the token.
+const qwenPermissionReply = `{"code":"200","data":{"success":false,"httpStatus":200,"errorCode":"BailianGateway.AuthorityPolicies.NoPermission","api":"zeldaHttp.apikeyMgr./tokenplan/personal/api/v2/usage","errorMsg":"{\"authorityPolicies\":[\"智能体-操作\"]}"},"httpStatusCode":200,"successResponse":true}`
+
 func qwenRenewTest(t *testing.T, profile string) string {
 	t.Helper()
 	dir := t.TempDir()
@@ -211,6 +215,44 @@ func TestQwenConsoleRenewFailureIsBoundedAndPrivate(t *testing.T) {
 	}
 	if calls.Load() != 1 {
 		t.Fatalf("failed renewal retried %d times within one minute", calls.Load())
+	}
+}
+
+func TestQwenConsoleReadsTokenSavedBeforeCLIError(t *testing.T) {
+	for _, profile := range []string{"default", "work"} {
+		for _, tc := range []struct {
+			name, body string
+			denied     bool
+		}{
+			{"allowance", qwenMonthlyReply, false},
+			{"permissions", qwenPermissionReply, true},
+		} {
+			t.Run(profile+"/"+tc.name, func(t *testing.T) {
+				dir := qwenRenewTest(t, profile)
+				runQwenConsoleCLI = func(context.Context, qwenConsole) error {
+					qwenWriteTestConsole(t, dir, profile, "renewed-console")
+					return errors.New("CLI lookup failed with test-access-secret in stderr")
+				}
+				qwenRenewTransport(t, func(r *http.Request) (*http.Response, error) {
+					if r.Header.Get("Authorization") == "Bearer expired-console" {
+						return qwenRenewReply(r, 200, qwenExpiredReply), nil
+					}
+					return qwenRenewReply(r, 200, tc.body), nil
+				})
+				c, _ := readQwenConsole()
+				next, ws, err := qwenConsoleAllowance(context.Background(), c)
+				if next.Token != "renewed-console" {
+					t.Fatal("a CLI lookup failure discarded its successfully renewed token")
+				}
+				if tc.denied {
+					if err == nil || errors.Is(err, errQwenConsole) || !strings.Contains(err.Error(), "permission denied") || len(ws) != 0 || strings.Contains(err.Error(), "test-access-secret") {
+						t.Fatalf("workspace permission denial became a renewal failure or exposed CLI output: %v", err)
+					}
+				} else if err != nil || len(ws) != 1 || ws[0].Used != 25 {
+					t.Fatalf("the token saved before a CLI error was not used for a fresh allowance: windows=%d error=%v", len(ws), err)
+				}
+			})
+		}
 	}
 }
 

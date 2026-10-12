@@ -94,6 +94,10 @@ during renewal returns an error. The CLI runs without a Terminal window,
 with the selected configuration directory and profile pinned. Its output
 is discarded, and no credentials are passed in process arguments. A
 renewal failure cannot hide an expired session behind an old reading.
+The CLI can save a replacement token and then fail its allowance retry.
+Magpie still reads that saved session and reports its lookup result;
+a workspace permission denial is not reported as an expired login or
+another reason to renew.
 
 Configure renewal credentials through the official CLI in the account
 that owns the allowance, using a dedicated RAM user with only the required
@@ -102,7 +106,12 @@ documents `AliyunTokenPlanReadOnlyAccess`, `AliyunBSSReadOnlyAccess`, and
 the subscription permission in Bailian account management. The permission
 to generate a CLI token must also be verified for that user. A real quota
 read is required before treating the RAM user's access to the personal
-allowance as verified. The CLI can remain closed between renewals.
+allowance as verified. The console gateway can enforce additional Bailian
+workspace permissions beyond the documented subscription role; a live
+`BailianGateway.AuthorityPolicies.NoPermission` is shown with instructions
+to check Bailian account management. Review any broader operation role
+before granting it for a read-only allowance task. The CLI can remain
+closed between renewals.
 
 The card says **Bailian console**: this is that console account's shared
 personal allowance, not a verified allowance for each saved API key. It is

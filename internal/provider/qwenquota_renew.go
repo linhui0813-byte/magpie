@@ -70,18 +70,21 @@ func qwenConsoleAllowance(ctx context.Context, c qwenConsole) (qwenConsole, []Qu
 	rctx, cancel := context.WithTimeout(ctx, 8*time.Second)
 	err = runQwenConsoleCLI(rctx, next)
 	cancel()
-	if err != nil {
-		return next, nil, renewErr
-	}
-	renewed, err := readQwenConsole()
-	if err != nil {
-		return renewed, nil, err
+	// The CLI can save a replacement token and then fail its quota retry.
+	// That is a lookup failure, not a failed sign-in: read the new session
+	// before classifying its exit, without exposing either output stream.
+	renewed, readErr := readQwenConsole()
+	if readErr != nil {
+		return renewed, nil, readErr
 	}
 	if !sameQwenScope(next, renewed) {
 		return renewed, nil, errors.New("Bailian console profile changed during renewal; refresh the Qwen Token Plan card")
 	}
+	if err != nil && renewed.Token == next.Token {
+		return renewed, nil, renewErr
+	}
 	ws, err = qwenConsoleWindows(ctx, renewed)
-	if renewed.Token == next.Token && err != nil {
+	if renewed.Token == next.Token && errors.Is(err, errQwenConsole) {
 		return renewed, nil, renewErr
 	}
 	return renewed, ws, err

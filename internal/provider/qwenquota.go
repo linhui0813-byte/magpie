@@ -191,6 +191,9 @@ func readQwenPlan(b []byte) ([]QuotaWindow, error) {
 			if strings.Contains(code, "NotLogined") {
 				return nil, errQwenConsole
 			}
+			if code == "BailianGateway.AuthorityPolicies.NoPermission" {
+				return nil, errors.New("Qwen Token Plan console permission denied; check this RAM user's permissions in Bailian account management")
+			}
 			return nil, errors.New("Qwen Token Plan console lookup was refused")
 		}
 		var ws []QuotaWindow

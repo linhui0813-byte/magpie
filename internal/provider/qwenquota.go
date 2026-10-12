@@ -2,7 +2,7 @@ package provider
 
 // Qwen Token Plan's allowance belongs to the signed-in Bailian console,
 // not to its model API key. Reuse the official CLI's console sign-in without
-// copying or changing it; its gateway also serves the current monthly plan.
+// copying it; the CLI owns renewal too. Its gateway serves the monthly plan.
 
 import (
 	"context"
@@ -31,6 +31,8 @@ type qwenConsole struct {
 	Site        string `json:"console_site"`
 	SwitchAgent int64  `json:"console_switch_agent"`
 	Profile     string `json:"-"`
+	Dir         string `json:"-"`
+	CanRenew    bool   `json:"-"`
 }
 
 // readQwenConsole follows the CLI's active_config, including named profiles.
@@ -73,11 +75,22 @@ func readQwenConsole() (qwenConsole, error) {
 	}
 	c.Token = strings.TrimSpace(c.Token)
 	c.Profile = profile
+	c.Dir = dir
 	if c.Token == "" {
 		return c, errQwenConsole
 	}
 	if c.Region != "" && c.Region != "cn-beijing" || c.Site != "" && c.Site != "domestic" {
 		return c, errors.New("Qwen Token Plan needs a domestic Beijing Bailian console profile")
+	}
+	// The CLI renews from a stored static AccessKey pair, not from a
+	// browser refresh token. Keep only whether that pair is configured.
+	var auth struct {
+		ID     string `json:"access_key_id"`
+		Secret string `json:"access_key_secret"`
+		STS    string `json:"security_token"`
+	}
+	if json.Unmarshal(b, &auth) == nil {
+		c.CanRenew = strings.TrimSpace(auth.ID) != "" && strings.TrimSpace(auth.Secret) != "" && strings.TrimSpace(auth.STS) == ""
 	}
 	return c, nil
 }
@@ -106,7 +119,7 @@ func qwenPlanQuotas(ctx context.Context) []SubscriptionQuota {
 		q := SubscriptionQuota{Provider: p.ID, Name: p.Name, Icon: p.Icon, Plan: "Token Plan", User: user, Windows: []QuotaWindow{}}
 		c, err := readQwenConsole()
 		if err == nil {
-			q.Windows, err = qwenConsoleWindows(p.Via(ctx), c)
+			c, q.Windows, err = qwenConsoleAllowance(p.Via(ctx), c)
 		}
 		if err != nil {
 			q.Error = err.Error()

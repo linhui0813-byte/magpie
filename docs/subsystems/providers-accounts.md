@@ -71,9 +71,38 @@ Its model API key cannot authenticate the console lookup. Sign in to the
 account that owns the plan with `bl auth login --console` (install the CLI
 with `npm install -g bailian-cli`), then refresh the card. Magpie reads the
 CLI's `~/.bailian/config.json`, or `BAILIAN_CONFIG_DIR/config.json`, following
-`active_config` for a named profile. It never changes or copies that sign-in.
+`active_config` for a named profile. Magpie never copies that sign-in or
+writes the CLI's configuration itself.
 The profile must use the domestic Beijing console. A missing or expired
 session leaves the Qwen card visible with a sign-in instruction.
+
+When the console refuses an expired session, and that same CLI profile has
+a static Alibaba Cloud AccessKey ID and Secret (`access_key_id` and
+`access_key_secret`), [`qwenquota_renew.go`](../../internal/provider/qwenquota_renew.go)
+asks the installed `bl` (or `bailian`) CLI to read this same allowance. The
+[CLI's client](https://github.com/modelstudioai/cli/blob/main/packages/core/src/client/client.ts)
+renews the token with `GenerateCLIAccessToken`, retries once, and saves it
+in its own profile. Magpie rereads the session, checks that its profile and
+console scope still match, and reads the card with that session. Model API
+keys cannot renew it. Browser-only profiles and profiles with a temporary
+STS security token retain the manual sign-in path.
+
+Renewals are serialized, bounded to eight seconds, and a failed attempt
+is not repeated for the same session within a minute. Concurrent reads
+reuse the session already renewed; a profile or console scope changed
+during renewal returns an error. The CLI runs without a Terminal window,
+with the selected configuration directory and profile pinned. Its output
+is discarded, and no credentials are passed in process arguments. A
+renewal failure cannot hide an expired session behind an old reading.
+
+Configure renewal credentials through the official CLI in the account
+that owns the allowance, using a dedicated RAM user with only the required
+permissions. The [personal-plan setup](https://help.aliyun.com/zh/model-studio/token-plan-personal-quick-start)
+documents `AliyunTokenPlanReadOnlyAccess`, `AliyunBSSReadOnlyAccess`, and
+the subscription permission in Bailian account management. The permission
+to generate a CLI token must also be verified for that user. A real quota
+read is required before treating the RAM user's access to the personal
+allowance as verified. The CLI can remain closed between renewals.
 
 The card says **Bailian console**: this is that console account's shared
 personal allowance, not a verified allowance for each saved API key. It is

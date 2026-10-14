@@ -214,6 +214,9 @@ type Provider struct {
 	// Ark's account balance instead uses AccessKeyID:SecretAccessKey to
 	// sign only the Volcengine billing lookup (volcengine_balance.go).
 	BalanceToken string `json:"balanceToken,omitempty"`
+	// GeminiBilling estimates recorded funds minus exported account charges.
+	// It holds no authentication material (see gemini_billing.go).
+	GeminiBilling *GeminiBilling `json:"geminiBilling,omitempty"`
 	// ZhipuTeam, for a Zhipu or Z.ai key on a team's GLM Coding Plan, is
 	// the team's organization and project, from the BigModel console: the
 	// team's windows are told to the key only with them (see
@@ -543,6 +546,14 @@ func Save(p Provider) error {
 	if err := checkAccountProxies(p.AccountProxies); err != nil {
 		return err
 	}
+	if p.GeminiBilling != nil {
+		if !SupportsGeminiBilling(p) || p.BalanceURL != "" {
+			return errors.New("a Gemini billing estimate needs Google's own Gemini endpoint and no custom Balance URL")
+		}
+		if err := p.GeminiBilling.check(); err != nil {
+			return err
+		}
+	}
 	if p.Name == "" {
 		p.Name = p.ID
 	}
@@ -645,6 +656,9 @@ func AddCopy(p Provider, from string) (string, error) {
 	}
 	if p.BalanceToken == "" {
 		p.BalanceToken = src.BalanceToken
+	}
+	if p.GeminiBilling == nil {
+		p.GeminiBilling = src.GeminiBilling
 	}
 	if p.ZhipuTeam == nil {
 		p.ZhipuTeam = src.ZhipuTeam
@@ -851,6 +865,7 @@ func normalize(p Provider) Provider {
 	p.AccountModels = normalAccountModels(p.AccountModels)
 	p.AccountCaps = normalAccountCaps(p.AccountCaps)
 	p.ZhipuTeam = p.ZhipuTeam.normal()
+	p.GeminiBilling = p.GeminiBilling.normal()
 	p.remoteMagpieEndpoints()
 	for _, u := range []*string{&p.Chat, &p.Responses, &p.Anthropic, &p.Decide, &p.Website, &p.KeysURL} {
 		*u = strings.TrimRight(strings.TrimSpace(*u), "/")

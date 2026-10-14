@@ -41,6 +41,30 @@ keys and accounts per request is in [Gateway routing and fallback](gateway-routi
 
 ## Constraints and failure behavior
 
+Google Gemini's own endpoint offers a delayed **Credit estimate**, described
+in [the setup guide](../gemini-billing-estimate.md). `Provider.GeminiBilling`
+names a standard BigQuery billing export, billing account, Gemini service,
+currency, UTC start date and recorded funds. An omitted setting on GUI save
+preserves it; an empty object clears it. Imported Google endpoints support
+the same configuration; relays and custom Balance URLs cannot use it.
+[`gemini_billing.go`](../../internal/provider/gemini_billing.go) uses local
+Google Cloud ADC through Google's OAuth library, never the model key or
+provider headers. It sums exported cost and credits for the exact account
+and service across all projects, and subtracts this from recorded funds.
+The caller keeps funds and top-ups current. No matching rows, incomplete
+queries, invalid data, missing credentials and currency mismatches return
+an instruction or error, not zero. Queries are cached for 15 minutes,
+limited to a 1 GiB billed scan and a ten-second job timeout; explicit checks
+and card refreshes bypass the cache. Identical account configurations reuse
+the query result, and each shared account appears on its first enabled
+provider. Cache and stale-reading identities include the whole estimate
+configuration, so a changed account, currency, start date or funds cannot
+inherit the previous configuration's balance. `BillingEstimate` carries
+export and latest-usage timestamps through Usage, CLI and remote cards.
+The amount is prefixed with `≈`; the latest usage row does not establish
+complete coverage. Estimates neither drive routing nor contribute to wallet
+balance history or forecasts.
+
 Volcengine Ark's account balance is read by
 [`volcengine_balance.go`](../../internal/provider/volcengine_balance.go),
 through the official billing
@@ -145,6 +169,8 @@ go test -tags nogui ./internal/provider -run 'TestQwen|TestReadQwenPlan'
 go test -tags nogui ./internal/provider -run 'TestVolcengine|TestReadVolcengine'
 node --test internal/gui/tests/volcengine-balance.test.cjs
 node --test internal/gui/tests/usage-card-refresh.test.cjs
+go test -tags nogui ./internal/provider ./internal/gui -run 'TestGeminiBilling|TestReadGeminiBilling'
+node --test internal/gui/tests/gemini-billing.test.cjs
 ```
 
 The package's tests use a home of their own (`testenv`). Never point them at

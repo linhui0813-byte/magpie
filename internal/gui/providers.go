@@ -91,9 +91,11 @@ type providerJSON struct {
 	// of its windows, by its name in lower case (provider.AccountCaps)
 	AccountCaps map[string]int `json:"accountCaps,omitempty"`
 	// where a custom provider's balance is asked (see provider.Balance)
-	BalanceURL  string `json:"balanceURL,omitempty"`
-	BalancePath string `json:"balancePath,omitempty"`
-	ModelsURL   string `json:"modelsURL,omitempty"`
+	BalanceURL             string                  `json:"balanceURL,omitempty"`
+	BalancePath            string                  `json:"balancePath,omitempty"`
+	GeminiBilling          *provider.GeminiBilling `json:"geminiBilling,omitempty"`
+	GeminiBillingSupported bool                    `json:"geminiBillingSupported,omitempty"`
+	ModelsURL              string                  `json:"modelsURL,omitempty"`
 	// an account-wide balance token (provider.BalanceToken): whether the
 	// vendor takes one, and whether one is saved; never the token itself
 	BalanceToken struct {
@@ -426,6 +428,7 @@ func providerInfo(p provider.Provider, agents []agentUse) providerJSON {
 		out.Key.Optional = pr.NoKey
 	}
 	out.BalanceToken.Takes, out.BalanceToken.Set = provider.TakesBalanceToken(p), p.BalanceToken != ""
+	out.GeminiBilling, out.GeminiBillingSupported = p.GeminiBilling, provider.SupportsGeminiBilling(p)
 	if provider.UsesVolcengineBilling(p) {
 		out.BalanceToken.Kind = "volcengine"
 	}
@@ -976,6 +979,7 @@ func providerRoutes(mux *http.ServeMux, w Windows) {
 			if pr, err := provider.FromPreset(in.Preset); err == nil && in.Chat == "" && in.Responses == "" && in.Anthropic == "" {
 				pr.Key, pr.Models, pr.Fallback, pr.Headers, pr.BalanceToken, pr.Contexts = in.Key, in.Models, in.Fallback, in.Headers, in.BalanceToken, in.Contexts
 				pr.ZhipuTeam = in.ZhipuTeam
+				pr.GeminiBilling = in.GeminiBilling
 				pr.Searches = in.Searches
 				pr.PinUpstream = in.PinUpstream
 				pr.Unredacted = in.Unredacted
@@ -1096,6 +1100,9 @@ func providerRoutes(mux *http.ServeMux, w Windows) {
 				// a Zhipu key's team likewise: {} clears it
 				if in.ZhipuTeam == nil && old != nil {
 					in.ZhipuTeam = old.ZhipuTeam
+				}
+				if in.GeminiBilling == nil && old != nil {
+					in.GeminiBilling = old.GeminiBilling
 				}
 				if in.Key == "" && old != nil {
 					in.Key = old.Key
@@ -1382,6 +1389,16 @@ func providerRoutes(mux *http.ServeMux, w Windows) {
 			}
 			ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 			defer cancel()
+			if in.GeminiBilling != nil {
+				q.GeminiBilling = in.GeminiBilling
+				amount, estimate, err := provider.CheckGeminiBilling(ctx, q)
+				out := map[string]any{"ok": err == nil, "amount": amount, "billingEstimate": estimate}
+				if err != nil {
+					out["error"] = err.Error()
+				}
+				writeJSON(rw, out)
+				return
+			}
 			amount, ok, err := provider.Balance(ctx, q)
 			out := map[string]any{"ok": ok, "amount": amount}
 			if err != nil {

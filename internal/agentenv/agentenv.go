@@ -53,6 +53,8 @@ var Vars = []string{
 	"KIMI_CODE_HOME", "KIMI_SHARE_DIR",
 	// Bailian CLI's console sign-in, for Qwen Token Plan allowance
 	"BAILIAN_CONFIG_DIR",
+	// Google Cloud's billing-export credentials, separate from Gemini keys
+	"GOOGLE_APPLICATION_CREDENTIALS", "CLOUDSDK_CONFIG",
 	// MiMo Code, MiniMax Code, OpenHanako, Hermes, dsh, WorkBuddy, CodeBuddy Code
 	"MIMOCODE_HOME", "MINIMAX_DATA_DIR", "HANA_HOME", "HERMES_HOME", "DSH_HOME",
 	"WORKBUDDY_CONFIG_DIR", "CODEBUDDY_CONFIG_DIR",

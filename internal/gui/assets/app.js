@@ -7429,9 +7429,54 @@ function baseAPIOf(p) {
   return p.chat ? "openai" : p.anthropic ? "anthropic" : p.responses ? "responses" : p.decide ? "decide" : "openai";
 }
 
+// Gemini's estimate uses a separately configured billing export.
+function geminiBillingFields(p) {
+  const wrap = el("div");
+  wrap.className = "gemini-billing";
+  const [toggle, cb] = tick(t("Estimate Gemini credits from billing data"), !!draft.geminiBilling);
+  const inner = el("div", "inner");
+  inner.style.display = draft.geminiBilling ? "grid" : "none";
+  let config = draft.geminiBilling || { table: "", location: "US", billingAccount: "", serviceID: "", currency: "USD", since: new Date().toISOString().slice(0, 10), credits: null };
+  const add = (label, key, placeholder, type = "text", hint = "") => {
+    const i = input(config[key] ?? "", placeholder, type);
+    i.dataset.billing = key;
+    i.oninput = () => { config[key] = key === "credits" ? (i.value === "" ? null : Number(i.value)) : i.value.trim(); };
+    inner.append(...field(t(label), i, hint ? t(hint) : ""));
+  };
+  add("Billing export table", "table", "project.dataset.table");
+  add("Dataset location", "location", "US / EU / asia-east1");
+  add("Billing account ID", "billingAccount", "XXXXXX-XXXXXX-XXXXXX");
+  add("Gemini service ID", "serviceID", "XXXX-XXXX-XXXX", "text", "Use the Gemini API service ID from your billing export; the estimate includes all projects sharing this account.");
+  add("Billing currency", "currency", "HKD / USD");
+  add("Start date (UTC)", "since", "YYYY-MM-DD", "date");
+  add("Recorded funds", "credits", "160.00", "number", "Balance at 00:00 UTC on the start date, plus all later top-ups, in the billing currency. Update this amount after every top-up.");
+  const buttons = el("div", "pair wrap");
+  const check = el("button", "text action", t("Check estimate"));
+  check.disabled = !p;
+  const help = el("button", "link", t("Setup guide ↗"));
+  help.onclick = () => api("open", { url: "https://github.com/linhui0813-byte/magpie/blob/main/docs/gemini-billing-estimate.md" });
+  buttons.append(check, help);
+  const result = el("div", "bal-res");
+  check.onclick = async () => {
+    check.disabled = true;
+    result.className = "bal-res wait"; result.textContent = "…";
+    try {
+      const r = await api("provider/balance", { id: p.id, geminiBilling: { ...config } });
+      result.className = "bal-res " + (r.error ? "bad" : "ok");
+      result.textContent = r.error ? balanceError(r.error) || r.error : t("Estimated balance") + " " + r.amount;
+    } catch (e) { result.className = "bal-res bad"; result.textContent = e.message; }
+    finally { check.disabled = false; }
+  };
+  buttons.append(result);
+  inner.append(...field(t("Estimate"), buttons, t("Uses Google Cloud credentials and a BigQuery billing export. Refreshes at most every 15 minutes; billing data may be over 24 hours late. This estimate is not the prepaid wallet balance.")));
+  cb.onchange = () => { draft.geminiBilling = cb.checked ? config : null; inner.style.display = cb.checked ? "grid" : "none"; };
+  wrap.append(toggle, inner);
+  return field(t("Credit estimate"), wrap, "");
+}
+
 // draftOf is a saved provider as its editor's form holds it.
 function draftOf(p) {
-  return { id: p.id, name: p.name, preset: p.preset, chat: p.chat, responses: p.responses, anthropic: p.anthropic, catalog: p.catalog, decide: p.decide || "", key: "", api: baseAPIOf(p), chosen: pickedOf(p), extra: [], headers: headerRows(p.headers), icon: p.icon || "", fallback: [...(p.fallback || [])], unlisted: !!p.unlisted, searches: !!p.searches, unredacted: !!p.unredacted, pinUpstream: !!p.pinUpstream, balanceURL: p.balanceURL || "", balancePath: p.balancePath || "", modelsURL: p.modelsURL || "", contexts: contextsText(p.contexts), outputs: contextsText(p.outputs), compacts: contextsText(p.compacts), keysUrl: p.keysUrl || "", ...proxyDraft(p), ...concurrencyDraft(p) };
+  return { id: p.id, name: p.name, preset: p.preset, chat: p.chat, responses: p.responses, anthropic: p.anthropic, catalog: p.catalog, decide: p.decide || "", key: "", api: baseAPIOf(p), chosen: pickedOf(p), extra: [], headers: headerRows(p.headers), icon: p.icon || "", fallback: [...(p.fallback || [])], unlisted: !!p.unlisted, searches: !!p.searches, unredacted: !!p.unredacted, pinUpstream: !!p.pinUpstream, balanceURL: p.balanceURL || "", balancePath: p.balancePath || "", geminiBilling: p.geminiBilling ? { ...p.geminiBilling } : null, modelsURL: p.modelsURL || "", contexts: contextsText(p.contexts), outputs: contextsText(p.outputs), compacts: contextsText(p.compacts), keysUrl: p.keysUrl || "", ...proxyDraft(p), ...concurrencyDraft(p) };
 }
 
 // duplicateProvider opens the Add form on a copy of p (#268): its URLs,
@@ -7836,6 +7881,8 @@ function drawEditor(p, presetID) {
   // — or a custom provider's, whose Balance URL may not be named yet: a
   // token pasted there says at once which URL it wants (balanceFix)
   let balFix = null;
+  const geminiBilling = p?.geminiBillingSupported || (isNew && pr?.id === "google");
+  if (geminiBilling) ed.append(...geminiBillingFields(p));
   const arkBalance = p?.balanceToken?.kind === "volcengine" || (isNew && pr?.id === "volcengine");
   if (p?.balanceToken?.takes || custom || arkBalance) {
     const saved = !!p?.balanceToken?.set;
@@ -8110,6 +8157,7 @@ function drawEditor(p, presetID) {
     if (p && priceTypedError(ed)) return;
     if (draft.balanceToken) body.balanceToken = draft.balanceToken;
     else if (draft.clearBalanceToken) body.clearBalanceToken = true;
+    if (geminiBilling) body.geminiBilling = draft.geminiBilling || {};
     if (team) {
       // both or neither: {} clears them
       const org = (draft.zhipuTeam.org || "").trim(), project = (draft.zhipuTeam.project || "").trim();
@@ -10921,6 +10969,13 @@ function balanceFieldOf(raw) {
 // balanceError: a balance that couldn't be read, said plainly where magpie
 // knows the fix (see balance.go); "" for any other.
 function balanceError(err) {
+  if (/^Gemini billing estimate needs setup/.test(err)) return t("Setup required: configure this provider's Credit estimate");
+  if (/^Gemini billing estimate needs Google Cloud credentials/.test(err)) return t("Sign in to Google Cloud with gcloud auth application-default login");
+  if (/^No matching Gemini billing rows/.test(err)) return t("No exported Gemini charges yet; check billing export setup");
+  if (/^Gemini billing export (currency|contains mixed)/.test(err)) return t("Billing currency or exported data does not match the estimate setup");
+  if (/^Gemini billing query has not completed/.test(err)) return t("Billing query is still running; refresh later");
+  const billingHTTP = /^Gemini billing query: HTTP (\d+)/.exec(err);
+  if (billingHTTP) return t("Billing query failed (HTTP {code}); check export access and the query limit", { code: billingHTTP[1] });
   if (/takes the API key, not the access token/.test(err)) return t("The Balance URL …/api/usage/token takes the API key, not the access token — set it to …/api/user/self in the provider's settings");
   if (/New-Api-User/i.test(err)) return t("Add the header New-Api-User = your user ID (shown in the site's personal settings) to the provider's Headers");
   return "";
@@ -14287,7 +14342,7 @@ function balanceRow(sub, why, when = true) {
   const parts = sub.balanceParts;
   const b = el("div", "quota-balance" + (parts?.length ? " parts" : ""));
   b.title = t(why);
-  if (!parts?.length) b.append(el("span", "", t("Balance")), el("b", "", sub.balance));
+  if (!parts?.length) b.append(el("span", "", t(sub.billingEstimate ? "Estimated balance" : "Balance")), el("b", "", sub.balance));
   for (const [i, p] of (parts || []).entries()) {
     const row = el("div", "bal-part" + (i ? "" : " lead"));
     row.append(el("span", "", p.label || (i ? "" : t("Balance"))), el("b", "", p.text));
@@ -14296,6 +14351,12 @@ function balanceRow(sub, why, when = true) {
   }
   const read = when && readWhen(sub, when === "refresh");
   if (read) b.append(read);
+  if (sub.billingEstimate) {
+    const date = (value) => new Date(value).toLocaleString();
+    const note = el("div", "quota-read", t("Latest exported usage: {when}", { when: date(sub.billingEstimate.latestUsage) }));
+    note.title = t("Exported {when}. Billing data may arrive more than 24 hours late; recorded top-ups and starting funds must be kept current.", { when: date(sub.billingEstimate.exportedAt) });
+    b.append(note);
+  }
   return b;
 }
 

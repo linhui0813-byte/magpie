@@ -46,6 +46,9 @@ func balanceSourceOf(p Provider) (balanceSource, bool) {
 	if UsesVolcengineBilling(p) {
 		return balanceSource{volcengineBalanceURL, readVolcengineBalance, p.BalanceToken}, true
 	}
+	if SupportsGeminiBilling(p) {
+		return balanceSource{}, true
+	}
 	hosts := []string{hostOf(p.Chat), hostOf(p.Responses), hostOf(p.Anthropic)}
 	for _, h := range hosts {
 		switch h {
@@ -696,6 +699,11 @@ func balanceRead(ctx context.Context, p Provider) (amount string, parts []Balanc
 		amount, err = volcengineBalance(ctx, src.token)
 		return amount, nil, nil, true, err
 	}
+	if SupportsGeminiBilling(p) && p.BalanceURL == "" {
+		_, force := refreshing(ctx)
+		r := geminiBillingRead(ctx, p, force)
+		return r.amount, nil, nil, true, r.err
+	}
 	if src.token != "" && p.BalanceURL != "" && balanceURLPath(p.BalanceURL) == newAPIKeyUsage {
 		return "", nil, nil, true, errKeyUsageWithToken(p.BalanceURL)
 	}
@@ -831,12 +839,24 @@ func KeyBalances(ctx context.Context) []SubscriptionQuota {
 		user string
 	}
 	var jobs []job
+	geminiAccounts := map[string]bool{}
 	for _, p := range All() {
 		if p.Hidden || p.Off || p.Account != nil || p.Key == "" {
 			continue
 		}
 		src, ok := balanceSourceOf(p)
 		if !ok && !clineKeyCard(p) {
+			continue
+		}
+		if SupportsGeminiBilling(p) && p.BalanceURL == "" {
+			account := p.ID
+			if p.GeminiBilling != nil {
+				account = p.GeminiBilling.BillingAccount
+			}
+			if !geminiAccounts[account] {
+				jobs = append(jobs, job{p, ""})
+				geminiAccounts[account] = true
+			}
 			continue
 		}
 		others := 0
@@ -880,6 +900,19 @@ func KeyBalances(ctx context.Context) []SubscriptionQuota {
 		go func() {
 			defer wg.Done()
 			q := SubscriptionQuota{Provider: j.p.ID, Name: j.p.Name, Icon: j.p.Icon, User: j.user, Windows: []QuotaWindow{}}
+			if SupportsGeminiBilling(j.p) && j.p.BalanceURL == "" {
+				_, force := refreshing(ctx)
+				r := geminiBillingRead(ctx, j.p, force)
+				q.Plan = "BigQuery"
+				if r.err != nil {
+					q.Error = r.err.Error()
+				} else {
+					q.Balance, q.BillingEstimate, q.ReadAt = r.amount, r.estimate, &r.at
+				}
+				config, _ := json.Marshal(j.p.GeminiBilling)
+				out[i] = keepReading(ctx, q, keyTag("gemini-billing", string(config)))
+				return
+			}
 			if clineKeyCard(j.p) {
 				// ClinePass's limits beside the credits (cline_usage.go)
 				if ws, amount, err := clineKeyUsage(ctx, j.p); err != nil {

@@ -77,14 +77,15 @@ type QuotaWindow struct {
 // SubscriptionQuota is provider-reported allowance usage. This is separate
 // from Dial's local token log: vendors expose percentages, not token totals.
 type SubscriptionQuota struct {
-	Provider  string        `json:"provider"`
-	Name      string        `json:"name"`
-	Icon      string        `json:"icon"`
-	Plan      string        `json:"plan,omitempty"`
-	AccessSKU string        `json:"accessSku,omitempty"`
-	User      string        `json:"user,omitempty"` // the account, so two of one vendor tell apart
-	Windows   []QuotaWindow `json:"windows"`
-	Balance   string        `json:"balance,omitempty"` // what is left on an API key, instead of windows
+	Provider        string           `json:"provider"`
+	Name            string           `json:"name"`
+	Icon            string           `json:"icon"`
+	Plan            string           `json:"plan,omitempty"`
+	AccessSKU       string           `json:"accessSku,omitempty"`
+	User            string           `json:"user,omitempty"` // the account, so two of one vendor tell apart
+	Windows         []QuotaWindow    `json:"windows"`
+	Balance         string           `json:"balance,omitempty"` // what is left on an API key, instead of windows
+	BillingEstimate *BillingEstimate `json:"billingEstimate,omitempty"`
 	// BalanceParts are the Balance's amounts each apart, when the balance
 	// field the user wrote has several or a percent (cardParts)
 	BalanceParts []BalancePart `json:"balanceParts,omitempty"`

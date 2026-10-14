@@ -106,7 +106,7 @@ func addBalancePoint(pts []BalancePoint, n BalancePoint) []BalancePoint {
 
 // balancePointOf is the point q's balance makes, if it is one to keep.
 func balancePointOf(q SubscriptionQuota, now time.Time) (BalancePoint, bool) {
-	if q.Error != "" || q.AsOf != nil || q.Provider == "" || q.Balance == "" || len(q.BalanceParts) > 0 {
+	if q.Error != "" || q.AsOf != nil || q.Provider == "" || q.Balance == "" || len(q.BalanceParts) > 0 || q.BillingEstimate != nil {
 		return BalancePoint{}, false
 	}
 	n, ok := BalanceNumber(q.Balance)
@@ -163,7 +163,7 @@ func noteBalanceHistory(qs []SubscriptionQuota, now time.Time) {
 		writeBalanceHist(h)
 	}
 	for i, q := range qs {
-		if q.Balance == "" || len(q.BalanceParts) > 0 {
+		if q.Balance == "" || len(q.BalanceParts) > 0 || q.BillingEstimate != nil {
 			continue
 		}
 		if h == nil {

@@ -146,3 +146,99 @@ func TestGroupLevelsWithFixedMembers(t *testing.T) {
 		}
 	}
 }
+
+// While a request holds the providers, whether a member at an effort is a
+// model's own id is looked up among them once, not at each of the
+// group's expansions (XcodeFish, #2502: a third of /v1/models' CPU was
+// Find and Available again for every such member); a provider saved
+// meanwhile is looked at anew, and with nothing held every look is fresh.
+func TestMemberEffortLooksOncePerHold(t *testing.T) {
+	effortHome(t)
+	looks := func(id string, n int) int64 {
+		was := providersLooked.Load()
+		for range n {
+			if m, e := MemberEffort(id); m+":"+e != id {
+				t.Fatalf("MemberEffort(%q) = %q %q", id, m, e)
+			}
+		}
+		return providersLooked.Load() - was
+	}
+	release := Hold()
+	if got := looks("a/m:low", 5); got != 1 {
+		t.Fatalf("held: looked %d times, want 1", got)
+	}
+	if err := Save(Provider{ID: "a", Name: "A", Key: "k", Chat: "http://127.0.0.1:1/v1", Models: []string{"m", "m:low"}}); err != nil {
+		t.Fatal(err)
+	}
+	if m, e := MemberEffort("a/m:low"); m != "a/m:low" || e != "" {
+		t.Fatalf("saved while held: %q %q, want the model's own id", m, e)
+	}
+	release()
+	if got := looks("a/n:high", 3); got != 3 {
+		t.Fatalf("not held: looked %d times, want 3", got)
+	}
+}
+
+// A member may carry several levels, joined by "+" (Garydesu on X: one
+// model in a group at a few efforts, the agent picking): kept each once,
+// lowest first, lowercase; read back as levels the member follows the
+// agent among, not one it is fixed at; offered to agents as the group's
+// levels for it; and one level alone is still a fixed effort, as a group
+// saved before has it.
+func TestMemberSeveralLevels(t *testing.T) {
+	effortHome(t)
+	for in, want := range map[string][2]string{
+		"a/m:high+low":     {"a/m", "low+high"},
+		"a/m:HIGH+low+low": {"a/m", "low+high"},
+		"a/m:low+low":      {"a/m", "low"},
+		"a/m:low+turbo":    {"a/m:low+turbo", ""},
+		"or/odd:high+max":  {"or/odd", "high+max"},
+	} {
+		if m, e := MemberEffort(in); m != want[0] || e != want[1] {
+			t.Errorf("MemberEffort(%q) = %q %q, want %q %q", in, m, e, want[0], want[1])
+		}
+	}
+	if f, l := MemberLevels("low+high"); f != "" || !slices.Equal(l, []string{"low", "high"}) {
+		t.Errorf("MemberLevels(low+high) = %q %v", f, l)
+	}
+	if f, l := MemberLevels("high"); f != "high" || l != nil {
+		t.Errorf("MemberLevels(high) = %q %v", f, l)
+	}
+	if err := SetModelEfforts("a/m", []string{"low", "medium", "high", "xhigh"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveGroup(Group{Name: "Pick", Members: []string{"a/m:XHIGH+low", "a/n:medium"}, Rules: []Rule{{Use: "a/m:low+xhigh", Tokens: 10}}}); err != nil {
+		t.Fatal(err)
+	}
+	g, ms, ok := FindGroup("group/pick")
+	if !ok {
+		t.Fatal("no group")
+	}
+	if want := []string{"a/m:low+xhigh", "a/n:medium"}; !slices.Equal(g.Members, want) {
+		t.Fatalf("members %v, want %v", g.Members, want)
+	}
+	if ms[0].Effort != "" || !slices.Equal(ms[0].Levels, []string{"low", "xhigh"}) || ms[0].Spelled() != "a/m:low+xhigh" {
+		t.Fatalf("member %+v", ms[0])
+	}
+	if ms[1].Effort != "medium" || ms[1].Levels != nil || ms[1].Spelled() != "a/n:medium" {
+		t.Fatalf("fixed member %+v", ms[1])
+	}
+	i := slices.IndexFunc(Catalog(), func(e Entry) bool { return e.ID == "group/pick" })
+	if i < 0 {
+		t.Fatal("not listed")
+	}
+	if got := Catalog()[i].Efforts; !slices.Equal(got, []string{"low", "xhigh"}) {
+		t.Fatalf("offered %v, want the member's own low and xhigh", got)
+	}
+	// beside a member that follows the agent, the group offers what both have
+	if err := SetModelEfforts("a/n", []string{"low", "medium", "high"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveGroup(Group{Name: "Shared", Members: []string{"a/m:low+xhigh", "a/n"}}); err != nil {
+		t.Fatal(err)
+	}
+	i = slices.IndexFunc(Catalog(), func(e Entry) bool { return e.ID == "group/shared" })
+	if got := Catalog()[i].Efforts; !slices.Equal(got, []string{"low"}) {
+		t.Fatalf("shared %v, want low", got)
+	}
+}

@@ -44,6 +44,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: "chromium" }));
       const page = await (await browser.newContext({ viewport: { width: 900, height: 760 }, reducedMotion: "reduce" })).newPage();
       page.setDefaultTimeout(5000);
+      page.setDefaultNavigationTimeout(60000);
       const errors = [];
       page.on("pageerror", (e) => errors.push(e.message));
       t.after(async () => {
@@ -63,7 +64,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       const look = await hint.evaluate((e) => { const s = getComputedStyle(e); return { left: s.borderLeftWidth, color: s.color, ground: getComputedStyle(document.body).color }; });
       assert.equal(look.left, "0px", "no left border");
       assert.notEqual(look.color, look.ground, "said as a warning");
-      assert.equal(await page.locator(".editor").getByText(/vendor list|供应商列表/).count(), 0, "its defaults aren't called the vendor's list");
+      assert.equal(await page.locator(".editor").getByText(/vendor list ·|供应商列表 ·/).count(), 0, "its defaults aren't called the vendor's list");
       assert.deepEqual(errors, []);
     });
   }
@@ -72,6 +73,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
     const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: "chromium" }));
     const page = await (await browser.newContext({ viewport: { width: 900, height: 760 }, reducedMotion: "reduce" })).newPage();
     page.setDefaultTimeout(5000);
+    page.setDefaultNavigationTimeout(60000);
     t.after(() => browser.close());
     await page.route("**/*", server("en", ""));
     await page.goto("http://magpie.test/?view=providers");

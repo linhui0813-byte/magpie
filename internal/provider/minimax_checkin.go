@@ -21,6 +21,7 @@ package provider
 // WorkBuddy's and Trae CN's are (checkin.go).
 
 import (
+	"cmp"
 	"context"
 	"crypto/md5"
 	"encoding/hex"
@@ -131,7 +132,7 @@ func newMiniMaxCheckiner(accounts func() []miniMaxAccount) checkiner {
 	return checkiner{path: miniMaxCheckinPath(), now: time.Now, mu: &miniMaxCheckinMu, by: "minimax", label: "minimax", accounts: func() []checkinAcct {
 		var out []checkinAcct
 		for _, a := range accounts() {
-			out = append(out, checkinAcct{User: a.User, On: a.On, key: miniMaxCheckinKey(a), do: func(ctx context.Context) WorkBuddyCheckin { return miniMaxCheckin(ctx, a) }})
+			out = append(out, checkinAcct{User: a.User, On: a.On, key: miniMaxCheckinKey(a), provider: cmp.Or(a.card, a.siteID()), do: func(ctx context.Context) WorkBuddyCheckin { return miniMaxCheckin(ctx, a) }})
 		}
 		return out
 	}}
@@ -240,7 +241,7 @@ func CheckInMiniMax(ctx context.Context) []WorkBuddyCheckin {
 // MiniMaxCheckins is each MiniMax Code account's last check-in, as kept,
 // by its name now; asks nothing.
 func MiniMaxCheckins() []WorkBuddyCheckin {
-	st := readCheckins(miniMaxCheckinPath())
+	st := shownCheckins(miniMaxCheckinPath())
 	var out []WorkBuddyCheckin
 	listed := map[string]bool{}
 	for _, a := range miniMaxCheckinAccounts() {
@@ -312,5 +313,5 @@ func miniMaxSiteAccounts(site string, pp plugin.Provider) []miniMaxAccount {
 // KeepMiniMaxCheckedIn checks the MiniMax Code accounts in each day while
 // settings say to, as KeepTraeCheckedIn does Trae CN's.
 func KeepMiniMaxCheckedIn(ctx context.Context) {
-	keepCheckedIn(ctx, "minimax", newMiniMaxCheckiner(miniMaxCheckinAccounts), func() bool { return settings.Load().MiniMaxCheckin })
+	keepCheckedIn(ctx, "minimax", newMiniMaxCheckiner(miniMaxCheckinAccounts), func() bool { return settings.Shared().MiniMaxCheckin })
 }

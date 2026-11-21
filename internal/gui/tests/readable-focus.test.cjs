@@ -4,6 +4,7 @@ const fs = require("node:fs/promises");
 const path = require("node:path");
 const { test } = require("node:test");
 const { chromium, webkit } = require("playwright");
+const { watchSettingsReads, settingsDrawn } = require("./reader.cjs");
 const assets = path.resolve(__dirname, "../assets");
 const settings = { theme: "light", lang: "en", tray: "panel", textSize: 100, currency: "usd",
   dir: "/config/magpie", gateway: "http://127.0.0.1:3999", version: "0.1.900",
@@ -72,12 +73,15 @@ for (const engine of process.env.BROWSER ? [process.env.BROWSER] : ["chromium", 
     t.after(() => browser.close());
     const page = await browser.newPage({ viewport: { width: 1100, height: 600 }, reducedMotion: "reduce" });
     page.setDefaultTimeout(5000);
+    page.setDefaultNavigationTimeout(60000);
     const errors = [];
     page.on("pageerror", (e) => errors.push(e.message));
     await page.route("**/*", serve);
 
     await t.test("connection instructions and editor help are readable in both themes", async () => {
+      await watchSettingsReads(page);
       await page.goto("http://magpie.test/?view=gateway");
+      await settingsDrawn(page); // rows found are the ones that stay (#1659)
       await page.locator("#gwModels .name").first().waitFor();
       for (const theme of ["light", "dark"]) {
         await page.evaluate((value) => { document.documentElement.dataset.theme = value; }, theme);
@@ -95,8 +99,10 @@ for (const engine of process.env.BROWSER ? [process.env.BROWSER] : ["chromium", 
           assert.ok(ratio >= 4.5, `${theme} ${selector}: contrast ${ratio}`);
         }
       }
+      await watchSettingsReads(page);
       await page.goto("http://magpie.test/?view=settings");
-      const description = page.locator(".row.pref .sub").filter({ hasText: /\S/ }).first();
+      await settingsDrawn(page); // rows found are the ones that stay (#1659)
+      const description = page.locator(".row.pref .sub:visible").filter({ hasText: /\S/ }).first(); // a shown one: Appearance has none now (1ooogle on X)
       await description.waitFor();
       for (const theme of ["light", "dark"]) {
         await page.evaluate((value) => { document.documentElement.dataset.theme = value; }, theme);
@@ -105,7 +111,9 @@ for (const engine of process.env.BROWSER ? [process.env.BROWSER] : ["chromium", 
     });
 
     await t.test("selecting a model ID does not activate or redraw its row", async () => {
+      await watchSettingsReads(page);
       await page.goto("http://magpie.test/?view=gateway");
+      await settingsDrawn(page); // rows found are the ones that stay (#1659)
       const name = page.locator("#gwModels .name").nth(1);
       await name.waitFor();
       const picked = await page.locator("#gwModels .selected .name").textContent();
@@ -118,7 +126,7 @@ for (const engine of process.env.BROWSER ? [process.env.BROWSER] : ["chromium", 
       assert.equal(await page.locator("#gwModels .selected .name").textContent(), await name.textContent(), "an ordinary click still picks the model");
       await page.locator('#nav button[data-view="providers"]').click();
       await page.locator("#providers .row.provider").click();
-      await page.getByRole("button", { name: "Names & levels", exact: true }).click();
+      await page.getByRole("button", { name: "Model settings", exact: true }).click();
       const id = page.locator(".mname .mwho code").first();
       await id.scrollIntoViewIfNeeded();
       assert.equal(await selectText(page, id), await id.textContent(), "model IDs in the editor can be selected too");
@@ -129,8 +137,10 @@ for (const engine of process.env.BROWSER ? [process.env.BROWSER] : ["chromium", 
       // each step starts from a fresh page: macOS WebKit doesn't Tab to
       // buttons, and the page keeps the reader's place against a script's scroll
       const setup = async () => {
+        await watchSettingsReads(page);
         await page.goto("http://magpie.test/?view=settings");
-        await page.locator("#setTab-general").waitFor();
+        await settingsDrawn(page); // rows found are the ones that stay (#1659)
+        await page.locator(":is(#setTab-general, .nav-s[data-of=setTab-general]):visible").waitFor();
         await page.locator("#view-settings").evaluate((v) => {
           const first = document.createElement("button"); first.id = "focus-start"; first.textContent = "Edit";
           const spacer = document.createElement("div"); spacer.style.cssText = "flex:none;height:1400px";

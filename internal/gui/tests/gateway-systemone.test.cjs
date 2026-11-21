@@ -10,6 +10,7 @@ const fs = require("node:fs/promises");
 const path = require("node:path");
 const { test } = require("node:test");
 const { chromium, webkit } = require("playwright");
+const { reach } = require("./reader.cjs");
 
 const assets = path.resolve(__dirname, "../assets");
 const providers = {
@@ -60,7 +61,9 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: "chromium" }));
         const context = await browser.newContext({ viewport: { width: 900, height: 1000 }, reducedMotion: "reduce", colorScheme: theme });
         const page = await context.newPage();
+        await page.addInitScript(() => { try { localStorage.setItem("magpie.gwConnectFolded", "0"); } catch {} }); // Connect opened, as a user who reads it
         page.setDefaultTimeout(5000);
+        page.setDefaultNavigationTimeout(60000);
         const errors = [];
         page.on("pageerror", (e) => errors.push(e.message));
         await page.route("**/*", serve(lang, theme));
@@ -100,7 +103,10 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         assert.match(await snippet(), /fetch\("http:\/\/127\.0\.0\.1:3999\/v1\/systemone"/);
 
         // a click on a decision model puts it in, a click on another model
-        // goes back to OpenAI's
+        // goes back to OpenAI's. The line on where gateway keys come from
+        // (unshared) puts the rows past the window's foot: the reader
+        // wheels down to them
+        await reach(page, rowOf(page, "cf/@cf/cloudflare/clef"));
         await rowOf(page, "cf/@cf/cloudflare/clef").click();
         assert.equal(await modelCode(), "cf/@cf/cloudflare/clef");
         assert(await rowOf(page, "cf/@cf/cloudflare/clef").evaluate((r) => r.classList.contains("selected")));

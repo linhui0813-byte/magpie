@@ -18,6 +18,7 @@ const fs = require("node:fs/promises");
 const path = require("node:path");
 const { test } = require("node:test");
 const { chromium, webkit } = require("playwright");
+const { openPart } = require("./reader.cjs");
 
 const assets = path.resolve(__dirname, "../assets");
 
@@ -114,6 +115,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       const context = ctx || await browser.newContext({ viewport: { width, height }, deviceScaleFactor: zoom, reducedMotion: "reduce" });
       const page = await context.newPage();
       page.setDefaultTimeout(5000);
+      page.setDefaultNavigationTimeout(60000);
       page.errors = [];
       page.on("pageerror", (e) => page.errors.push(e.message));
       await page.route("**/*", server(lang, posts, { web, size }));
@@ -157,24 +159,25 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
           assert(Math.abs((await tabY(id)) - y0) <= 1, id + ": the tab stays where it was");
           assert.equal(posts.length, posted, id + ": a tab posts nothing");
         }
-        // the warm-ups are in Allowances, still a tab each
-        await page.locator("#setTab-usage").click();
-        assert(await page.locator("#warmTab-codex").isVisible(), "the warm-ups under Allowances");
+        // the warm-ups left Allowances for their providers' editors (the
+        // owner, 11-07): none of their rows, and no tabs for them, in it
+        await openPart(page, "usage");
+        assert.equal(await page.locator("#setPage-usage :is(#warmTabs, #warmSegs, #claudeWarmSegs, #wbCheckinSegs)").count(), 0, "no warm-ups under Allowances");
 
         // a part's control posts what it did
-        await page.locator("#setTab-general").click();
+        await openPart(page, "general");
         await page.locator("#themeSegs .opt").nth(2).click();
         for (let i = 0; i < 50 && !posts.length; i++) await page.waitForTimeout(40);
         assert.equal(posts.at(-1)?.theme, "dark", "the theme still saves");
-        await page.locator("#setTab-usage").click();
+        await openPart(page, "usage");
         await page.locator("#currencySegs .opt").nth(1).click();
         for (let i = 0; i < 50 && posts.at(-1)?.currency !== "cny"; i++) await page.waitForTimeout(40);
         assert.equal(posts.at(-1).currency, "cny", "the currency still saves");
 
         // the keyboard: one tab in the Tab order, the arrows, Home and End
-        await page.locator("#setTab-privacy").click();
+        await openPart(page, "privacy");
         assert.deepEqual(await page.locator("#setTabs [role=tab]").evaluateAll((bs) => bs.filter((b) => b.tabIndex === 0).map((b) => b.dataset.set)), ["privacy"]);
-        await page.locator("#setTab-privacy").focus();
+        await page.locator(":is(#setTab-privacy, .nav-s[data-of=setTab-privacy]):visible").focus();
         await page.keyboard.press("ArrowRight");
         assert.deepEqual((await shown(page)).parts, ["otel"]);
         assert.equal((await shown(page)).focus, "otel");
@@ -231,7 +234,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
           const under = await page.evaluate(() => document.querySelector("#setPage-general").getBoundingClientRect().top - document.querySelector("#setTabs").getBoundingClientRect().bottom);
           assert(under >= 0, what + ": the part under the tabs");
           // the last tab, on the last line, reached with one click, moving nothing
-          await page.locator("#setTab-about").click();
+          await openPart(page, "about");
           await page.waitForTimeout(150);
           assert.deepEqual((await shown(page)).parts, ["about"], what);
           assert.equal(await top(page), 0, what + ": the click must not scroll the page");

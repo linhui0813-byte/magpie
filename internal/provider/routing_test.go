@@ -1,8 +1,11 @@
 package provider
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -136,6 +139,79 @@ func TestAllowancesFirstWaits(t *testing.T) {
 	}
 }
 
+// An account that says it is out while its allowance is being read has it
+// read again once that reading is back, not a minute later: the reading
+// was asked before the refusal, and what it tells is kept only until the
+// next ask, which reads again (as StaleKeyAllowance does a key's).
+func TestAllowancesStaleMidRead(t *testing.T) {
+	signIn(t)
+	week := time.Now().Add(72 * time.Hour)
+	release := make(chan struct{})
+	var once sync.Once
+	var readings atomic.Int32
+	LoginUsageVia(func(_ context.Context, agent string) map[string]SubscriptionQuota {
+		used := 100.0
+		if readings.Add(1) == 1 {
+			<-release
+			used = 97
+		}
+		return map[string]SubscriptionQuota{"me@example.com": {Windows: []QuotaWindow{{Span: 7 * 24 * time.Hour, Used: used, ResetsAt: &week}}}}
+	})
+	reset := func() {
+		usedCache.Lock()
+		usedCache.m, usedCache.at, usedCache.loading = map[string]map[string]Allowance{}, map[string]time.Time{}, map[string]chan struct{}{}
+		usedCache.stale = nil
+		usedCache.Unlock()
+	}
+	reset()
+	t.Cleanup(func() {
+		once.Do(func() { close(release) })
+		// every reading this started lands before the stand-in goes
+		for {
+			usedCache.Lock()
+			done := usedCache.loading["codex"]
+			usedCache.Unlock()
+			if done == nil {
+				break
+			}
+			<-done
+		}
+		LoginUsageVia(nil)
+		reset()
+	})
+	// read over a minute ago, at 90%
+	usedCache.Lock()
+	usedCache.m["codex"] = map[string]Allowance{"me@example.com": {{Used: 90, Resets: week, Span: 7 * 24 * time.Hour}}}
+	usedCache.at["codex"] = time.Now().Add(-2 * time.Minute)
+	usedCache.Unlock()
+	share := func() float64 {
+		u, _ := Allowances("codex")["me@example.com"].For("gpt-5.5", time.Now())
+		return u
+	}
+	share() // reads again, behind the request
+	usedCache.Lock()
+	reading := usedCache.loading["codex"]
+	usedCache.Unlock()
+	for readings.Load() < 1 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	StaleAllowance("codex", "me@example.com") // refused: out, as the request found
+	once.Do(func() { close(release) })
+	<-reading
+	first := share()
+	got, deadline := first, time.Now().Add(2*time.Second)
+	for got != 100 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+		got = share()
+	}
+	if got != 100 {
+		t.Fatalf("first ask %v%%, 2s later %v%%, readings %d", first, got, readings.Load())
+	}
+	if n := readings.Load(); n != 2 {
+		t.Fatalf("readings %d", n)
+	}
+}
+
 // Copilot's allowances renew on the day GitHub says, and its code
 // completions don't stop an account from answering.
 func TestCopilotUsageResets(t *testing.T) {
@@ -155,5 +231,36 @@ func TestCopilotUsageResets(t *testing.T) {
 	now := time.Date(2026, 9, 25, 0, 0, 0, 0, time.UTC)
 	if used, renews := allowanceOf(q.Windows, now).For("gpt-5", now); used != 75 || len(renews) != 1 {
 		t.Fatalf("completions counted: %v %v", used, renews)
+	}
+}
+
+// Lapsing is what a window loses soon unspent as points of the used
+// share, fading to nothing a week out; never guessed from what is left.
+func TestAllowanceLapsing(t *testing.T) {
+	now := time.Now()
+	near := func(got, want float64) bool { return got > want*0.999 && got < want*1.001 }
+	w := func(used float64, in time.Duration, amount, of float64) Allowance {
+		return Allowance{{Used: used, Of: of, RunsOut: now.Add(in), RunsOutLeft: amount}}
+	}
+	// 500 of 5000 lapse in a day: 10 points, whole
+	if got := w(50, 24*time.Hour, 500, 5000).Lapsing("m", now); !near(got, 10) {
+		t.Fatalf("a day out: %v", got)
+	}
+	// a check-in reward of 20 credits ending in 6 days, in a 5100 pool:
+	// 0.39 points, not faded away (kudi3699 on X)
+	if got := w(50, 6*24*time.Hour, 20, 5100).Lapsing("m", now); !near(got, 100*20.0/5100) {
+		t.Fatalf("a small reward 6 days out: %v", got)
+	}
+	if got := w(50, 8*24*time.Hour, 500, 5000).Lapsing("m", now); got != 0 {
+		t.Fatalf("past the horizon: %v", got)
+	}
+	if got := w(50, 24*time.Hour, 0, 5000).Lapsing("m", now); got != 0 {
+		t.Fatalf("an amount not told was guessed: %v", got)
+	}
+	if got := w(95, 24*time.Hour, 4000, 5000).Lapsing("m", now); !near(got, 5) {
+		t.Fatalf("more than is left: %v", got)
+	}
+	if got := w(50, -time.Hour, 500, 5000).Lapsing("m", now); got != 0 {
+		t.Fatalf("already lapsed: %v", got)
 	}
 }

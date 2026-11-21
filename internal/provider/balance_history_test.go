@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yetone/magpie/internal/plugin"
 	"github.com/yetone/magpie/internal/testenv"
 )
 
@@ -107,5 +108,111 @@ func TestBalanceTrendRunsOut(t *testing.T) {
 	old := []BalancePoint{{now.Add(-20 * 24 * time.Hour), 10}, {h(0), 9}}
 	if tr := balanceTrend(old, now); tr != nil {
 		t.Fatalf("one point within the span shown: %+v", tr)
+	}
+}
+
+// TestBalanceHistoryTwoCurrencies (gakki on Discord): DeepSeek tells an
+// account's CNY and USD balances in an order that changes between reads.
+// The card says them in one order every time, the money left first, and
+// the trend is the USD alone, in dollars, not ¥-0.05 and $11.12 joined
+// into one line; the CNY keeps a line of its own. The card's old line,
+// kept before and alternating, goes.
+func TestBalanceHistoryTwoCurrencies(t *testing.T) {
+	testenv.SetHome(t, t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	cny := `{"currency":"CNY","total_balance":"-0.05","granted_balance":"0.00","topped_up_balance":"-0.05"}`
+	usd := func(v string) string {
+		return `{"currency":"USD","total_balance":"` + v + `","granted_balance":"0.00","topped_up_balance":"` + v + `"}`
+	}
+	t0 := time.Date(2026, 10, 8, 8, 0, 0, 0, time.UTC)
+	key := quotaHistKey("deepseek", "main")
+	// what an earlier magpie kept: whichever amount came first
+	writeBalanceHist(balanceHist{key: {{t0.Add(-30 * time.Minute), 11.2}, {t0.Add(-20 * time.Minute), -0.05}, {t0.Add(-10 * time.Minute), 11.15}}})
+	var last []SubscriptionQuota
+	for i, v := range []string{"11.12", "11.10", "11.08", "11.05"} {
+		body := `{"is_available":true,"balance_infos":[` + cny + `,` + usd(v) + `]}`
+		if i%2 == 1 {
+			body = `{"is_available":true,"balance_infos":[` + usd(v) + `,` + cny + `]}`
+		}
+		bal, err := readDeepSeek([]byte(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want := "$" + v + " · ¥-0.05"; bal != want {
+			t.Fatalf("read %d: card says %q, want %q", i, bal, want)
+		}
+		last = []SubscriptionQuota{balCard("Main", bal)}
+		noteBalanceHistory(last, t0.Add(time.Duration(i)*10*time.Minute))
+	}
+	tr := last[0].BalanceTrend
+	if tr == nil || tr.Currency != "$" || len(tr.Points) != 4 {
+		t.Fatalf("trend = %+v, want the four USD readings in $", tr)
+	}
+	for _, p := range tr.Points {
+		if p.Amount < 11 {
+			t.Fatalf("a CNY amount in the USD line: %+v", tr.Points)
+		}
+	}
+	h := readBalanceHist()
+	if c := h[currencyHistKey(key, "¥")]; len(c) != 2 || c[0].Amount != -0.05 {
+		t.Fatalf("CNY line = %+v, want its own run of -0.05", c)
+	}
+	if old, ok := h[key]; ok {
+		t.Fatalf("the old alternating line is kept: %+v", old)
+	}
+	if n, ok := BalanceNumber(last[0].Balance); !ok || n != 11.05 {
+		t.Fatalf("an alert reads %v, want the USD's 11.05", n)
+	}
+	// anything else with " · " in it is one amount, as before
+	for _, s := range []string{"$3 · 2 keys", "$1 · $2", "¥12.30", "12 · 13"} {
+		if cs := balanceCurrencies(s); cs != nil {
+			t.Errorf("%q read as currencies %+v", s, cs)
+		}
+	}
+}
+
+// TestBalanceOnlyCardHasTrend: a plugin's account told by a balance alone
+// (Raccoon's "6122 credits" with no window) is drawn over time as a key's
+// balance is (corddis_114 on Discord): each read is a point, and the card
+// read again carries the trend. A card with windows and a balance keeps its
+// windows' curve alone, and a failed read adds no point.
+func TestBalanceOnlyCardHasTrend(t *testing.T) {
+	testenv.SetHome(t, t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t0 := time.Date(2026, 11, 4, 8, 0, 0, 0, time.UTC)
+	read := func(m int, balance string) []SubscriptionQuota {
+		wallet := quotaOfPlugin(SubscriptionQuota{Provider: "raccoon", Name: "Raccoon", User: "138****0000"},
+			plugin.Usage{Plan: "Free", Balance: balance})
+		windowed := quotaOfPlugin(SubscriptionQuota{Provider: "fakeco", Name: "FakeCo", User: "a@fake"},
+			plugin.Usage{Balance: "$3", Windows: []plugin.UsageWindow{{Name: "5 hours", Used: fptr(25)}}})
+		qs := []SubscriptionQuota{wallet, windowed}
+		noteCardHistory(qs, t0.Add(time.Duration(m)*time.Minute))
+		return qs
+	}
+	if got := read(0, "6122 credits"); got[0].BalanceTrend != nil {
+		t.Fatalf("one reading's trend = %+v, want none", got[0].BalanceTrend)
+	}
+	read(30, "6000 credits")
+	got := read(60, "5900 credits")
+	tr := got[0].BalanceTrend
+	if tr == nil || len(tr.Points) != 3 || tr.Points[0].Amount != 6122 || tr.Points[2].Amount != 5900 {
+		t.Fatalf("wallet's trend = %+v, want its three readings", tr)
+	}
+	if got[1].BalanceTrend != nil {
+		t.Fatalf("windowed card's balance trend = %+v, want none", got[1].BalanceTrend)
+	}
+	h := readBalanceHist()
+	if pts := h[quotaHistKey("fakeco", "a@fake")]; len(pts) != 0 {
+		t.Fatalf("windowed card's balance kept: %+v", pts)
+	}
+	failed := quotaOfPlugin(SubscriptionQuota{Provider: "raccoon", Name: "Raccoon", User: "138****0000"},
+		plugin.Usage{Balance: "1 credits", Error: "401"})
+	noteCardHistory([]SubscriptionQuota{failed}, t0.Add(90*time.Minute))
+	if pts := readBalanceHist()[quotaHistKey("raccoon", "138****0000")]; len(pts) != 3 {
+		t.Fatalf("after a failed read, points = %+v, want the three", pts)
+	}
+	// the window's share is still kept as before
+	if lines := QuotaHistories(t0.Add(-time.Hour), "fakeco", ""); len(lines) != 1 {
+		t.Fatalf("windowed card's quota history = %+v", lines)
 	}
 }

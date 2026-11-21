@@ -14,6 +14,7 @@ import (
 )
 
 func TestParseGoogleImportFormats(t *testing.T) {
+	t.Cleanup(AntigravityBuiltinForTest()) // the retired built-in route
 	cases := []struct {
 		name, data string
 		want       []googleImport // n and err not compared unless set
@@ -118,6 +119,7 @@ func (f *fakeGoogleImport) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func TestImportGoogleAccounts(t *testing.T) {
+	t.Cleanup(AntigravityBuiltinForTest()) // the retired built-in route
 	googleSandbox(t, &fakeGoogle{})
 	f := &fakeGoogleImport{users: map[string]string{"1//a": "a@x.com", "1//b": "b@x.com", "1//c": "c@x.com", "1//n": "nouser"}}
 	srv := httptest.NewServer(f)
@@ -220,5 +222,11 @@ func TestImportGoogleAccounts(t *testing.T) {
 	}
 	if _, err := ImportGoogleAccounts(context.Background(), "antigravity", []string{"{broken"}); err == nil {
 		t.Error("broken JSON imported")
+	}
+	// one broken file among several is listed by its place, not passed over
+	// (#1453)
+	res, err = ImportGoogleAccounts(context.Background(), "antigravity", []string{cockpit, "{broken"})
+	if err != nil || len(res) != 4 || res[3].File != 2 || res[3].User != "" || res[3].Status != "failed" || res[3].Error == "" {
+		t.Errorf("a broken file among several = %+v, %v", res, err)
 	}
 }

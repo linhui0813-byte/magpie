@@ -9,6 +9,7 @@ const fs = require("node:fs/promises");
 const path = require("node:path");
 const { test } = require("node:test");
 const { chromium, webkit } = require("playwright");
+const { watchSettingsReads, settingsDrawn } = require("./reader.cjs");
 
 const assets = path.resolve(__dirname, "../assets");
 
@@ -53,6 +54,7 @@ function server(lang, ctl) {
     }
     if (url.pathname === "/api/update") {
       ctl.gets++;
+      if (url.searchParams.get("fresh") === "1") ctl.freshGets++;
       const body = ctl.inflight ? { state: "checking", current: ctl.update.current || "0.1.400" } : { ...ctl.update };
       if (ctl.holdGets) await new Promise((go) => getWait.push(go));
       return json(body);
@@ -67,7 +69,7 @@ function server(lang, ctl) {
 }
 
 function fresh(over) {
-  return { update: { state: "latest", current: "0.1.400" }, posts: 0, gets: 0, inflight: 0, holdPost: false, holdGets: false, ...over };
+  return { update: { state: "latest", current: "0.1.400" }, posts: 0, gets: 0, freshGets: 0, inflight: 0, holdPost: false, holdGets: false, ...over };
 }
 
 const viewTop = (page) => page.locator("#view-settings").evaluate((v) => v.scrollTop);
@@ -90,9 +92,12 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       const page = await (await browser.newContext({ viewport: { width: 900, height: 300 }, reducedMotion: "reduce" })).newPage();
       pages.push(page);
       page.setDefaultTimeout(5000);
-      page.on("pageerror", (e) => errors.push(e.message));
+      page.setDefaultNavigationTimeout(60000);
+      page.on("pageerror", (e) => { if (!/^ResizeObserver loop completed with undelivered notifications/.test(e.message)) errors.push(e.message); });
       await page.route("**/*", server(lang, ctl));
+      await watchSettingsReads(page);
       await page.goto("http://magpie.test/?view=settings&tab=about");
+      await settingsDrawn(page); // rows found are the ones that stay (#1659)
       return { page, errors };
     };
 
@@ -124,6 +129,9 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await button.waitFor();
         assert.equal(await button.isEnabled(), true);
         assert.equal((await row.locator(".sub").textContent()).trim(), w.latest);
+        // the row's read asks for a fresh answer: an old "latest" is asked
+        // again (RickyWei: 已是最新 on 0.1.1402 with 0.1.1517 out)
+        assert(ctl.freshGets > 0, "the Version row must read with fresh=1");
         const top = await showRow(page, row);
 
         await button.click();
@@ -135,7 +143,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await button.evaluate((b) => { const fn = b.onclick; fn(); fn(); });
         await page.waitForTimeout(50);
         assert.equal(ctl.posts, 1, "a second click must not ask again");
-        assert.equal(await row.locator("button").count(), 1);
+        assert.equal(await row.locator("button", { hasText: w.check }).count(), 1); // and Restart beside it (version-restart)
 
         // a read that left while the check ran, answered "checking" only after
         // the check itself has answered — it must not be drawn over that
@@ -156,7 +164,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         ctl.releaseGets();
         await page.waitForTimeout(1200);
         assert.equal((await row.locator(".sub").textContent()).trim(), w.latest, "a late checking read must not replace the answer");
-        assert.equal(await row.locator("button").count(), 1);
+        assert.equal(await row.locator("button", { hasText: w.check }).count(), 1); // and Restart beside it (version-restart)
         assert.equal(await button.isEnabled(), true);
         assert.equal(ctl.posts, 1);
         assert.deepEqual(errors, []);
@@ -174,7 +182,8 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await page.evaluate(() => renderSettings());
         const again = rowOf(page, w.version);
         await again.locator("button", { hasText: w.check }).waitFor();
-        assert.equal(await again.locator("button").isDisabled(), true, "the new row keeps the button while the check runs");
+        assert.equal(await again.locator("button", { hasText: w.check }).isDisabled(), true, "the new row keeps the button while the check runs");
+        assert.equal(await again.locator("button", { hasNotText: w.check }).isDisabled(), true, "and Restart beside it dimmed with it");
         assert.equal((await again.locator(".sub").textContent()).trim(), w.checking);
         assert.equal(ctl.posts, 1);
         ctl.update = { state: "latest", current: "0.1.400" };

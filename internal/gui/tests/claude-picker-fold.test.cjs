@@ -7,8 +7,10 @@
 // one, opened at a click without the page moving; an alias and its dated
 // id are one row, the alias's, or the dated one's while that is the value
 // set. In English and Chinese. No backend: the API is faked here.
-// The fold row ends Claude Code's own rows, though the account comes after
-// the providers the user added (where it was, Claude Code was headed twice);
+// The fold row ends Claude Code's own rows, which come after magpie's
+// (abledo on Discord: they hid every magpie model below the fold), though
+// the account is listed among magpie's (where it was, Claude Code was
+// headed twice);
 // a click on it leaves the keys to the filter (focus went to the page, and
 // Esc and the arrows did nothing); a query shows the rows it finds, so an id
 // typed in full is picked with Enter (which only opened the fold); and a
@@ -86,6 +88,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       if (favorites) await context.addInitScript((f) => localStorage.setItem("magpie.modelFavorites", JSON.stringify(f)), favorites);
       const page = await context.newPage();
       page.setDefaultTimeout(5000);
+      page.setDefaultNavigationTimeout(60000);
       page.on("pageerror", (e) => errors.push(e.message));
       await page.route("**/*", server(lang, value, sets));
       await page.goto("http://magpie.test/");
@@ -118,10 +121,10 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         assert.equal(fold[0].v, w.two);
         assert.equal(fold[0].n, w.whose);
         assert(names.includes("DeepSeek V4"), "another provider's stay unfolded");
-        // after Claude Code's own rows, before the providers the user added:
-        // Claude Code is headed once
-        assert.deepEqual(await page.locator("#list li.group").allTextContents(), ["Claude Code", "DeepSeek"]);
-        assert.equal(await page.locator("#list li.fold + li.group").textContent(), "DeepSeek");
+        // magpie's first, then Claude Code's own rows and the fold after
+        // them: Claude Code is headed once
+        assert.deepEqual(await page.locator("#list li.group").allTextContents(), ["DeepSeek", "Claude Code"]);
+        assert.equal(await page.locator("#list li:last-child.fold").count(), 1);
         const foldRow = page.locator("#list li.fold");
         assert.equal(await foldRow.getAttribute("aria-expanded"), "false");
 
@@ -199,7 +202,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         assert(names.includes("claude-opus-4-5-20251101") && !names.includes("claude-opus-4-5"), names.join(", "));
         await page.locator('#pickerRail .rail-item[data-group="favorites"]').click();
         await page.waitForFunction(() => document.querySelectorAll("#list li:not(.group)").length === 2);
-        assert.deepEqual((await rows(page)).map((r) => r.v), ["claude-opus-4-5-20251101", "Claude Opus 4.5"]);
+        assert.deepEqual((await rows(page)).map((r) => r.v), ["Claude Opus 4.5", "claude-opus-4-5-20251101"]);
         await page.context().close();
       });
     }

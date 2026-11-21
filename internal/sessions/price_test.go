@@ -11,8 +11,9 @@ import (
 )
 
 // A session's Grok model named at an effort is priced as its model; one no
-// catalog lists (Grok Build's grok-4.7-build, grok-4.7-mini, a fast one)
-// stays unpriced (#224).
+// catalog lists (Grok Build's grok-4.7-build, grok-4.7-mini, Cursor's fast
+// one) stays unpriced (#224). Grok Build's own fast variant,
+// grok-4.7-build-fast, is twice grok-4.7, as xAI sells it.
 func TestPriceOfGrokEffort(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -29,7 +30,12 @@ func TestPriceOfGrokEffort(t *testing.T) {
 			t.Errorf("priceOf(%q) = %+v, %v; want $2/$6/$0.5", m, pr, ok)
 		}
 	}
-	for _, m := range []string{"grok-4.7-build", "grok-4.7-mini", "grok-4.7-low-fast", "grok-4.7-build-fast"} {
+	for _, m := range []string{"grok-4.7-build-fast", "Grok-4.7-Build-Fast", "grok-4.7-build-fast@500k"} {
+		if pr, ok := priceOf(settings.Load(), m); !ok || pr.Input != 4 || pr.Output != 12 || pr.CacheRead != 1 {
+			t.Errorf("priceOf(%q) = %+v, %v; want twice grok-4.7's, $4/$12/$1", m, pr, ok)
+		}
+	}
+	for _, m := range []string{"grok-4.7-build", "grok-4.7-mini", "grok-4.7-low-fast", "grok-4.6-build-fast"} {
 		if pr, ok := priceOf(settings.Load(), m); ok {
 			t.Errorf("priceOf(%q) = %+v; want unpriced", m, pr)
 		}
@@ -166,5 +172,32 @@ func TestListingPricesEveryModelAtTheSettingsItReadOnce(t *testing.T) {
 	}
 	if p := pricer()("relay/widget-b"); p == nil || p.Input != 3 {
 		t.Errorf("the next listing prices the second at %v; want the $3 just written", p)
+	}
+}
+
+// A session is priced without its provider's rate windows (#2463): its
+// calls are summed by model, not by time, so the window open as it is
+// read would price every call at it, and the same session would read 3×
+// at the peak and 1× off it. A window that holds every hour shows it.
+func TestPriceOfLeavesTheRateWindowOut(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
+	catalog.Reset()
+	t.Cleanup(catalog.Reset)
+	if err := settings.Save(settings.Settings{ModelPrices: map[string]settings.ModelPrice{
+		"relay/gpt-5.5": {Input: new(float64(0.2)), Output: new(float64(1)),
+			CacheRead: new(float64(0.05)), CacheWrite: new(float64(0.25))},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := provider.Save(provider.Provider{ID: "relay", Name: "Relay", Key: "k", Chat: "https://relay.example.com/v1",
+		RateWindows: []provider.RateWindow{{Start: "00:00", End: "24:00", Rate: 3}}}); err != nil {
+		t.Fatal(err)
+	}
+	if pr, ok := priceOf(settings.Load(), "relay/gpt-5.5"); !ok || pr.Input != 0.2 || pr.Output != 1 {
+		t.Errorf("priceOf(relay/gpt-5.5) = %+v, %v; want the set $0.2/$1, not the window's 3×", pr, ok)
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/yetone/magpie/internal/access"
 	"github.com/yetone/magpie/internal/mcpauth"
 	"github.com/yetone/magpie/internal/mcpauth/mcpauthtest"
 )
@@ -115,8 +116,8 @@ func TestMCPProxy(t *testing.T) {
 	}
 }
 
-// Another machine is lent magpie's sign-ins only through the gateway shared
-// on the local network, with its key.
+// Another machine is lent magpie's sign-ins only with an enabled gateway
+// key: a gateway MAGPIE_ADDR puts on the network asks for one too.
 func TestMCPProxyStaysHere(t *testing.T) {
 	fresh(t)
 	t.Setenv("MAGPIE_ADDR", "0.0.0.0:3425")
@@ -127,8 +128,50 @@ func TestMCPProxyStaysHere(t *testing.T) {
 	r.RemoteAddr = "192.168.1.9:5000"
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, r)
-	if w.Code != http.StatusForbidden || len(f.Calls) != 0 {
+	if w.Code != http.StatusUnauthorized || len(f.Calls) != 0 {
 		t.Fatalf("another machine got %d, calls %v", w.Code, f.Calls)
+	}
+}
+
+// A WSL agent under NAT, at Windows' address, is lent the sign-in with the
+// key the gateway is shared with as its Authorization (library's through),
+// which the server never sees: it gets magpie's token. Without the key the
+// call is a 401, which an MCP client takes for the server asking it to
+// sign in.
+func TestMCPProxyFromWSLWithLANKey(t *testing.T) {
+	fresh(t)
+	if err := access.ConfigureLAN(true, false); err != nil {
+		t.Fatal(err)
+	}
+	key := access.LANSecret()
+	f := mcpauthtest.New(t)
+	f.SignIn(t, "neon")
+	h := lanGuard(New().Handler())
+	call := func(auth string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest("POST", "/mcp/neon", strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"initialize"}`))
+		r.RemoteAddr = "172.20.0.5:40000"
+		r.Host = "172.20.0.1:3425"
+		r.Header.Set("Content-Type", "application/json")
+		r.Header.Set("Accept", "application/json, text/event-stream")
+		if auth != "" {
+			r.Header.Set("Authorization", auth)
+		}
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		return w
+	}
+	if w := call(""); w.Code != http.StatusUnauthorized || len(f.Calls) != 0 {
+		t.Fatalf("without the key: %d, calls %v", w.Code, f.Calls)
+	}
+	w := call("Bearer " + key)
+	token, _ := mcpauth.Token(t.Context(), "neon")
+	if w.Code != 200 || f.Seen.Get("Authorization") != "Bearer "+token {
+		t.Fatalf("with the LAN key: %d %s, the server got Authorization %q", w.Code, w.Body, f.Seen.Get("Authorization"))
+	}
+	for k, v := range f.Seen {
+		if strings.Contains(strings.Join(v, " "), key) {
+			t.Fatalf("the server got the LAN key in %s", k)
+		}
 	}
 }
 
@@ -206,5 +249,36 @@ func TestMCPProxyKeepsQueryAndHeaders(t *testing.T) {
 	call(`{"jsonrpc":"2.0","id":2,"method":"tools/list"}`, "X-Api-Key", Token)
 	if f.Seen.Get("X-Api-Key") != "" {
 		t.Fatalf("the server got the gateway's key %q", f.Seen.Get("X-Api-Key"))
+	}
+}
+
+// A server that refuses even the token magpie just renewed no longer takes
+// the sign-in: it is marked run out, for the Library to say so rather than
+// "Signed in" beside the server's refusal (新v学员 on Discord), and the
+// agent is told to sign in again, never with a 401.
+func TestMCPProxyRefusedAfterRenewalRunsOut(t *testing.T) {
+	fresh(t)
+	f := mcpauthtest.New(t)
+	f.SignIn(t, "neon")
+	gw := httptest.NewServer(New().Handler())
+	defer gw.Close()
+	f.RefuseTokens()
+	req, _ := http.NewRequest("POST", gw.URL+"/mcp/neon", strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+Token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadGateway || resp.Header.Get("WWW-Authenticate") != "" || !strings.Contains(string(b), "sign in to it again") {
+		t.Fatalf("refused after renewing: %d %v %s", resp.StatusCode, resp.Header, b)
+	}
+	if f.Refreshed != 1 {
+		t.Fatalf("renewed %d times, not once", f.Refreshed)
+	}
+	if st := mcpauth.StatusOf("neon", f.URL); !st.SignedIn || !st.Dead {
+		t.Fatalf("the sign-in after a renewed token was refused: %+v", st)
 	}
 }

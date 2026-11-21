@@ -119,6 +119,27 @@ const rows = (page) => page.locator(".rt-gedit .fbrow").evaluateAll((rs) => rs.m
   };
 }));
 
+// what is clicked next, wheeled into the Routing page's view as a reader
+// would: a scroll the reader didn't make (Playwright's own, before its
+// click) is put back (#1554), and the click lands on the window's foot
+async function reach(page, target) {
+  const view = await page.locator("#view-groups").boundingBox();
+  await page.mouse.move(view.x + view.width / 2, view.y + view.height / 2);
+  const rest = () => page.evaluate(() => new Promise((done) => {
+    const v = document.querySelector("#view-groups");
+    let last = -1;
+    const look = () => { if (v.scrollTop === last) done(); else { last = v.scrollTop; setTimeout(look, 100); } };
+    look();
+  }));
+  for (let i = 0; i < 60; i++) {
+    const b = await target.boundingBox();
+    if (b && b.y > view.y && b.y + b.height < view.y + view.height) return;
+    await page.mouse.wheel(0, b && b.y < view.y ? -40 : 40);
+    await rest();
+  }
+  assert.fail("it never came into view");
+}
+
 for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium", "webkit"])) {
   for (const lang of ["en", "zh"]) {
     const w = words[lang];
@@ -133,10 +154,11 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       });
       const page = await (await browser.newContext({ viewport: { width: 1100, height: 800 }, reducedMotion: "reduce" })).newPage();
       page.setDefaultTimeout(5000);
+      page.setDefaultNavigationTimeout(60000);
       const errors = [];
       page.on("pageerror", (e) => errors.push(e.message));
       await page.route("**/*", serve(lang));
-      await page.goto("http://magpie.test/?view=routing");
+      await page.goto("http://magpie.test/?view=groups");
       await page.locator(".rt-group[data-id=g]").waitFor();
       await page.locator(".rt-group[data-id=g]").click();
       await page.locator(".rt-gedit .fbrow").first().waitFor();
@@ -162,17 +184,14 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
 
       // the row is still the row it was: switching it off and removing it
       const off = page.locator(".rt-gedit .fbrow").first().locator(".rt-mon");
+      await reach(page, off);
       await off.click();
       assert.equal(await off.getAttribute("aria-checked"), "false", "the member is switched off");
       await off.click();
       assert.equal(await off.getAttribute("aria-checked"), "true", "and on again");
-      // the last row is wheeled up into view as a reader would: a scroll the
-      // page wasn't asked for by the reader (Playwright's own) is put back
-      // after the clicks above (scrollOnPurpose), which leaves the row under
-      // the footer
-      await page.mouse.move(550, 400);
-      await page.mouse.wheel(0, 400);
-      await page.locator(".rt-gedit .fbrow").last().locator("button.text", { hasText: lang === "zh" ? "移除" : "Remove" }).click();
+      const remove = page.locator(".rt-gedit .fbrow").last().locator("button.text", { hasText: lang === "zh" ? "移除" : "Remove" });
+      await reach(page, remove);
+      await remove.click();
       assert.equal((await rows(page)).length, 2, "the last member is removed");
     });
 
@@ -187,10 +206,11 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       });
       const page = await (await browser.newContext({ viewport: { width: 1100, height: 800 }, reducedMotion: "reduce" })).newPage();
       page.setDefaultTimeout(5000);
+      page.setDefaultNavigationTimeout(60000);
       const errors = [];
       page.on("pageerror", (e) => errors.push(e.message));
       await page.route("**/*", serve(lang));
-      await page.goto("http://magpie.test/?view=routing");
+      await page.goto("http://magpie.test/?view=groups");
       await page.locator(".rt-group[data-id=g3]").waitFor();
       await page.locator(".rt-group[data-id=g3]").click();
       await page.locator(".rt-gedit .fbrow").first().waitFor();

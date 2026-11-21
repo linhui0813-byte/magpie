@@ -3,6 +3,7 @@ package provider
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -24,6 +25,10 @@ type fakeWBCheckin struct {
 	claimCode int
 	down      bool // the network: every request fails
 	broken    bool // every request is answered with a 500
+	// refuse401 is the paths WorkBuddy's gateway answers with its bare
+	// 401 page; "*" is every one (a token it refuses)
+	refuse401 []string
+	summaries int
 	statuses  int
 	claims    int
 }
@@ -42,6 +47,18 @@ func (f *fakeWBCheckin) serve(t *testing.T) *httptest.Server {
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
+		if slices.Contains(f.refuse401, "*") || slices.Contains(f.refuse401, r.URL.Path) {
+			switch r.URL.Path {
+			case "/v2/billing/meter/checkin-activity-status":
+				f.statuses++
+			case "/billing/meter/get-user-resource-summary":
+				f.summaries++
+			}
+			w.Header().Set("Content-Type", "text/html")
+			w.WriteHeader(http.StatusUnauthorized)
+			io.WriteString(w, wbGateway401)
+			return
+		}
 		if r.Header.Get("Authorization") != "Bearer wb-access" || r.Header.Get("X-User-Id") != "u1" ||
 			!strings.HasPrefix(r.Header.Get("User-Agent"), "WorkBuddy/") {
 			json.NewEncoder(w).Encode(map[string]any{"code": 10085, "msg": "请求不合法"})
@@ -53,6 +70,9 @@ func (f *fakeWBCheckin) serve(t *testing.T) *httptest.Server {
 			f.statuses++
 			ok(map[string]any{"active": f.active, "today_checked_in": f.checked, "streak_days": 3,
 				"daily_credit": 100, "today_credit": map[bool]int{true: 100}[f.checked], "total_credits": 300})
+		case "/billing/meter/get-user-resource-summary":
+			f.summaries++
+			ok(map[string]any{"Packages": []any{map[string]any{"CycleTotalCapacity": "1500", "CycleUsedCapacity": "0"}}})
 		case "/v2/billing/meter/daily-checkin":
 			f.claims++
 			if f.claimCode != 0 {
@@ -69,24 +89,39 @@ func (f *fakeWBCheckin) serve(t *testing.T) *httptest.Server {
 	return srv
 }
 
+// wbGateway401 is what copilot.tencent.com's gateway (APISIX) answers a
+// token it refuses with, as captured on 2026-10-10.
+const wbGateway401 = `<html>
+<head><title>401 Authorization Required</title></head>
+<body>
+<center><h1>401 Authorization Required</h1></center>
+<hr><center>openresty</center>
+<p><em>Powered by <a href="https://apisix.apache.org/">APISIX</a>.</em></p></body>
+</html>
+`
+
 func (f *fakeWBCheckin) counts() (int, int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.statuses, f.claims
 }
 
-// wbCheckinFixture is a checkiner for one WorkBuddy account at srv, its
-// clock at *now, its file in a temp folder.
+// wbPluginSigned is the plugin's fetch for the account fakeWBCheckin
+// knows: it signs each request with the account's sign-in.
+func wbPluginSigned(req *http.Request) (*http.Response, error) {
+	req.Header.Set("Authorization", "Bearer wb-access")
+	req.Header.Set("X-User-Id", "u1")
+	return http.DefaultClient.Do(req)
+}
+
+// wbCheckinFixture is a checkiner for one WorkBuddy plugin account at srv,
+// its clock at *now, its file in a temp folder.
 func wbCheckinFixture(t *testing.T, srv *httptest.Server, now *time.Time) wbCheckiner {
 	t.Helper()
-	wbTokens.Lock()
-	wbTokens.m = map[string]wbCreds{}
-	wbTokens.Unlock()
 	endpoint := srv.URL
 	site := &wbSite{id: "workbuddy", name: "WorkBuddy", endpoint: &endpoint}
-	future := time.Now().Add(24 * time.Hour).UnixMilli()
-	a := wbAccount{Login: Login{User: "旅行者", On: true, Active: true}, site: site, own: true,
-		creds: wbCreds{UID: "u1", Access: "wb-access", ExpiresAt: future, Domain: "www.codebuddy.cn"}}
+	a := wbAccount{Login: Login{User: "旅行者", On: true, Active: true}, site: site,
+		creds: wbCreds{UID: "u1"}, via: wbPluginSigned}
 	return wbCheckiner{
 		path:     filepath.Join(t.TempDir(), "workbuddy-checkin.json"),
 		now:      func() time.Time { return *now },
@@ -147,7 +182,8 @@ func TestWorkBuddyCheckinOncePerDay(t *testing.T) {
 }
 
 // Checked in already (in WorkBuddy), or the event not running: nothing is
-// claimed, and that holds for the day.
+// claimed, and, answered from noon Beijing on (checkinSureHour), that holds
+// for the day; an earlier one is asked again (#3326).
 func TestWorkBuddyCheckinNothingToClaim(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -159,7 +195,7 @@ func TestWorkBuddyCheckinNothingToClaim(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			srv := tc.f.serve(t)
-			now := time.Date(2026, 3, 1, 2, 0, 0, 0, time.UTC)
+			now := time.Date(2026, 3, 1, 4, 0, 0, 0, time.UTC) // 12:00 Beijing
 			c := wbCheckinFixture(t, srv, &now)
 			rs := c.checkinNow(context.Background(), false)
 			if len(rs) != 1 || rs[0].Outcome != tc.outcome {
@@ -177,13 +213,13 @@ func TestWorkBuddyCheckinNothingToClaim(t *testing.T) {
 	}
 }
 
-// A claim refused as already made (1001) or not eligible (1002) is that
-// day's answer, not asked again.
+// A claim refused as already made (1001) or not eligible (1002) from noon
+// Beijing on is that day's answer, not asked again by the loop.
 func TestWorkBuddyCheckinRefused(t *testing.T) {
 	for code, outcome := range map[int]string{wbCheckinAlready: CheckinDone, wbCheckinIneligible: CheckinIneligible, wbCheckinEnded: CheckinInactive} {
 		f := &fakeWBCheckin{active: true, claimCode: code}
 		srv := f.serve(t)
-		now := time.Date(2026, 3, 1, 2, 0, 0, 0, time.UTC)
+		now := time.Date(2026, 3, 1, 4, 0, 0, 0, time.UTC) // 12:00 Beijing
 		c := wbCheckinFixture(t, srv, &now)
 		rs := c.checkinNow(context.Background(), false)
 		if len(rs) != 1 || rs[0].Outcome != outcome {
@@ -270,36 +306,40 @@ func TestWorkBuddyCheckinOfflineRetriesSoon(t *testing.T) {
 	}
 }
 
-// The accounts are WorkBuddy's own sign-in and those magpie added, read as
-// the rest of magpie reads them; what is kept is shown by name.
-func TestWorkBuddyCheckinSignedIn(t *testing.T) {
-	home := signIn(t)
-	wbTokens.Lock()
-	wbTokens.m = map[string]wbCreds{}
-	wbTokens.Unlock()
-	future := time.Now().Add(24 * time.Hour).UnixMilli()
-	writeFile(t, wbAuthFile(home), map[string]any{
-		"account": map[string]any{"uid": "u1", "nickname": "旅行者"},
-		"auth":    map[string]any{"accessToken": "wb-access", "refreshToken": "r", "expiresAt": future, "domain": "www.codebuddy.cn"},
-	})
+// A moved account's check-in goes through the plugin's fetch, whose failure
+// comes back as Bun's text, not a net.Error. The connection reset that
+// plugins #149 showed is a check-in that never got an answer: tried again a
+// minute later, not half an hour. An answer that failed still waits.
+func TestWorkBuddyCheckinPluginResetRetriesSoon(t *testing.T) {
 	f := &fakeWBCheckin{active: true}
 	srv := f.serve(t)
-	old := wbEndpoint
-	wbEndpoint = srv.URL
-	defer func() { wbEndpoint = old }()
+	now := time.Date(2026, 3, 1, 2, 0, 0, 0, time.UTC)
+	c := wbCheckinFixture(t, srv, &now)
+	reset := true
+	accts := c.accounts()
+	accts[0].via = func(req *http.Request) (*http.Response, error) {
+		if reset {
+			// the reporter's words, as the plugin host passes them on
+			return nil, errors.New("ECONNRESET: The socket connection was closed unexpectedly. For more information, pass `verbose: true` in the second argument to fetch()")
+		}
+		return wbPluginSigned(req)
+	}
+	c.accounts = func() []wbAccount { return accts }
+	ctx := context.Background()
+	var l wbCheckinLoop
+	if rs := l.tick(ctx, c); len(rs) != 1 || rs[0].Outcome != CheckinFailed || !rs[0].Offline || !rs[0].Asked {
+		t.Fatalf("reset: %+v", rs)
+	}
+	reset = false
+	now = now.Add(time.Minute)
+	if rs := l.tick(ctx, c); len(rs) != 1 || rs[0].Outcome != CheckinClaimed || !rs[0].Asked {
+		t.Fatalf("a minute on: %+v", rs)
+	}
 
-	if !HasWorkBuddy() || len(WorkBuddyCheckins()) != 0 {
-		t.Fatalf("before: %v %+v", HasWorkBuddy(), WorkBuddyCheckins())
-	}
-	rs := CheckInWorkBuddy(context.Background())
-	if len(rs) != 1 || rs[0].Outcome != CheckinClaimed || rs[0].User != "旅行者" {
-		t.Fatalf("checked in: %+v", rs)
-	}
-	if _, err := os.Stat(filepath.Join(home, ".config", "magpie", "workbuddy-checkin.json")); err != nil {
-		t.Fatal(err)
-	}
-	if got := WorkBuddyCheckins(); len(got) != 1 || got[0].User != "旅行者" || got[0].Credit != 100 {
-		t.Fatalf("kept: %+v", got)
+	for _, msg := range []string{"plugin fetch: HTTP 500", "WorkBuddy refused: code 11140", "Unable to parse the reply"} {
+		if r := wbCheckinFailed(errors.New(msg)); r.Offline {
+			t.Errorf("%q read as never answered", msg)
+		}
 	}
 }
 
@@ -365,28 +405,23 @@ func TestWorkBuddyCheckinOnTheCard(t *testing.T) {
 	}
 }
 
-// The WorkBuddy plugin signed in under its own id, not moved (signed in
-// before the move was, or moved back), has its accounts checked in too and
-// its cards ("workbuddy-plugin") say so, beside the built-in's; one account
-// signed in to both is checked in once (#694, Dazzle-sys on 0.1.774: two
-// accounts on the card, credits by day, no check-in).
-func TestWorkBuddyCheckinPluginUnderItsOwnID(t *testing.T) {
+// The WorkBuddy plugin's accounts are checked in, and their cards say so;
+// WorkBuddy AI's are not, and a sign-in magpie kept from the retired
+// built-in, not moved yet, is checked in by nothing (#694, Dazzle-sys on
+// 0.1.774: two accounts on the card, credits by day, no check-in).
+func TestWorkBuddyCheckinPluginAccounts(t *testing.T) {
 	movedPlugin(t, "workbuddy", map[string]map[string]any{
 		"workbuddy":     {"type": "oauth", "access": "a", "refresh": "r", "expires": 0, "accountId": "Ann", "uid": "u1"},
 		"workbuddy#abc": {"type": "oauth", "access": "b", "refresh": "r", "expires": 0, "accountId": "Bob", "uid": "u2"},
 	})
-	_ = setMigration("workbuddy", func(m *Migration) { m.State = MovedBack })
 	loginsMu.Lock()
 	_ = writeLogins([]savedLogin{{Agent: "workbuddy", User: "Cat", On: true, First: true, Auth: []byte(`{"uid":"u3","accessToken":"c"}`)}})
 	loginsMu.Unlock()
-	if Moved("workbuddy") || PluginID("workbuddy") != "workbuddy-plugin" {
-		t.Fatalf("set up as moved: %q", PluginID("workbuddy"))
-	}
 	var users []string
 	for _, a := range wbCheckinAccounts() {
 		users = append(users, a.User)
 	}
-	if strings.Join(users, ",") != "Cat,Ann,Bob" {
+	if strings.Join(users, ",") != "Ann,Bob" {
 		t.Fatalf("accounts checked in: %v", users)
 	}
 	if !HasWorkBuddy() {
@@ -394,23 +429,22 @@ func TestWorkBuddyCheckinPluginUnderItsOwnID(t *testing.T) {
 	}
 	st := map[string]WorkBuddyCheckin{"workbuddy|u2": {Day: "2026-10-04", Outcome: CheckinClaimed, Credit: 100, Streak: 5}}
 	qs := []SubscriptionQuota{
+		{Provider: "workbuddy", User: "Ann"},
+		{Provider: "workbuddy", User: "Bob"},
+		{Provider: "workbuddy-ai", User: "Ann"},
 		{Provider: "workbuddy", User: "Cat"},
-		{Provider: "workbuddy-plugin", User: "Ann"},
-		{Provider: "workbuddy-plugin", User: "Bob"},
-		{Provider: "workbuddy-ai-plugin", User: "Ann"},
-		{Provider: "workbuddy-plugin", User: "Cat"},
 	}
 	got := withCheckins(qs, wbCheckinAccounts(), st)
-	for i, want := range []bool{true, true, true, false, false} {
+	for i, want := range []bool{true, true, false, false} {
 		if got[i].Checkins != want {
 			t.Fatalf("card %d %s %s: checkins %v, want %v", i, got[i].Provider, got[i].User, got[i].Checkins, want)
 		}
 	}
-	if got[2].Checkin == nil || got[2].Checkin.Credit != 100 || got[1].Checkin != nil {
-		t.Fatalf("Bob's check-in: %+v, Ann's %+v", got[2].Checkin, got[1].Checkin)
+	if got[1].Checkin == nil || got[1].Checkin.Credit != 100 || got[0].Checkin != nil {
+		t.Fatalf("Bob's check-in: %+v, Ann's %+v", got[1].Checkin, got[0].Checkin)
 	}
 
-	// the same account on the built-in and the plugin: asked once
+	// the same account listed twice: asked once
 	var asked int
 	via := func(req *http.Request) (*http.Response, error) {
 		asked++
@@ -425,5 +459,92 @@ func TestWorkBuddyCheckinPluginUnderItsOwnID(t *testing.T) {
 	}}
 	if rs := c.checkinNow(context.Background(), true); len(rs) != 1 || asked != 1 || rs[0].Outcome != CheckinDone {
 		t.Fatalf("one account twice: %d asked, %+v", asked, rs)
+	}
+}
+
+// WorkBuddy's gateway answering the check-in with its bare 401 (モモコ on
+// Discord: 签到失败，magpie 稍后重试 · Unauthorized, all day, and signing in
+// again didn't help) is told apart by reading the account's credits with
+// the same headers: they read, so the sign-in is good and the check-in
+// takes WorkBuddy's own app — an answer for the day, not asked again; they
+// don't, so the sign-in is refused and the account is to be signed in
+// again, said in those words, not "Unauthorized".
+func TestWorkBuddyCheckinUnauthorized(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		refuse  []string
+		outcome string
+		msg     string
+		claims  int
+		again   bool
+	}{
+		{"status", []string{"/v2/billing/meter/checkin-activity-status"}, CheckinOwnApp, "WorkBuddy's own app", 0, false},
+		{"claim", []string{"/v2/billing/meter/daily-checkin"}, CheckinOwnApp, "WorkBuddy's own app", 1, false},
+		{"sign-in", []string{"*"}, CheckinFailed, "sign in to it again", 0, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &fakeWBCheckin{active: true, refuse401: tc.refuse}
+			srv := f.serve(t)
+			now := time.Date(2026, 10, 10, 2, 0, 0, 0, time.UTC)
+			c := wbCheckinFixture(t, srv, &now)
+			rs := c.checkinNow(context.Background(), false)
+			if len(rs) != 1 || rs[0].Outcome != tc.outcome || !strings.Contains(rs[0].Msg, tc.msg) || rs[0].Checked() {
+				t.Fatalf("got %+v", rs)
+			}
+			if f.summaries != 1 {
+				t.Fatalf("credits read %d times", f.summaries)
+			}
+			now = now.Add(wbCheckinRetry + time.Minute)
+			c.checkinNow(context.Background(), false)
+			s, cl := f.counts()
+			if again := s == 2; again != tc.again || cl > tc.claims {
+				t.Fatalf("after the retry: status %d, claims %d", s, cl)
+			}
+		})
+	}
+}
+
+// Through the plugin's fetch too: a moved account's check-in answered 401
+// while its credits read is the WorkBuddy app's to do.
+func TestWorkBuddyCheckinUnauthorizedThroughPlugin(t *testing.T) {
+	var paths []string
+	via := func(req *http.Request) (*http.Response, error) {
+		paths = append(paths, req.URL.Path)
+		if strings.HasSuffix(req.URL.Path, "/checkin-activity-status") {
+			return &http.Response{StatusCode: 401, Body: io.NopCloser(strings.NewReader(wbGateway401)), Header: http.Header{"X-Magpie-Sign-In": {"kept"}}}, nil
+		}
+		body := `{"code":0,"data":{"Packages":[]}}`
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(body)), Header: http.Header{}}, nil
+	}
+	a := wbAccount{Login: Login{User: "me", On: true}, site: wbCN, creds: wbCreds{UID: "u1"}, via: via}
+	r := wbCheckin(context.Background(), a)
+	if r.Outcome != CheckinOwnApp {
+		t.Fatalf("got %+v", r)
+	}
+	if len(paths) != 2 || !strings.HasSuffix(paths[1], "/billing/meter/get-user-resource-summary") || strings.Contains(paths[1], "/v2/") {
+		t.Fatalf("asked %v", paths)
+	}
+}
+
+// #3326: magpie's own check-ins go through the same checkiner, so a done
+// WorkBuddy gives before its day turns is asked again too, and claimed
+// once it has.
+func TestWorkBuddyCheckinEarlyDoneAskedAgain(t *testing.T) {
+	f := &fakeWBCheckin{active: true, checked: true}
+	srv := f.serve(t)
+	now := time.Date(2026, 10, 22, 16, 0, 28, 0, time.UTC) // 00:00:28 Beijing
+	c := wbCheckinFixture(t, srv, &now)
+	if rs := c.checkinNow(context.Background(), false); len(rs) != 1 || rs[0].Outcome != CheckinDone || !rs[0].Again {
+		t.Fatalf("at midnight: %+v", rs)
+	}
+	f.mu.Lock()
+	f.checked = false
+	f.mu.Unlock()
+	now = now.Add(wbCheckinEvery)
+	if rs := c.checkinNow(context.Background(), false); len(rs) != 1 || rs[0].Outcome != CheckinClaimed {
+		t.Fatalf("30 minutes on: %+v", rs)
+	}
+	if s, cl := f.counts(); s != 2 || cl != 1 {
+		t.Fatalf("status %d, claims %d", s, cl)
 	}
 }

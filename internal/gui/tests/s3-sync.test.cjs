@@ -8,6 +8,7 @@ const fs = require("node:fs/promises");
 const path = require("node:path");
 const { test } = require("node:test");
 const { chromium, webkit } = require("playwright");
+const { openPart } = require("./reader.cjs");
 
 const assets = path.resolve(__dirname, "../assets");
 
@@ -64,7 +65,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
 
       await page.goto("http://magpie.test/");
       await page.locator("#prefs").click();
-      await page.locator("#setTab-sync").click();
+      await openPart(page, "sync");
       const list = page.locator("#syncList");
       const first = list.locator(".row.pref").first();
       await first.waitFor({ state: "visible" });
@@ -77,14 +78,14 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await page.waitForTimeout(300);
       };
       await toEnd();
-      assert.equal(await first.locator(".name").textContent(), zh ? "WebDAV / S3 同步" : "WebDAV or S3 sync");
+      assert.equal(await first.locator(".name").textContent(), zh ? "WebDAV / S3 / GitHub 同步" : "WebDAV, S3 or GitHub sync");
       await first.locator(".val button").click();
 
       const form = list.locator(".sync-form");
       await form.waitFor({ state: "visible" });
       const labels = async () => (await form.locator(":scope > label:visible").allTextContents()).filter(Boolean);
       // WebDAV is the one picked at first, S3's fields not shown
-      assert.deepEqual(await labels(), zh ? ["同步到", "地址", "用户", "密码", "口令", "同时同步"] : ["Sync to", "Address", "User", "Password", "Passphrase", "Also sync"]);
+      assert.deepEqual(await labels(), zh ? ["同步到", "地址", "用户", "密码", "口令", "同步内容"] : ["Sync to", "Address", "User", "Password", "Passphrase", "What syncs"]);
       await form.locator(":scope > div").nth(1).locator("input").fill("https://dav.example.com/dav/");
 
       // picking S3 moves nothing on the page
@@ -92,7 +93,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       // at the page's end, then back up by the wheel till the choice is in sight
       await toEnd();
       const segTop = () => page.evaluate(() => document.querySelector(".sync-form .segs").getBoundingClientRect().top - document.querySelector("#view-settings").getBoundingClientRect().top);
-      for (let i = 0; i < 40 && (await segTop()) < 40; i++) { await page.mouse.wheel(0, -40); await page.waitForTimeout(15); }
+      for (let i = 0; i < 40 && (await segTop()) < 10; i++) { await page.mouse.wheel(0, -40); await page.waitForTimeout(15); }
       await page.waitForTimeout(300);
       const before = await top();
       assert.ok(before > 0, "the settings page must be scrolled");
@@ -100,15 +101,15 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await page.waitForTimeout(250);
       assert.equal(await top(), before, "picking S3 must not scroll the page");
       assert.deepEqual(await labels(), zh
-        ? ["同步到", "终结点", "存储桶", "前缀", "区域", "Access Key", "Secret", "口令", "同时同步"]
-        : ["Sync to", "Endpoint", "Bucket", "Prefix", "Region", "Access key", "Secret", "Passphrase", "Also sync"]);
+        ? ["同步到", "接口地址", "存储桶", "前缀", "区域", "Access Key", "Secret", "口令", "同步内容"]
+        : ["Sync to", "Endpoint", "Bucket", "Prefix", "Region", "Access key", "Secret", "Passphrase", "What syncs"]);
       // every label fits its column
       for (const l of await form.locator(":scope > label:visible").all()) {
         assert.equal(await l.evaluate((e) => e.scrollWidth <= e.clientWidth + 1), true, await l.textContent());
       }
 
       const box = (label) => form.locator(":scope > label:visible", { hasText: new RegExp("^" + label + "$") }).locator("xpath=following-sibling::div[1]").locator("input");
-      const L = zh ? { endpoint: "终结点", bucket: "存储桶", prefix: "前缀", region: "区域", key: "Access Key", secret: "Secret", phrase: "口令" }
+      const L = zh ? { endpoint: "接口地址", bucket: "存储桶", prefix: "前缀", region: "区域", key: "Access Key", secret: "Secret", phrase: "口令" }
         : { endpoint: "Endpoint", bucket: "Bucket", prefix: "Prefix", region: "Region", key: "Access key", secret: "Secret", phrase: "Passphrase" };
       await box(L.endpoint).fill("https://acct.r2.cloudflarestorage.com");
       await box(L.phrase).fill("correct horse");
@@ -127,7 +128,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       // going back and forth, the shorter form too, moves nothing
       // the fields filled scrolled the choice out of sight: wheeled back to it
       await page.mouse.move(450, 300);
-      for (let i = 0; i < 40 && (await segTop()) < 40; i++) { await page.mouse.wheel(0, -40); await page.waitForTimeout(15); }
+      for (let i = 0; i < 40 && (await segTop()) < 10; i++) { await page.mouse.wheel(0, -40); await page.waitForTimeout(15); }
       await page.waitForTimeout(300);
       const at = await top();
       assert.ok(at > 0, "the settings page must still be scrolled");
@@ -142,7 +143,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await save.click();
       await form.waitFor({ state: "detached" });
       assert.deepEqual(posts, [{ url: "s3://magpie-sync/team", user: "AKIDEXAMPLE", password: "s3cr3t", endpoint: "https://acct.r2.cloudflarestorage.com",
-        region: "auto", pathStyle: true, passphrase: "correct horse", keys: true, agents: true, library: true }]);
+        region: "auto", pathStyle: true, passphrase: "correct horse", keys: true, agents: true, library: true, memory: true }]);
 
       assert.equal(await first.locator(".name").textContent(), zh ? "S3 同步" : "S3 sync");
       assert.equal(await first.locator(".sub").textContent(), (zh ? "尚未同步 · " : "Not synced yet · ") + "s3://magpie-sync/team · acct.r2.cloudflarestorage.com");
@@ -166,6 +167,9 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       assert.equal(await form.locator("label.tick input").first().isChecked(), true);
 
       await page.setViewportSize({ width: 520, height: 700 });
+      // WebKit applies the sidebar's media rule to the new width at the next
+      // frame, so measure after that frame
+      await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
       assert.equal(await form.evaluate((e) => e.scrollWidth > e.clientWidth), false);
       assert.deepEqual(errors, []);
     });

@@ -47,7 +47,7 @@ func relay(t *testing.T) (*httptest.Server, func() []asked) {
 		json.Unmarshal(b, &body)
 		m, _ := body["model"].(string)
 		mu.Lock()
-		got = append(got, asked{r.Method, r.URL.Path, r.Header.Get("Authorization") + r.Header.Get("x-api-key"), m, body})
+		got = append(got, asked{r.Method, r.URL.Path, r.Header.Get("Authorization") + r.Header.Get("x-api-key") + r.Header.Get("x-goog-api-key"), m, body})
 		mu.Unlock()
 		switch r.Method + " " + r.URL.Path {
 		case "GET /v1/models":
@@ -81,7 +81,7 @@ func TestDetectProtocols(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(res) != 3 {
+		if len(res) != 4 {
 			t.Fatalf("%s: %+v", typed, res)
 		}
 		want := []struct {
@@ -93,6 +93,9 @@ func TestDetectProtocols(t *testing.T) {
 			{Chat, true, srv.URL + "/v1", "gpt-5.5"},
 			{Responses, false, srv.URL + "/v1", "gpt-5.5"},
 			{Anthropic, true, srv.URL, "claude-sonnet-5"},
+			// no Gemini model listed: the first that chats, at the
+			// …/v1beta beside the …/v1, where this relay serves none
+			{Gemini, false, srv.URL + "/v1beta", "gpt-5.5"},
 		}
 		for i, w := range want {
 			r := res[i]
@@ -123,7 +126,7 @@ func TestDetectProtocols(t *testing.T) {
 			}
 		}
 		slices.Sort(posts)
-		if !slices.Equal(posts, []string{"/v1/chat/completions", "/v1/messages", "/v1/responses"}) {
+		if !slices.Equal(posts, []string{"/v1/chat/completions", "/v1/messages", "/v1/responses", "/v1beta/models/gpt-5.5:generateContent"}) {
 			t.Fatalf("%s: asked %v", typed, posts)
 		}
 	}
@@ -179,14 +182,14 @@ func TestResponsesProbesUseArrayInput(t *testing.T) {
 	}
 	t.Run("Detect", func(t *testing.T) {
 		rs, err := p.Detect(ctx, srv.URL, model)
-		if err != nil || len(rs) != len(Protocols) {
+		if err != nil || len(rs) != len(detectProtocols) {
 			t.Fatalf("Detect: %v, %+v", err, rs)
 		}
 		check(t, rs[1].Result)
 	})
 	t.Run("DetectModels", func(t *testing.T) {
 		each, sum, err := p.DetectModels(ctx, srv.URL, []string{model})
-		if err != nil || len(each) != 1 || len(each[0].Results) != len(Protocols) || len(sum) != len(Protocols) {
+		if err != nil || len(each) != 1 || len(each[0].Results) != len(detectProtocols) || len(sum) != len(detectProtocols) {
 			t.Fatalf("DetectModels: %v, %+v, %+v", err, each, sum)
 		}
 		check(t, each[0].Results[1].Result)
@@ -263,8 +266,15 @@ func TestModelAPI(t *testing.T) {
 	if err := SetModelAPI("relay/mixed", "responses"); err == nil || !strings.Contains(err.Error(), "no responses URL") {
 		t.Fatalf("an API with no URL: %v", err)
 	}
-	if err := SetModelAPI("relay/mixed", "gemini"); err == nil {
-		t.Fatal("gemini was taken")
+	if err := SetModelAPI("relay/mixed", "gemini"); err == nil || !strings.Contains(err.Error(), "no gemini URL") {
+		t.Fatalf("gemini with no Gemini URL: %v", err)
+	}
+	// System One, with no URL there (TestModelSystemOneNeedsItsURL)
+	if err := SetModelAPI("relay/mixed", "decide"); err == nil || !strings.Contains(err.Error(), "no System One URL") {
+		t.Fatalf("System One with no URL there: %v", err)
+	}
+	if err := SetModelAPI("relay/mixed", "jev"); err == nil || !strings.Contains(err.Error(), "not \"jev\"") {
+		t.Fatalf("an API a model isn't asked on: %v", err)
 	}
 	if err := SetModelAPI("relay/nope", "anthropic"); err == nil {
 		t.Fatal("a model it hasn't was given an API")
@@ -357,24 +367,24 @@ func TestDetectModels(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := map[string][3]bool{ // chat, responses, anthropic
-		"gpt-both":    {true, true, false},
-		"gpt-resp":    {false, true, false},
-		"glm-chat":    {true, false, false},
-		"claude-only": {false, false, true},
-		"gpt-image-2": {false, false, false},
+	want := map[string][4]bool{ // chat, responses, anthropic, gemini
+		"gpt-both":    {true, true, false, false},
+		"gpt-resp":    {false, true, false, false},
+		"glm-chat":    {true, false, false, false},
+		"claude-only": {false, false, true, false},
+		"gpt-image-2": {false, false, false, false},
 	}
 	if len(each) != len(want) {
 		t.Fatalf("asked %d models: %+v", len(each), each)
 	}
 	for _, md := range each {
 		w, ok := want[md.Model]
-		if !ok || len(md.Results) != 3 {
+		if !ok || len(md.Results) != 4 {
 			t.Fatalf("%+v", md)
 		}
 		for i, r := range md.Results {
-			if r.OK != w[i] || r.Model != md.Model || r.Protocol != Protocols[i] {
-				t.Fatalf("%s on %s: %+v, want ok=%v", md.Model, Protocols[i], r, w[i])
+			if r.OK != w[i] || r.Model != md.Model || r.Protocol != detectProtocols[i] {
+				t.Fatalf("%s on %s: %+v, want ok=%v", md.Model, detectProtocols[i], r, w[i])
 			}
 			if !r.OK && md.Model != "gpt-image-2" && (r.Status != 400 || !strings.Contains(r.Error, "not supported")) {
 				t.Fatalf("%s on %s said %+v", md.Model, r.Protocol, r)
@@ -384,14 +394,14 @@ func TestDetectModels(t *testing.T) {
 	if each[len(each)-1].Results[0].Error == "" {
 		t.Fatal("an image model was asked on chat")
 	}
-	if asked != 12 {
-		t.Fatalf("%d requests for 4 models on 3 APIs", asked)
+	if asked != 16 {
+		t.Fatalf("%d requests for 4 models on 4 APIs", asked)
 	}
 	for i, w := range []struct {
 		model, base string
 	}{{"gpt-both", srv.URL + "/v1"}, {"gpt-both", srv.URL + "/v1"}, {"claude-only", srv.URL}} {
 		if !sum[i].OK || sum[i].Model != w.model || sum[i].Base != w.base {
-			t.Fatalf("by API %s: %+v", Protocols[i], sum[i])
+			t.Fatalf("by API %s: %+v", detectProtocols[i], sum[i])
 		}
 	}
 
@@ -407,7 +417,7 @@ func TestDetectModels(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(each) != DetectMax || asked != 3*DetectMax || most > DetectWide {
+	if len(each) != DetectMax || asked != 4*DetectMax || most > DetectWide {
 		t.Fatalf("%d models, %d requests, %d at once", len(each), asked, most)
 	}
 	if _, _, err := (Provider{Key: "k"}).DetectModels(context.Background(), srv.URL, []string{" "}); err == nil {
@@ -437,5 +447,237 @@ func TestDetectModelsOutOfTime(t *testing.T) {
 	}
 	if n := len(got()); n != 0 {
 		t.Fatalf("%d sent past the time", n)
+	}
+}
+
+// A Gemini API is detected too (#1346, NagaseMinato: 「检测」不会探测 Gemini
+// 端点，为什么呢？): typed as the relay's …/v1, the bare host, Google's
+// …/v1beta or a generateContent URL pasted whole, it is asked at the
+// …/v1beta, a Gemini model from its own list, the key in x-goog-api-key, the
+// smallest request generateContent takes; a provider's own Gemini URL is
+// asked as it is.
+func TestDetectGemini(t *testing.T) {
+	detectHome(t)
+	var mu sync.Mutex
+	var gem []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/v1beta/models" && r.Method == "GET":
+			if r.Header.Get("x-goog-api-key") != "AIza-k" {
+				http.Error(w, `{"error":{"code":401,"message":"API key not valid","status":"UNAUTHENTICATED"}}`, http.StatusUnauthorized)
+				return
+			}
+			io.WriteString(w, `{"models":[{"name":"models/text-embedding-004","supportedGenerationMethods":["embedContent"]},{"name":"models/gemini-2.5-flash","supportedGenerationMethods":["generateContent","countTokens"]}]}`)
+		case strings.HasPrefix(r.URL.Path, "/v1beta/models/") && r.Method == "POST":
+			b, _ := io.ReadAll(r.Body)
+			mu.Lock()
+			gem = append(gem, r.URL.Path+" "+r.Header.Get("x-goog-api-key")+" "+r.Header.Get("Authorization")+" "+string(b))
+			mu.Unlock()
+			if r.Header.Get("x-goog-api-key") != "AIza-k" {
+				http.Error(w, `{"error":{"code":401,"message":"API key not valid","status":"UNAUTHENTICATED"}}`, http.StatusUnauthorized)
+				return
+			}
+			io.WriteString(w, `{"candidates":[{"content":{"parts":[{"text":"Hi"}],"role":"model"},"finishReason":"MAX_TOKENS","index":0}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1,"totalTokenCount":2},"modelVersion":"gemini-2.5-flash"}`)
+		default:
+			http.Error(w, `{"error":{"code":404,"message":"Not Found","status":"NOT_FOUND"}}`, http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	for _, typed := range []string{srv.URL + "/v1", srv.URL, srv.URL + "/v1beta", srv.URL + "/v1beta/models/gemini-2.5-flash:generateContent"} {
+		mu.Lock()
+		gem = nil
+		mu.Unlock()
+		res, err := Provider{Key: "AIza-k"}.Detect(context.Background(), typed, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		g := res[len(res)-1]
+		if g.Protocol != Gemini || !g.OK || g.Base != srv.URL+"/v1beta" || g.Model != "gemini-2.5-flash" {
+			t.Fatalf("%s: gemini = %+v", typed, g)
+		}
+		mu.Lock()
+		if len(gem) != 1 || gem[0] != `/v1beta/models/gemini-2.5-flash:generateContent AIza-k  {"contents":[{"role":"user","parts":[{"text":"hi"}]}],"generationConfig":{"maxOutputTokens":16}}` {
+			t.Fatalf("%s: asked %q", typed, gem)
+		}
+		mu.Unlock()
+		for _, r := range res[:len(res)-1] {
+			if r.OK {
+				t.Fatalf("%s: %s answered on a Gemini-only relay: %+v", typed, r.Protocol, r)
+			}
+		}
+	}
+
+	// the provider's own Gemini URL, and a model typed, asked as they are
+	res, err := Provider{Key: "AIza-k", Gemini: srv.URL + "/v1beta"}.Detect(context.Background(), "https://elsewhere.invalid/v1", "gemini-2.5-flash")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if g := res[3]; !g.OK || g.Base != srv.URL+"/v1beta" {
+		t.Fatalf("own URL: %+v", g)
+	}
+
+	// each model on each API: Gemini's the fourth
+	each, sum, err := Provider{Key: "AIza-k"}.DetectModels(context.Background(), srv.URL+"/v1beta", []string{"gemini-2.5-flash"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(each) != 1 || len(each[0].Results) != 4 || !each[0].Results[3].OK || !sum[3].OK || sum[3].Base != srv.URL+"/v1beta" {
+		t.Fatalf("each %+v, sum %+v", each, sum)
+	}
+	if ps := All(); len(ps) != 0 {
+		t.Fatalf("detecting saved %+v", ps)
+	}
+}
+
+// retrievalRelay serves embeddings and rerank under /v1 and nothing to
+// chat with, listing list; each request is asked.
+func retrievalRelay(t *testing.T, list string) (*httptest.Server, func() []asked) {
+	var mu sync.Mutex
+	var got []asked
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		var body map[string]any
+		json.Unmarshal(b, &body)
+		m, _ := body["model"].(string)
+		mu.Lock()
+		got = append(got, asked{r.Method, r.URL.Path, r.Header.Get("Authorization"), m, body})
+		mu.Unlock()
+		switch r.Method + " " + r.URL.Path {
+		case "GET /v1/models":
+			io.WriteString(w, list)
+		case "POST /v1/embeddings":
+			if _, ok := body["input"]; !ok || !strings.Contains(m, "bge-m3") {
+				http.Error(w, `{"error":{"message":"bad embeddings request"}}`, http.StatusBadRequest)
+				return
+			}
+			io.WriteString(w, `{"object":"list","data":[{"object":"embedding","index":0,"embedding":[0.1,0.2]}],"model":"bge-m3"}`)
+		case "POST /v1/rerank":
+			if _, ok := body["documents"]; !ok || body["query"] == nil {
+				http.Error(w, `{"error":{"message":"bad rerank request"}}`, http.StatusBadRequest)
+				return
+			}
+			io.WriteString(w, `{"results":[{"index":0,"relevance_score":0.9}]}`)
+		case "POST /v1/chat/completions":
+			// an embedding model asked to chat, as heatonz's vendor answers
+			http.Error(w, `{"error":{"message":"The model `+m+` does not support chat"}}`, http.StatusBadRequest)
+		default:
+			http.Error(w, `{"error":{"message":"Invalid URL (POST `+r.URL.Path+`)"}}`, http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv, func() []asked {
+		mu.Lock()
+		defer mu.Unlock()
+		return slices.Clone(got)
+	}
+}
+
+// A vendor of embedding and rerank models alone (heatonz on Discord,
+// 11-05): Detect APIs found nothing, as it asked an embedding model to
+// chat. Its OpenAI URL is asked as the gateway asks it for such a model,
+// at /embeddings, the smallest request with nothing a chat sends; the
+// other APIs say why they weren't asked.
+func TestDetectEmbeddingOnly(t *testing.T) {
+	detectHome(t)
+	for _, c := range []struct {
+		list, model, path string
+	}{
+		{`{"data":[{"id":"BAAI/bge-m3"},{"id":"BAAI/bge-reranker-v2-m3"}]}`, "BAAI/bge-m3", "/v1/embeddings"},
+		{`{"data":[{"id":"BAAI/bge-reranker-v2-m3"}]}`, "BAAI/bge-reranker-v2-m3", "/v1/rerank"},
+	} {
+		srv, got := retrievalRelay(t, c.list)
+		res, err := Provider{Key: "sk-relay"}.Detect(context.Background(), srv.URL, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(res) != 4 || res[0].Protocol != Chat || !res[0].OK || res[0].Model != c.model || res[0].Base != srv.URL+"/v1" {
+			t.Fatalf("%s: chat = %+v", c.model, res)
+		}
+		for _, r := range res[1:] {
+			if r.OK || r.Model != c.model || !strings.Contains(r.Error, "model: asked at OpenAI's URL") || r.Status != 0 {
+				t.Fatalf("%s on %s: %+v", c.model, r.Protocol, r)
+			}
+		}
+		var posts []asked
+		for _, a := range got() {
+			if a.method == "POST" {
+				posts = append(posts, a)
+			}
+		}
+		if len(posts) != 1 || posts[0].path != c.path || posts[0].model != c.model || posts[0].auth != "Bearer sk-relay" {
+			t.Fatalf("%s: asked %+v", c.model, posts)
+		}
+		for _, k := range []string{"max_tokens", "messages", "stream", "temperature"} {
+			if _, ok := posts[0].body[k]; ok {
+				t.Fatalf("%s: %s sent %s: %v", c.model, c.path, k, posts[0].body)
+			}
+		}
+	}
+
+	// a list with a model to chat with asks it on chat, as before
+	srv, got := retrievalRelay(t, `{"data":[{"id":"BAAI/bge-m3"},{"id":"glm-5"}]}`)
+	res, err := Provider{Key: "sk-relay"}.Detect(context.Background(), srv.URL, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range res {
+		if r.Model != "glm-5" {
+			t.Fatalf("%s asked %+v", r.Protocol, r)
+		}
+	}
+	for _, a := range got() {
+		if a.method == "POST" && a.path == "/v1/embeddings" {
+			t.Fatalf("an embedding model was asked beside a chat one: %+v", a)
+		}
+	}
+
+	// each model asked: the embedding model at /embeddings, once
+	srv, got = retrievalRelay(t, `{"data":[]}`)
+	each, sum, err := Provider{Key: "sk-relay"}.DetectModels(context.Background(), srv.URL+"/v1", []string{"BAAI/bge-m3"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(each) != 1 || !each[0].Results[0].OK || !sum[0].OK {
+		t.Fatalf("%+v", each)
+	}
+	if n := len(got()); n != 1 {
+		t.Fatalf("%d requests for one embedding model: %+v", n, got())
+	}
+	if ps := All(); len(ps) != 0 {
+		t.Fatalf("detecting saved %+v", ps)
+	}
+}
+
+// Saved, such a provider's Test asks a model its list keeps apart where
+// the gateway sends it, and a model's own test too; the extra body a chat
+// carries isn't sent to /embeddings or /rerank, as the gateway sends none.
+func TestTestEmbeddingOnly(t *testing.T) {
+	detectHome(t)
+	srv, got := retrievalRelay(t, `{"data":[{"id":"BAAI/bge-m3"},{"id":"BAAI/bge-reranker-v2-m3"}]}`)
+	if err := Save(Provider{ID: "relay", Name: "Relay", Chat: srv.URL + "/v1", Key: "sk-relay",
+		ExtraBody: ExtraBody{"prompt_cache_key": json.RawMessage(`"${sessionId}"`)}}); err != nil {
+		t.Fatal(err)
+	}
+	p, _ := Find("relay")
+	if rs := p.Test(context.Background()); len(rs) != 1 || !rs[0].OK || rs[0].Model != "BAAI/bge-m3" {
+		t.Fatalf("Test: %+v", rs)
+	}
+	rs := p.TestModels(context.Background(), []string{"BAAI/bge-reranker-v2-m3", "BAAI/bge-m3"})
+	if len(rs) != 2 || !rs[0].OK || !rs[1].OK || rs[0].Protocol != Chat {
+		t.Fatalf("TestModels: %+v", rs)
+	}
+	var paths []string
+	for _, a := range got() {
+		if a.method != "POST" {
+			continue
+		}
+		paths = append(paths, a.path)
+		if _, ok := a.body["prompt_cache_key"]; ok {
+			t.Fatalf("%s carried the extra body: %v", a.path, a.body)
+		}
+	}
+	slices.Sort(paths)
+	if !slices.Equal(paths, []string{"/v1/embeddings", "/v1/embeddings", "/v1/rerank"}) {
+		t.Fatalf("asked %v", paths)
 	}
 }

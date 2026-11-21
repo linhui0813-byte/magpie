@@ -4,8 +4,8 @@
 // installed from GitHub, one the skills CLI installed and one linked from a
 // clone, each with the repository magpie traced (repo), are one group, its
 // name's case aside; one from a git host other than GitHub is a group
-// opened at that host; the rest are On this computer. English and Chinese;
-// the API is faked here.
+// opened at that host, as is a site's kit of skills (#1862); the rest are
+// On this computer. English and Chinese; the API is faked here.
 const assert = require("node:assert/strict");
 const fs = require("node:fs/promises");
 const path = require("node:path");
@@ -42,9 +42,12 @@ const SKILLS = [
   { name: "write-a-prd", kind: "folder", source: `${HOME}/code/skills/skills/write-a-prd`, repo: "MattPocock/skills", description: "d", agents: [] },
   { name: "review", kind: "", source: "", repo: "gitlab.com/me/review", description: "d", agents: ["claude"] },
   { name: "notes", kind: "", source: "", description: "d", agents: ["claude"] },
+  // a site's kit, from the skills CLI's lock: by its base URL (#1862)
+  { name: "fish-audio-api", kind: "folder", source: `${HOME}/.agents/skills/fish-audio-api`, repo: "docs.fish.audio", description: "d", agents: ["claude"] },
+  { name: "fish-audio-sdk", kind: "folder", source: `${HOME}/.agents/skills/fish-audio-sdk`, repo: "docs.fish.audio", description: "d", agents: ["claude"] },
 ];
-const L = { en: { here: "On this computer", open: "Open gitlab.com/me/review", gh: "Open mattpocock/skills on GitHub" },
-  zh: { here: "本机", open: "打开 gitlab.com/me/review", gh: "在 GitHub 上打开 mattpocock/skills" } };
+const L = { en: { here: "On this computer", open: "Open gitlab.com/me/review", gh: "Open mattpocock/skills on GitHub", site: "Open docs.fish.audio" },
+  zh: { here: "本机", open: "打开 gitlab.com/me/review", gh: "在 GitHub 上打开 mattpocock/skills", site: "打开 docs.fish.audio" } };
 
 for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium", "webkit"])) {
   test(engine + ": a repository's skills are one group however each came in", async (t) => {
@@ -70,6 +73,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         });
         const page = await ctx.newPage();
         page.setDefaultTimeout(5000);
+        page.setDefaultNavigationTimeout(60000);
         const errors = [];
         page.on("pageerror", (e) => errors.push(e.message));
         await page.route("**/*", server(lang, state));
@@ -80,7 +84,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         const heads = await v.locator(".lib-grouphead").evaluateAll((hs) => hs.map((h) => [h.querySelector(".name").textContent, h.querySelector(".sub").textContent.replace(/\D+/g, "")]));
         // the first spelling met names the group; one only traced to a
         // repository is with this computer's, below those from GitHub (#1031)
-        assert.deepEqual(heads, [["mattpocock/skills", "3"], ["gitlab.com/me/review", "1"], [w.here, "1"]]);
+        assert.deepEqual(heads, [["mattpocock/skills", "3"], ["docs.fish.audio", "2"], ["gitlab.com/me/review", "1"], [w.here, "1"]]);
         const card = (name) => v.locator(".lib-group").filter({ has: page.locator(".lib-grouphead .name", { hasText: name }) });
         assert.equal(await card("mattpocock/skills").locator(".lib-grouphead .lib-icon").getAttribute("title"), w.gh);
         const gl = card("gitlab.com/me/review").locator(".lib-grouphead .lib-icon");
@@ -88,6 +92,11 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         // the page in a browser opens it in a tab of its own
         await gl.click();
         assert.deepEqual(await page.evaluate(() => window.__opened), ["https://gitlab.com/me/review"]);
+        // a site's kit, with no path, opens the site, not GitHub (#1862)
+        const site = card("docs.fish.audio").locator(".lib-grouphead .lib-icon");
+        assert.equal(await site.getAttribute("title"), w.site);
+        await site.click();
+        assert.deepEqual(await page.evaluate(() => window.__opened), ["https://gitlab.com/me/review", "https://docs.fish.audio"]);
         // its three skills under it, none in a part of a folder
         const names = await card("mattpocock/skills").locator(".lib-row:not(.lib-grouphead) .name").allTextContents();
         assert.deepEqual(names.map((n) => n.trim()).filter((n) => SKILLS.some((s) => s.name === n)).sort(), ["grill-me", "tdd", "write-a-prd"]);

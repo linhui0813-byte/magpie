@@ -61,6 +61,33 @@ func TestPluginTextWrittenCall(t *testing.T) {
 			t.Fatalf("arguments %q", args)
 		}
 	})
+	t.Run("chat whole", func(t *testing.T) {
+		// asked for one body (#1845): a plugin is asked streamed and the
+		// reply given whole, its text read the same way
+		req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"`+model+`","stream":false,"tools":[`+tool+`],"messages":[{"role":"user","content":"go on"}]}`))
+		req.Header.Set("Authorization", "Bearer magpie")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		body := rec.Body.String()
+		var out struct {
+			Choices []struct {
+				Message struct {
+					ToolCalls []struct {
+						Function struct{ Name, Arguments string }
+					} `json:"tool_calls"`
+				}
+				FinishReason string `json:"finish_reason"`
+			}
+		}
+		if rec.Code != 200 || json.Unmarshal([]byte(body), &out) != nil || len(out.Choices) != 1 || strings.Contains(body, "DSML") || strings.Contains(body, "tool_call>") ||
+			len(out.Choices[0].Message.ToolCalls) != 1 || out.Choices[0].FinishReason != "tool_calls" {
+			t.Fatalf("%d %s", rec.Code, body)
+		}
+		var a map[string]string
+		if json.Unmarshal([]byte(out.Choices[0].Message.ToolCalls[0].Function.Arguments), &a) != nil || a["command"] != `cd /e/Project && echo "### $spec"; done` {
+			t.Fatalf("arguments %s", body)
+		}
+	})
 	t.Run("messages", func(t *testing.T) {
 		req := httptest.NewRequest("POST", "/v1/messages", bytes.NewReader([]byte(`{"model":"`+model+`","stream":true,"max_tokens":100,"tools":[{"name":"bash","input_schema":{"type":"object"}}],"messages":[{"role":"user","content":"go on"}]}`)))
 		req.Header.Set("x-api-key", "magpie")

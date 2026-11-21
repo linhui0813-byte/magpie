@@ -20,7 +20,7 @@ func TestTrayImageNoBird(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cells, _, _ := trayUsageView(trayCards(), time.Now(), false)
+	cells, _, _ := trayUsageView(trayCards(), time.Now(), false, false)
 	for _, cs := range [][]trayCell{cells[:2], trayPlain(cells[:2])} {
 		for _, dark := range []bool{false, true} {
 			wb, ww, h := trayImagePNG(cs, bird, 22, 2, dark, false)

@@ -1,11 +1,16 @@
 package wslrun
 
 import (
+	"context"
 	"errors"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
 	"unicode/utf16"
+
+	"github.com/yetone/magpie/internal/proc"
+	"github.com/yetone/magpie/internal/settings"
 )
 
 func TestParseProbe(t *testing.T) {
@@ -22,6 +27,9 @@ func TestParseProbe(t *testing.T) {
 	if tool.Distro != "Ubuntu" || tool.Path != "/home/me/.local/bin/claude" || tool.Mount != "/mnt/" || tool.Host != "172.20.0.1" {
 		t.Fatalf("tool = %+v", tool)
 	}
+	if tool.Root {
+		t.Fatal("no uid printed, yet Root")
+	}
 	// the interactive shell's PATH wins, and the bin's folder joins it
 	if tool.PATH != "/home/me/.local/bin:/home/me/.nvm/bin:/usr/bin" {
 		t.Fatalf("PATH = %q", tool.PATH)
@@ -31,6 +39,52 @@ func TestParseProbe(t *testing.T) {
 	tool, _ = parseProbe("d", "bin:/usr/bin/claude\nlpath:/usr/bin\nmount:/win/c/\nroute:default via 10.0.0.1 dev eth0\nnet:mirrored\n")
 	if tool.Host != "" || tool.Mount != "/win/" || tool.PATH != "/usr/bin" {
 		t.Fatalf("mirrored = %+v", tool)
+	}
+
+	// consomme networking (#1230), and virtioproxy, its name before WSL
+	// 2.9: 127.0.0.1 is relayed to Windows' own, and the default route is
+	// Windows' next hop (a TUN proxy's 198.18.0.2), not Windows. A mode
+	// wslinfo didn't name, or one that isn't these, keeps the route.
+	for out, host := range map[string]string{
+		"net:consomme\n":    "",
+		"net:Consomme\r\n":  "",
+		"net:virtioproxy\n": "",
+		"net:nat\n":         "198.18.0.2",
+		"net:bridged\n":     "198.18.0.2",
+		"net:\n":            "198.18.0.2",
+		"":                  "198.18.0.2",
+	} {
+		tool, _ = parseProbe("d", "bin:/usr/bin/claude\nlpath:/usr/bin\nroute:default via 198.18.0.2 dev eth0 proto kernel\n"+out)
+		if tool.Host != host {
+			t.Errorf("%q: Host = %q, want %q", out, tool.Host, host)
+		}
+	}
+
+	// a distro whose default user is root: its Claude Code is told so
+	// (the gateway's asRoot)
+	for out, root := range map[string]bool{"uid:0\n": true, "uid:0\r\n": true, "uid:1000\n": false, "uid:\n": false} {
+		tool, _ = parseProbe("d", "bin:/usr/bin/claude\n"+out)
+		if tool.Root != root {
+			t.Errorf("%q: Root = %v, want %v", out, tool.Root, root)
+		}
+	}
+	if s := probeScript("claude"); !strings.Contains(s, `echo "uid:$(id -u)"`) {
+		t.Fatalf("probe doesn't print the user: %s", s)
+	}
+
+	// the user's home, where its Claude Code keeps its transcripts, as
+	// Windows reads it (claudetui)
+	for out, home := range map[string]string{"home:/home/me\n": "/home/me", "home:/root\r\n": "/root", "home:\n": "", "": ""} {
+		tool, _ = parseProbe("d", "bin:/usr/bin/claude\n"+out)
+		if tool.Home != home {
+			t.Errorf("%q: Home = %q, want %q", out, tool.Home, home)
+		}
+	}
+	if s := probeScript("claude"); !strings.Contains(s, `echo "home:$HOME"`) {
+		t.Fatalf("probe doesn't print the home: %s", s)
+	}
+	if w := (Tool{Distro: "Ubuntu"}).Windows("/home/me/.claude/projects"); w != `\\wsl$\Ubuntu\home\me\.claude\projects` {
+		t.Fatalf("Windows = %q", w)
 	}
 
 	// no claude in the distro (the probe skips Windows' own under /mnt)
@@ -225,5 +279,93 @@ func TestUp(t *testing.T) {
 	On = false
 	if Up("Ubuntu-24.04") {
 		t.Error("Up off Windows")
+	}
+}
+
+// #2341: a wsl.exe that failed to say which distros run is asked again only
+// after upFailedAge, not every upAge: each ask that times out holds the
+// caller 10s and leaves a wsl.exe behind. An answer is still kept only upAge.
+func TestUpFailedKept(t *testing.T) {
+	oldOn, oldRun := On, Run
+	t.Cleanup(func() { On, Run = oldOn, oldRun; Forget() })
+	On = true
+	Forget()
+	asks := 0
+	var err error
+	Run = func(_ time.Duration, args ...string) ([]byte, error) {
+		asks++
+		return utf16le("Ubuntu\r\n"), err
+	}
+	aged := func(d time.Duration) {
+		up.Lock()
+		up.at = time.Now().Add(-d)
+		up.Unlock()
+	}
+	err = errors.New("timed out")
+	if Up("Ubuntu") || asks != 1 {
+		t.Fatalf("failed: Up, %d asks", asks)
+	}
+	aged(upAge + time.Second)
+	if Up("Ubuntu") || asks != 1 {
+		t.Fatalf("a failure was asked again after %v: %d asks", upAge, asks)
+	}
+	aged(upFailedAge + time.Second)
+	err = nil
+	if !Up("Ubuntu") || asks != 2 {
+		t.Fatalf("after %v: %d asks", upFailedAge, asks)
+	}
+	aged(upAge + time.Second)
+	Up("Ubuntu")
+	if asks != 3 {
+		t.Fatalf("an answer was kept past %v: %d asks", upAge, asks)
+	}
+}
+
+// #1264: with Settings' Detect agents in WSL off, Find (Claude Code for a
+// Claude subscription, when Windows has none) asks wsl.exe nothing.
+func TestFindWithDetectionOff(t *testing.T) {
+	oldOn, oldRun := On, Run
+	t.Cleanup(func() { On, Run = oldOn, oldRun; Forget(); settings.Save(settings.Settings{}) })
+	On = true
+	Forget()
+	var asked []string
+	Run = func(_ time.Duration, args ...string) ([]byte, error) {
+		asked = append(asked, strings.Join(args, " "))
+		if strings.Join(args, " ") == "-l --running -q" || strings.Join(args, " ") == "-l -q" {
+			return utf16le("Ubuntu\r\n"), nil
+		}
+		return []byte("bin:/usr/bin/claude\nlpath:/usr/bin\n"), nil
+	}
+	if err := settings.Save(settings.Settings{NoWSLAgents: true}); err != nil {
+		t.Fatal(err)
+	}
+	if tool, ok := Find("claude"); ok || len(asked) != 0 {
+		t.Fatalf("Find with detection off = %+v %v, asked %q", tool, ok, asked)
+	}
+	if err := settings.Save(settings.Settings{}); err != nil {
+		t.Fatal(err)
+	}
+	if tool, ok := Find("claude"); !ok || tool.Distro != "Ubuntu" {
+		t.Fatalf("Find with detection on = %+v %v", tool, ok)
+	}
+}
+
+// #4872: Run, and a Tool's commands (Claude Code in a distro, its
+// pseudo-console helper's line), are refused at proc with detection off.
+func TestRunRefusedWhenOff(t *testing.T) {
+	t.Cleanup(func() { settings.Save(settings.Settings{}) })
+	if err := settings.Save(settings.Settings{NoWSLAgents: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Run(5*time.Second, "-l", "--running", "-q"); !errors.Is(err, proc.ErrWSLOff) {
+		t.Fatalf("detection off, Run ran wsl.exe: %v", err)
+	}
+	tool := Tool{Distro: "Ubuntu", Path: "/home/me/.local/bin/claude", Mount: "/mnt/"}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	for _, c := range []*exec.Cmd{tool.Command(ctx, "-v"), tool.Probe(ctx, "-v")} {
+		if !errors.Is(c.Err, proc.ErrWSLOff) {
+			t.Fatalf("detection off, %q not refused: %v", c.Args, c.Err)
+		}
 	}
 }

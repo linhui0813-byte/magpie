@@ -56,19 +56,26 @@ func trayProps(tray *application.SystemTray) (props *prop.Properties) {
 	if tray == nil {
 		return nil
 	}
-	impl := reflect.ValueOf(tray).Elem().FieldByName("impl")
-	if !impl.IsValid() || impl.Kind() != reflect.Interface || impl.IsNil() {
+	impl := trayImpl(reflect.ValueOf(tray).Elem())
+	if !impl.IsValid() {
 		return nil
 	}
-	p := impl.Elem()
-	if p.Kind() != reflect.Pointer || p.IsNil() || p.Elem().Kind() != reflect.Struct {
-		return nil
-	}
-	f := p.Elem().FieldByName("props")
+	f := impl.FieldByName("props")
 	if !f.IsValid() || f.Type() != reflect.TypeOf((*prop.Properties)(nil)) {
 		return nil
 	}
 	return *(**prop.Properties)(unsafe.Pointer(f.UnsafeAddr()))
+}
+
+// trayClick is where the tray host said the icon was clicked, across its
+// bar: Wails' Linux tray keeps Activate(x, y)'s coordinates
+// (SystemTray.impl.lastClickX) and passes the click handler none. ok is
+// false when they aren't there to read.
+func trayClick(tray *application.SystemTray) (x int, ok bool) {
+	if tray == nil {
+		return 0, false
+	}
+	return clickIn(reflect.ValueOf(tray).Elem())
 }
 
 // setTrayPassive takes the tray's StatusNotifierItem out of the bar's tray
@@ -101,4 +108,51 @@ func setTrayPassive(tray *application.SystemTray, passive bool) (ok bool) {
 		log.Println("tray: status signal:", err)
 	}
 	return true
+}
+
+// traySchemeLight says whether the desktop prefers a light colour scheme,
+// as xdg-desktop-portal's Settings has it; false for dark, for no
+// preference, and when there is no portal to ask.
+func traySchemeLight() bool {
+	conn, err := dbus.SessionBus()
+	if err != nil {
+		return false
+	}
+	obj := conn.Object("org.freedesktop.portal.Desktop", "/org/freedesktop/portal/desktop")
+	var v dbus.Variant
+	if err := obj.Call("org.freedesktop.portal.Settings.Read", 0, "org.freedesktop.appearance", "color-scheme").Store(&v); err != nil {
+		return false
+	}
+	return portalLight(v)
+}
+
+// watchTrayScheme calls f with the new preference each time the desktop's
+// colour scheme changes (the portal's SettingChanged), on a connection of
+// its own so Wails' signals on the shared one aren't held up by it.
+func watchTrayScheme(f func(light bool)) {
+	conn, err := dbus.ConnectSessionBus()
+	if err != nil {
+		return
+	}
+	if err := conn.AddMatchSignal(
+		dbus.WithMatchObjectPath("/org/freedesktop/portal/desktop"),
+		dbus.WithMatchInterface("org.freedesktop.portal.Settings"),
+		dbus.WithMatchMember("SettingChanged"),
+	); err != nil {
+		conn.Close()
+		return
+	}
+	ch := make(chan *dbus.Signal, 8)
+	conn.Signal(ch)
+	for s := range ch {
+		if len(s.Body) < 3 {
+			continue
+		}
+		ns, _ := s.Body[0].(string)
+		key, _ := s.Body[1].(string)
+		v, ok := s.Body[2].(dbus.Variant)
+		if ns == "org.freedesktop.appearance" && key == "color-scheme" && ok {
+			f(portalLight(v))
+		}
+	}
 }

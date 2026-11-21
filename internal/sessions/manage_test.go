@@ -199,3 +199,43 @@ func TestDeleteOnlyKnownAgents(t *testing.T) {
 		t.Fatal("no such session")
 	}
 }
+
+// A session nothing was said in is listed, to be cleared away, and opens
+// from its row as any other (#2273): Find, which the page's conversation,
+// Markdown and Terminal go through, finds it as ListAgent lists it. The
+// rollout is a real Codex Image Session Helper one whose only turn was
+// aborted, its ids, folder and instructions replaced.
+func TestFindEmptySession(t *testing.T) {
+	_, codex := manageSetup(t)
+	const id = "01a12261-d5bb-7f03-a40e-c4adca978a90"
+	b, err := os.ReadFile("testdata/codex-aborted-helper.jsonl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(codex, "sessions", "2026", "10", "10", "rollout-2026-10-10T04-36-39-"+id+".jsonl"), string(b))
+	for _, s := range List(All) {
+		if s.ID == id {
+			t.Fatalf("an empty session is in List: %+v", s)
+		}
+	}
+	m, ok := findManaged(ListAgent("codex"), id)
+	if !ok {
+		t.Fatal("the empty session isn't listed")
+	}
+	s, ok := Find("codex", id)
+	if !ok {
+		t.Fatal("a listed session isn't found")
+	}
+	if s.Path != m.Path || s.Resume != m.Resume || !s.Transcript || !strings.Contains(s.Resume, "codex resume "+id) {
+		t.Fatalf("found %+v, listed %+v", s, m.Session)
+	}
+	if _, err := TranscriptOf(s); err != nil {
+		t.Fatalf("its conversation: %v", err)
+	}
+	if _, ok := Get("codex:" + id); ok {
+		t.Fatal("Get counts an empty session as one something was said in")
+	}
+	if _, ok := Find("codex", "01a12261-0000-0000-0000-000000000000"); ok {
+		t.Fatal("a session with no files is found")
+	}
+}

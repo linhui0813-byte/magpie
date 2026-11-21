@@ -115,6 +115,8 @@ func TestKeepsEffort(t *testing.T) {
 		{"cold", tr, "high", 234_000, at.Add(cacheCold + time.Second), false},
 		{"answered since: warm", turnRule{effort: "xhigh", at: at, answered: at.Add(4 * time.Minute)}, "low", 1000, at.Add(6 * time.Minute), true},
 		{"compacted", tr, "high", 40_000, at.Add(time.Second), false},
+		{"an hour's cache: warm at 20 minutes", turnRule{effort: "xhigh", at: at, hour: hourCache{30_000, at}}, "high", 30_000, at.Add(20 * time.Minute), true},
+		{"an hour's cache: cold after the hour", turnRule{effort: "xhigh", at: at, hour: hourCache{30_000, at}}, "high", 30_000, at.Add(61 * time.Minute), false},
 		{"nothing before", turnRule{at: at}, "high", 1000, at.Add(time.Second), false},
 		{"no pick", tr, "", 234_000, at.Add(time.Second), false},
 	} {

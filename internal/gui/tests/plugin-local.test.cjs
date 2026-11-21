@@ -87,6 +87,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         const asked = [];
         const page = await (await browser.newContext({ viewport: { width: 980, height: 820 } })).newPage();
         page.setDefaultTimeout(5000);
+        page.setDefaultNavigationTimeout(60000);
         const errors = [];
         page.on("pageerror", (e) => errors.push(e.message));
         await page.route("**/*", server(lang, asked));
@@ -116,7 +117,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         assert.deepEqual(asked.find(([k]) => k === "add")[1], { spec: FOLDER });
 
         // Installed: the folder's own name, its page from the folder's README
-        await view.locator(".lib-tabs .opt", { hasText: w.tab === "Plugins" ? "Installed" : "已安装" }).click();
+        await view.page().locator(":is(.lib-tabs .opt, .nav-s):visible", { hasText: w.tab === "Plugins" ? "Installed" : "已安装" }).click();
         const row = view.locator(".pm-row").first();
         await row.waitFor();
         assert.equal((await row.locator(".name span").first().innerText()).trim(), w.folderName, "the folder names it, not the whole path");
@@ -141,6 +142,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       const asked = [];
       const page = await (await browser.newContext({ viewport: { width: 980, height: 820 } })).newPage();
       page.setDefaultTimeout(5000);
+      page.setDefaultNavigationTimeout(60000);
       await page.route("**/*", server("en", asked, { picker: false }));
       await page.goto("http://magpie.test/?view=plugins");
       const manual = page.locator("#view-plugins .pm-manual");

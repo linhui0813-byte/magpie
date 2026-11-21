@@ -23,7 +23,7 @@ const (
 // as the model it asks /v1/responses for.
 func (s *Server) museModels(w http.ResponseWriter, r *http.Request) {
 	shown := catalogFor(r)
-	labels := provider.Labels(shown)
+	labels := provider.LabelsFor(agentOf(r), shown)
 	data := []map[string]any{}
 	for i, e := range shown {
 		input := []string{"text"}
@@ -39,7 +39,7 @@ func (s *Server) museModels(w http.ResponseWriter, r *http.Request) {
 		// whose limit lacks either, and without a limit asks for replies
 		// of 128K tokens, more than most models give; one magpie doesn't
 		// know is told 128K and Muse's own 32K
-		ctx, out := cmp.Or(e.Context, museContext), e.Output
+		ctx, out := cmp.Or(e.Context, museContext), e.PublishedOutput()
 		if out <= 0 {
 			out = min(museOutput, ctx)
 		}

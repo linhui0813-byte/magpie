@@ -82,7 +82,15 @@ const otherVendorsCalls = `[{"type":"message","role":"user","content":[{"type":"
 
 // sentAsOpenAI is what the upstream must have been given: the calls' ids
 // of their own kinds, the call_ids their outputs name them by as they came.
-var sentAsOpenAI = []string{`"tsc_18da5b9a10256a3e00000011"`, `"ctc_18da5b9a10256a3e00000012"`, `"ctc_openai"`,
+// The search goes as a function's call and result, as it went in the turns
+// that offered it, and so with no id of its own (#1171).
+var sentAsOpenAI = []string{`"ctc_18da5b9a10256a3e00000012"`, `"ctc_openai"`,
+	`"call_id":"s1","name":"tool_search","type":"function_call"`, `"call_id":"p1"`, `"call_id":"p2"`, "fix it"}
+
+// sentToChatGPT is what the ChatGPT backend, which runs Codex's search as
+// Codex sends it, must have been given: the search's call too with an id of
+// its kind.
+var sentToChatGPT = []string{`"tsc_18da5b9a10256a3e00000011"`, `"ctc_18da5b9a10256a3e00000012"`, `"ctc_openai"`,
 	`"call_id":"s1"`, `"call_id":"p1"`, `"call_id":"p2"`, "fix it"}
 
 // The same conversation going on through a magpie model or a routing group
@@ -172,7 +180,7 @@ func TestResponsesRelayCallIDs(t *testing.T) {
 					if err := json.Unmarshal([]byte(last), &sent); err != nil {
 						t.Fatal(err)
 					}
-					if sent["tools"] != nil || !strings.Contains(last, "CONTEXT CHECKPOINT COMPACTION") {
+					if string(sent["tools"]) != "[]" || !strings.Contains(last, "CONTEXT CHECKPOINT COMPACTION") {
 						t.Errorf("not a compaction request: %s", last)
 					}
 					if !strings.Contains(rec.Body.String(), `"type":"compaction"`) || !strings.Contains(rec.Body.String(), magpieCompaction) {
@@ -202,7 +210,7 @@ func TestCodexOwnModelCustomCallIDs(t *testing.T) {
 			t.Fatalf("%s: %d %s", path, rec.Code, rec.Body)
 		}
 		last := got[len(got)-1]
-		for _, want := range sentAsOpenAI {
+		for _, want := range sentToChatGPT {
 			if !strings.Contains(last, want) {
 				t.Errorf("%s: upstream lacks %s: %s", path, want, last)
 			}

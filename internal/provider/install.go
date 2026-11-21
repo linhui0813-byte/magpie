@@ -1,12 +1,13 @@
 package provider
 
-// Some subscriptions are used through the vendor's own CLI — Cursor's,
-// Grok's, Devin's — and signed in with it too. One that isn't installed is
+// Some subscriptions are used through the vendor's own CLI — Claude
+// Code, Cursor's, Grok's, Devin's — and signed in with it too. One that isn't installed is
 // installed with the vendor's own installer when its sign-in starts, as the
 // vendor's page tells a person to, rather than leaving the sign-in to fail
 // or, as Devin's did, to finish with nothing to show for it.
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"os/exec"
@@ -14,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/yetone/magpie/internal/claudecode"
 	"github.com/yetone/magpie/internal/netproxy"
 	"github.com/yetone/magpie/internal/proc"
 )
@@ -21,21 +23,41 @@ import (
 // agentCLI is a CLI a subscription runs through: how to find it, and the
 // vendor's install one-liners for a POSIX shell and for PowerShell. native,
 // when there is one, does what the shell one does without a shell, for a
-// magpie with none (its Docker image has no bash, curl or wget).
+// magpie with none (its Docker image had no bash, curl or wget until #2834). setup: the
+// installer ends by running the CLI's own setup, which asks how to sign in;
+// magpie signs in itself once the CLI is there. manual, when set, is how
+// a person installs it, told when the install fails, where a CLI with no
+// one-liner (Claude Code's, which magpie downloads itself) has native only.
 type agentCLI struct {
 	Name   string
 	find   func() string
 	sh     string
 	ps     string
 	native func(ctx context.Context) error
+	manual string
+	setup  bool
 }
 
 func cliFor(agent string) (agentCLI, bool) {
 	switch agent {
+	case "claude":
+		// Kabubu01 (X): the GUI's Claude sign-in failed with "install
+		// Claude Code first … or run `magpie claude-code install`". The
+		// sign-in now downloads it as that command does: Anthropic's own
+		// build, checked against its manifest, kept in magpie's cache and
+		// not put on PATH
+		return agentCLI{Name: "Claude Code", find: func() string {
+			c, ok := findClaudeCLI()
+			if ok && c.wsl != nil {
+				return "wsl:" + c.wsl.Distro
+			}
+			return c.path
+		}, native: downloadClaudeCode, manual: "magpie claude-code install"}, true
 	case "devin":
 		return agentCLI{Name: "Devin CLI", find: func() string { return DevinExecutable() },
-			sh: "curl -fsSL https://cli.devin.ai/install.sh | bash",
-			ps: "irm https://static.devin.ai/cli/setup.ps1 | iex"}, true
+			sh:    "curl -fsSL https://cli.devin.ai/install.sh | bash",
+			ps:    "irm https://static.devin.ai/cli/setup.ps1 | iex",
+			setup: true}, true
 	case "cursor":
 		return agentCLI{Name: "Cursor CLI", find: func() string { return CursorExecutable() },
 			sh: "curl https://cursor.com/install -fsS | bash",
@@ -63,35 +85,109 @@ var installTimeout = 10 * time.Minute
 
 // runInstaller runs a vendor's installer; a var so tests can fake it.
 var runInstaller = func(ctx context.Context, c agentCLI) ([]byte, error) {
-	if runtime.GOOS != "windows" && c.native != nil && !shellInstallerRuns() {
+	if c.native != nil && (c.sh == "" && c.ps == "" || runtime.GOOS != "windows" && !shellInstallerRuns()) {
 		return nil, c.native(ctx)
 	}
 	var cmd *exec.Cmd
 	if runtime.GOOS == "windows" {
-		cmd = proc.CommandContext(ctx, "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", c.ps)
+		// the one-liner goes to PowerShell on stdin, as one typed into it
+		// does: on PowerShell's command line, Microsoft Defender took
+		// "irm <url> | iex" for a Trojan (Trojan:Win32/Commando.A!ml) and
+		// stopped it before it ran, which came back as "Access is denied"
+		cmd = proc.CommandContext(ctx, "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "-")
+		cmd.Stdin = strings.NewReader(c.ps + "\n")
 	} else {
 		cmd = proc.CommandContext(ctx, "bash", "-c", c.sh)
 	}
 	cmd.Dir, _ = os.UserHomeDir()
 	cmd.Env = netproxy.Env(nil)
-	// no stdin: an installer that would ask something takes its default
+	if runtime.GOOS == "windows" && c.setup {
+		return runUntilInstalled(ctx, cmd, c)
+	}
+	// nothing more on stdin: an installer that would ask something takes
+	// its default
 	return cmd.CombinedOutput()
 }
 
-// shellInstallerRuns is whether a vendor's `curl … | bash` can run here:
-// bash, and curl or wget for it to download with. magpie's Docker image
-// (distroless) has none of them, and the install failed there with "exec:
-// bash: not found". A var so tests can say there is none.
-var shellInstallerRuns = func() bool {
-	if _, err := exec.LookPath("bash"); err != nil {
-		return false
+// installerTail is how long an installer that ends in its CLI's setup is
+// given to end by itself once the CLI is in place; a var so tests can
+// shorten it.
+var installerTail = 5 * time.Second
+
+// runUntilInstalled runs an installer that ends in its CLI's setup, on
+// Windows, and ends it, with what it started, installerTail after the CLI
+// is in place. Devin's runs `devin setup`, whose menu asking how to sign in
+// waits for a key on the console, and no one can answer the console an
+// installer gets from magpie (it has no window, and magpie keeps its
+// output): the sign-in waited out installTimeout, then went on with
+// `devin setup` still running.
+func runUntilInstalled(ctx context.Context, cmd *exec.Cmd, c agentCLI) ([]byte, error) {
+	var out bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &out
+	t, err := proc.StartTree(cmd)
+	if err != nil {
+		return nil, err
 	}
-	for _, d := range []string{"curl", "wget"} {
-		if _, err := exec.LookPath(d); err == nil {
-			return true
+	ended := make(chan struct{})
+	go func() {
+		tick := time.NewTicker(time.Second)
+		defer tick.Stop()
+		var tail <-chan time.Time
+		for {
+			select {
+			case <-ended:
+				return
+			case <-ctx.Done():
+				t.Kill()
+				return
+			case <-tail:
+				t.Kill()
+				return
+			case <-tick.C:
+				if tail != nil {
+					continue
+				}
+				// the installer puts the CLI's folder on the user's PATH,
+				// which a running program reads from the registry
+				refreshPath()
+				if c.find() != "" {
+					tail = time.After(installerTail)
+				}
+			}
+		}
+	}()
+	err = t.Wait()
+	close(ended)
+	return out.Bytes(), err
+}
+
+// downloadClaudeCode downloads the newest Claude Code into magpie's cache
+// (claudecode.Install), where claudecode.Find, and so the sign-in, finds
+// it; a var so tests never reach the network.
+var downloadClaudeCode = func(ctx context.Context) error {
+	r, err := claudecode.Latest(ctx)
+	if err != nil {
+		return err
+	}
+	_, err = claudecode.Install(ctx, r, nil)
+	return err
+}
+
+// shellInstallerRuns is whether a vendor's `curl … | bash` can run here:
+// bash, and curl, which every one-liner (and the scripts behind them)
+// downloads with. magpie's Docker image had none of them, and the install
+// failed there with "exec: bash: not found". Since 7bfe3137 it has bash and
+// busybox's wget but still no curl, and the one-liner failed there too.
+// Since #2834 it is Debian with bash and curl, and the CLIs the one-liners
+// install find the loader and libraries they link. A var so tests can say
+// there is none.
+var shellInstallerRuns = func() bool {
+	for _, p := range []string{"bash", "curl"} {
+		if _, err := exec.LookPath(p); err != nil {
+			return false
 		}
 	}
-	return false
+	return true
 }
 
 // installCLI installs c with its vendor's installer and makes sure magpie
@@ -107,6 +203,9 @@ func installCLI(ctx context.Context, c agentCLI) error {
 	if runtime.GOOS == "windows" {
 		manual = c.ps
 	}
+	if c.manual != "" {
+		manual = c.manual
+	}
 	if ctx.Err() == context.Canceled {
 		return ctx.Err()
 	}
@@ -121,7 +220,13 @@ func installCLI(ctx context.Context, c agentCLI) error {
 		if msg == "" {
 			msg = err.Error()
 		}
+		if manual == "" {
+			return errorf("installing %s failed (%s); install it yourself, then sign in again", c.Name, msg)
+		}
 		return errorf("installing %s failed (%s); install it yourself with `%s`, then sign in again", c.Name, msg, manual)
+	}
+	if manual == "" {
+		return errorf("the %s installer finished, but magpie can't find it; install it yourself, then sign in again", c.Name)
 	}
 	return errorf("the %s installer finished, but magpie can't find it; install it yourself with `%s`, then sign in again", c.Name, manual)
 }

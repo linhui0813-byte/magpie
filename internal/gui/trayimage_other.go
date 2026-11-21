@@ -14,3 +14,7 @@ func trayImageHide() {}
 func trayHighlight(bool) {}
 
 func trayOwnClicks() {}
+
+// trayTipNative: Wails' SetTooltip sets Windows' own; Linux has setTrayTip
+// of its own (traytip_linux.go).
+var trayTipNative = func(string) bool { return true }

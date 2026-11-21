@@ -6,9 +6,11 @@ package tui
 // library.go.
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"math"
+	"net/url"
 	"slices"
 	"strings"
 	"sync"
@@ -79,7 +81,7 @@ func balancesCmd(ps []provider.Provider) tea.Cmd {
 				}
 				v := amount
 				if err != nil {
-					v = "balance: " + err.Error()
+					v = trf("balance: %s", err.Error())
 					if r := []rune(v); len(r) > 60 {
 						v = string(r[:60]) + "…"
 					}
@@ -115,7 +117,7 @@ func (m model) updateProviders(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.openPresets()
 		return m, nil
 	case "b":
-		m.flash, m.flashOK = "asking the vendors for balances…", true
+		m.flash, m.flashOK = tr("asking the vendors for balances…"), true
 		return m, balancesCmd(m.provs)
 	}
 	if n == 0 {
@@ -127,21 +129,55 @@ func (m model) updateProviders(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.openProviderModels(p.ID)
 	case "e":
 		if p.Account != nil {
-			m.flash, m.flashOK = p.Name+" is a signed-in account: its key is the agent's sign-in", false
+			m.flash, m.flashOK = trf("%s is a signed-in account: its key is the agent's sign-in", p.Name), false
 			return m, nil
 		}
-		in := newInput("the API key")
+		if p.IsVertex() {
+			// its token is minted from the user's Google credentials
+			m.flash, m.flashOK = trf("%s takes no key · magpie provider set %s credentials=… impersonate=… changes its Google credentials", p.Name, p.ID), false
+			return m, nil
+		}
+		in := newInput(tr("the API key"))
 		in.EchoMode = textinput.EchoPassword
 		in.EchoCharacter = '•'
-		m.openAsk(ask{crumbs: []string{"providers", p.Name, "key"}, input: in,
-			hint: "now " + dash(provider.Mask(p.Key)) + " · the key is kept in magpie's providers file",
+		m.openAsk(ask{crumbs: []string{tr("providers"), p.Name, tr("key")}, input: in,
+			hint: trf("now %s · the key is kept in magpie's providers file", dash(provider.Mask(p.Key))),
 			onEnter: func(v string) tea.Cmd {
-				return saveProvider(p.ID, func(p *provider.Provider) { p.Key = v; provider.ForgetBalances() }, p.Name+" key "+provider.Mask(v))
+				return saveProvider(p.ID, func(p *provider.Provider) { p.Key = v; provider.ForgetBalances() }, trf("%s key %s", p.Name, provider.Mask(v)))
 			}})
 	case "w":
+		if p.IsVertex() {
+			m.flash, m.flashOK = trf("%s is asked at your Google Cloud project · magpie provider set %s project=… location=… changes it", p.Name, p.ID), false
+			return m, nil
+		}
 		pr := provider.Preset(p.Preset)
+		if pr != nil && pr.Kind == provider.KindLocal {
+			id, name := p.ID, p.Name
+			now := provider.AddressOf(p.Chat, p.Responses, p.Anthropic)
+			m.openAsk(localAddressAsk(*pr, []string{tr("providers"), name, tr("address")}, now, func(v string) tea.Cmd {
+				q := p
+				_ = q.AtAddress(v)
+				// the address it opened with: URLs set apart (an Anthropic
+				// URL on another host) aren't moved onto the first one's
+				if at := provider.AddressOf(q.Chat, q.Responses, q.Anthropic); v == "" || at == now {
+					return func() tea.Msg { return flashMsg{text: trf("%s address unchanged", name), ok: true} }
+				}
+				return saveProvider(id, func(p *provider.Provider) {
+					_ = p.AtAddress(v)
+					provider.ForgetBalances()
+				}, trf("%s address %s", name, provider.AddressOf(q.Chat, q.Responses, q.Anthropic)))
+			}))
+			return m, nil
+		}
+		if pr == nil && p.Account == nil && len(customURLs(p)) > 0 {
+			// a provider of the user's own: its base URLs, one by one
+			// (luluxiu_1_4392 on Discord: on Linux, the TUI had no way to
+			// change one)
+			m.openAsk(customURLsAsk(p, customURLs(p), nil))
+			return m, nil
+		}
 		if pr == nil || pr.Endpoint == "" {
-			m.flash, m.flashOK = p.Name+" is asked at its vendor's address · magpie provider set "+p.ID+" url=… changes a custom one's", false
+			m.flash, m.flashOK = trf("%s is asked at its vendor's address · magpie provider set %s url=… changes a custom one's", p.Name, p.ID), false
 			return m, nil
 		}
 		now := p.Chat
@@ -152,54 +188,54 @@ func (m model) updateProviders(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			now = p.Anthropic // the address as typed, without /v1
 		}
 		id, name := p.ID, p.Name
-		m.openAsk(endpointAsk(*pr, []string{"providers", name, "address"}, now, func(v string) tea.Cmd {
+		m.openAsk(endpointAsk(*pr, []string{tr("providers"), name, tr("address")}, now, func(v string) tea.Cmd {
 			return saveProvider(id, func(p *provider.Provider) {
 				p.Chat, p.Responses = v, v
 				if p.IsRemoteMagpie() {
 					p.Anthropic = "" // put again from the address typed
 				}
 				provider.ForgetBalances()
-			}, name+" address "+v)
+			}, trf("%s address %s", name, v))
 		}))
 	case "f":
-		in := newInput("a tag, e.g. relay")
+		in := newInput(tr("a tag, e.g. relay"))
 		in.SetValue(p.Family)
-		m.openAsk(ask{crumbs: []string{"providers", p.Name, "family"}, input: in, empty: true,
-			hint: "agents can be shown only some families: magpie visible <agent> <family>",
+		m.openAsk(ask{crumbs: []string{tr("providers"), p.Name, tr("family")}, input: in, empty: true,
+			hint: tr("agents can be shown only some families: magpie visible <agent> <family>"),
 			onEnter: func(v string) tea.Cmd {
-				return saveProvider(p.ID, func(p *provider.Provider) { p.Family = v }, p.Name+" family "+dash(v))
+				return saveProvider(p.ID, func(p *provider.Provider) { p.Family = v }, trf("%s family %s", p.Name, dash(v)))
 			}})
 	case "u":
 		on := !p.Unlisted
-		what := "its models are listed"
+		what := tr("its models are listed")
 		if on {
-			what = "serves only through routing groups"
+			what = tr("serves only through routing groups")
 		}
 		return m, saveProvider(p.ID, func(p *provider.Provider) { p.Unlisted = on }, p.Name+" "+what)
 	case "o":
 		off := !p.Off
-		what := "switched on"
+		what := tr("switched on")
 		if off {
-			what = "switched off: agents are given none of its models"
+			what = tr("switched off: agents are given none of its models")
 		}
 		id := p.ID
 		return m, reseatCmd(func() error { return provider.SetOff(id, off) }, p.Name+" "+what)
 	case "t":
-		m.flash, m.flashOK = "testing "+p.Name+"…", true
+		m.flash, m.flashOK = trf("testing %s…", p.Name), true
 		return m, testCmd(p)
 	case "m":
-		// the vendor's list asked again, as the app editor's Refresh does
-		m.flash, m.flashOK = "asking "+p.Name+" for its models…", true
+		// the vendor's list asked again, as the app editor's Fetch models does
+		m.flash, m.flashOK = trf("asking %s for its models…", p.Name), true
 		return m, refetchCmd(p.ID)
 	case "d":
 		if m.confirm != "provider/"+p.ID {
 			m.confirm = "provider/" + p.ID
-			m.flash, m.flashOK = "press d again to remove "+p.Name, false
+			m.flash, m.flashOK = trf("press d again to remove %s", p.Name), false
 			return m, nil
 		}
 		m.confirm = ""
 		id := p.ID
-		return m, reseatCmd(func() error { return provider.Delete(id) }, "removed "+p.Name)
+		return m, reseatCmd(func() error { return provider.Delete(id) }, trf("removed %s", p.Name))
 	}
 	return m, nil
 }
@@ -217,7 +253,7 @@ func reseatCmd(change func() error, done string) tea.Cmd {
 				done += "; " + mv.String()
 				continue
 			}
-			done += "; moved " + mv.String()
+			done += "; " + trf("moved %s", mv.String())
 		}
 		return flashMsg{text: done, ok: true}
 	}
@@ -240,7 +276,7 @@ func saveProvider(id string, change func(*provider.Provider), done string) tea.C
 
 // refetchCmd asks the provider's vendor for its model list again and says
 // how many it has and how many agents are offered, or why there is none:
-// the app editor's Refresh, which the TUI had no way to do (akic404 on
+// the app editor's Fetch models, which the TUI had no way to do (akic404 on
 // Discord: a provider added here had 0 models and nothing to fetch them).
 func refetchCmd(id string) tea.Cmd {
 	return func() tea.Msg {
@@ -249,7 +285,7 @@ func refetchCmd(id string) tea.Cmd {
 			return flashMsg{text: err.Error()}
 		}
 		if p.IsPlugin() {
-			return flashMsg{text: p.Name + "'s models are what its plugin lists"}
+			return flashMsg{text: trf("%s's models are what its plugin lists", p.Name)}
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
@@ -259,7 +295,7 @@ func refetchCmd(id string) tea.Cmd {
 		}
 		text := p.Name + ": " + modelsNote(id, len(ms))
 		if len(dropped) > 0 {
-			text += " · gone from its list, so no longer picked: " + strings.Join(dropped, ", ")
+			text += " · " + trf("gone from its list, so no longer picked: %s", strings.Join(dropped, ", "))
 		}
 		return flashMsg{text: text, ok: len(ms) > 0}
 	}
@@ -268,9 +304,9 @@ func refetchCmd(id string) tea.Cmd {
 // modelsNote says how many models the vendor's list had and how many of
 // them agents are offered.
 func modelsNote(id string, fetched int) string {
-	text := fmt.Sprintf("%d models from its list", fetched)
+	text := trf("%d models from its list", fetched)
 	if p, err := provider.Find(id); err == nil {
-		text += fmt.Sprintf(" · %d for agents (↵ picks)", len(p.Exposed()))
+		text += " · " + trf("%d for agents (↵ picks)", len(p.Exposed()))
 	}
 	return text
 }
@@ -282,7 +318,7 @@ func fetchNote(err error) string {
 	if r := []rune(e); len(r) > 140 {
 		e = string(r[:140]) + "…"
 	}
-	return "no model list · " + strings.TrimPrefix(e, "no model list: ") + " · m asks again"
+	return trf("no model list · %s · m asks again", strings.TrimPrefix(e, "no model list: "))
 }
 
 func testCmd(p provider.Provider) tea.Cmd {
@@ -307,7 +343,7 @@ func testCmd(p provider.Provider) tea.Cmd {
 			parts = append(parts, fmt.Sprintf("%s ✗ %s", r.Protocol, e))
 		}
 		if len(parts) == 0 {
-			return flashMsg{text: p.Name + ": nothing to test"}
+			return flashMsg{text: p.Name + ": " + tr("nothing to test")}
 		}
 		return flashMsg{text: p.Name + ": " + strings.Join(parts, " · "), ok: ok}
 	}
@@ -331,9 +367,9 @@ func modelOptions(id string) []agent.Option {
 			return
 		}
 		seen[id] = true
-		note := "○ off"
+		note := "○ " + tr("off")
 		if on[id] {
-			note = "● on"
+			note = "● " + tr("on")
 		}
 		if n, ok := names[id]; ok {
 			name = n // the user's (magpie model name)
@@ -357,16 +393,20 @@ func modelOptions(id string) []agent.Option {
 func (m *model) openProviderModels(id string) {
 	p := m.provs[m.prow]
 	m.pk = picker{
-		crumbs: []string{"providers", p.Name, "models"},
-		input:  newInput("filter models"),
+		crumbs: []string{tr("providers"), p.Name, tr("models")},
+		input:  newInput(tr("filter models")),
 		items:  modelOptions(id),
-		empty:  "no models known yet · m on the providers list asks the vendor for them",
+		relist: func() []agent.Option { return modelOptions(id) },
+		empty:  tr("no models known yet · ctrl+r asks the vendor for them"),
+		// the list asked again from here, where its models are looked at
+		// (#2113), as m does on the providers list
+		refetch: func() tea.Cmd { return refetchCmd(id) },
 		toggle: func(model string) ([]agent.Option, string, bool) {
 			p, err := provider.Find(id)
 			if err != nil {
 				return nil, err.Error(), false
 			}
-			ids := p.Models
+			ids := p.Picks()
 			if len(ids) == 0 {
 				for _, x := range p.Exposed() {
 					ids = append(ids, x.ID)
@@ -375,7 +415,7 @@ func (m *model) openProviderModels(id string) {
 			verb := "on"
 			if i := slices.Index(ids, model); i >= 0 {
 				if len(ids) == 1 {
-					return nil, "one model has to stay on", false
+					return nil, tr("one model has to stay on"), false
 				}
 				ids = slices.Delete(slices.Clone(ids), i, i+1)
 				verb = "off"
@@ -390,38 +430,87 @@ func (m *model) openProviderModels(id string) {
 			if !slices.ContainsFunc(items, func(o agent.Option) bool { return o.Value == model }) {
 				// a vendor whose list wasn't fetched knows only those on:
 				// the one just turned off stays to be turned on again
-				items = append(items, agent.Option{Value: model, Note: "○ off"})
+				items = append(items, agent.Option{Value: model, Note: "○ " + tr("off")})
 			}
-			return items, model + " " + verb, true
+			return items, model + " " + tr(verb), true
 		},
 	}
 	m.pk.refilter()
 	m.mode = modePick
 }
 
-// openPresets picks a vendor magpie knows, then asks for its key.
+// kindNote is what a preset is, beside its name in the add list: another
+// computer's magpie is said to be one, not filed under the relays (Avalon
+// on Discord didn't find it there).
+func kindNote(k provider.Kind) string {
+	if k == provider.KindRemote {
+		return tr("another computer's magpie, shared on its network")
+	}
+	switch k {
+	case provider.KindVendor:
+		return tr("vendor")
+	case provider.KindRelay:
+		return tr("relay")
+	case provider.KindLocal:
+		return tr("local")
+	case provider.KindPartner:
+		return tr("partner")
+	}
+	return string(k)
+}
+
+// openPresets picks a vendor magpie knows, then asks for its key, or for
+// Google Vertex AI the project it takes in place of one.
 func (m *model) openPresets() {
 	var items []agent.Option
+	var shown []string
+	for _, d := range provider.Partners() {
+		items = append(items, agent.Option{Value: d.ID, Note: d.Name + " · " + tr("partner (sponsor)")})
+		shown = append(shown, d.ID)
+	}
+	go func() {
+		provider.CountPartner(provider.PartnerShown, shown...)
+		provider.NoticePartners(shown...)
+	}()
 	for _, d := range provider.Presets() {
-		items = append(items, agent.Option{Value: d.ID, Note: d.Name + " · " + string(d.Kind)})
+		items = append(items, agent.Option{Value: d.ID, Note: d.Name + " · " + kindNote(d.Kind)})
+	}
+	for _, c := range customAPIs {
+		items = append(items, agent.Option{Value: c.id, Note: trf("your own · %s API, at its address", tr(c.name))})
 	}
 	m.pk = picker{
-		crumbs: []string{"providers", "add"},
-		input:  newInput("a vendor magpie knows (magpie provider add <name> url=… for another)"),
+		crumbs: []string{tr("providers"), tr("add")},
+		input:  newInput(tr("a vendor magpie knows, or custom for your own API")),
 		items:  items,
 		onPick: func(id string) tea.Cmd {
+			if i := slices.IndexFunc(customAPIs, func(c customAPI) bool { return c.id == id }); i >= 0 {
+				return func() tea.Msg { return askMsg{customURLAsk(customAPIs[i])} }
+			}
 			return func() tea.Msg {
 				p, err := provider.FromPreset(id)
 				if err != nil {
 					return flashMsg{text: err.Error()}
 				}
+				if p.IsVertex() {
+					return askMsg{vertexProjectAsk(p)}
+				}
 				// a vendor reached at the user's own address (a remote
 				// magpie, Azure OpenAI) has none of the preset's: it is
 				// asked for first, as the app's editor asks it
 				if pr := provider.Preset(id); pr != nil && pr.Endpoint != "" {
-					return askMsg{endpointAsk(*pr, []string{"providers", "add", p.Name, "address"}, "", func(addr string) tea.Cmd {
+					return askMsg{endpointAsk(*pr, []string{tr("providers"), tr("add"), p.Name, tr("address")}, "", func(addr string) tea.Cmd {
 						return func() tea.Msg {
 							p.Chat, p.Responses = addr, addr
+							return askMsg{addKeyAsk(p)}
+						}
+					})}
+				}
+				// a local server can listen on another port, or be another
+				// computer's: asked first, Enter alone keeping the preset's
+				if pr := provider.Preset(id); pr != nil && pr.Kind == provider.KindLocal {
+					return askMsg{localAddressAsk(*pr, []string{tr("providers"), tr("add"), p.Name, tr("address")}, "", func(addr string) tea.Cmd {
+						return func() tea.Msg {
+							_ = p.AtAddress(addr)
 							return askMsg{addKeyAsk(p)}
 						}
 					})}
@@ -434,63 +523,198 @@ func (m *model) openPresets() {
 	m.mode = modePick
 }
 
-// addKeyAsk asks for the key of p, a preset's provider, and adds it.
-func addKeyAsk(p provider.Provider) ask {
-	in := newInput("the API key")
-	in.EchoMode = textinput.EchoPassword
-	in.EchoCharacter = '•'
-	hint := "the key is kept in magpie's providers file"
-	if p.KeysURL != "" {
-		hint = "keys: " + p.KeysURL
-	}
-	return ask{crumbs: []string{"providers", "add", p.Name}, input: in, hint: hint, empty: true,
-		onEnter: func(key string) tea.Cmd {
+// customAPI is an API a provider of the user's own is asked on, as the
+// app's custom provider editor names it, and magpie provider add's url=,
+// responses=, anthropic= and gemini= set it.
+type customAPI struct {
+	id, name, example string
+	set               func(p *provider.Provider, url string)
+}
+
+// customAPIs are what a custom provider is added as from the TUI, which
+// had vendors magpie knows alone (hezz1891 on Discord: a server's TUI had
+// no way to add one's own relay).
+var customAPIs = []customAPI{
+	{"custom-openai", "OpenAI compatible (Chat Completions)", "https://api.example.com/v1", func(p *provider.Provider, u string) { p.Chat = u }},
+	{"custom-responses", "OpenAI Responses", "https://api.example.com/v1", func(p *provider.Provider, u string) { p.Responses = u }},
+	{"custom-anthropic", "Anthropic compatible (Messages)", "https://api.example.com", func(p *provider.Provider, u string) { p.Anthropic = u }},
+	{"custom-gemini", "Gemini compatible", "https://api.example.com/v1beta", func(p *provider.Provider, u string) { p.Gemini = u }},
+}
+
+// customURLAsk asks for the base URL of a provider of the user's own on
+// api, then its name and its key, and adds it.
+func customURLAsk(api customAPI) ask {
+	return ask{crumbs: []string{tr("providers"), tr("add"), tr("custom"), tr("base URL")}, input: newInput(api.example),
+		hint: tr(api.name) + " · " + trf("the base URL, e.g. %s", api.example), empty: true,
+		onEnter: func(v string) tea.Cmd {
 			return func() tea.Msg {
-				p.Key = key
-				id, err := provider.Add(p)
-				if err != nil {
-					return flashMsg{text: err.Error()}
+				u, err := url.Parse(v)
+				if v == "" || err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+					return flashMsg{text: trf("the base URL is an http:// or https:// address, e.g. %s", api.example)}
 				}
-				ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-				defer cancel()
-				saved, err := provider.Find(id)
-				if err != nil {
-					return flashMsg{text: err.Error()}
-				}
-				// the vendor's list, and what came of asking it: a list
-				// that failed said so, not an "added" over 0 models
-				// (akic404 on Discord)
-				text := "added " + saved.Name
-				ms, err := saved.Fetch(ctx)
-				if err != nil && saved.Decides() {
-					// a System One API: its list isn't what it is for
-					return flashMsg{text: text, ok: true}
-				}
-				if err != nil {
-					return flashMsg{text: text + " · " + fetchNote(err)}
-				}
-				return flashMsg{text: text + " · " + modelsNote(id, len(ms)), ok: len(ms) > 0}
+				in := newInput(u.Hostname())
+				return askMsg{ask{crumbs: []string{tr("providers"), tr("add"), tr("custom"), tr("name")}, input: in,
+					hint: trf("its name in magpie · enter for %s", u.Hostname()), empty: true,
+					onEnter: func(name string) tea.Cmd {
+						return func() tea.Msg {
+							if name == "" {
+								name = u.Hostname()
+							}
+							p := provider.Provider{Name: name}
+							api.set(&p, strings.TrimRight(v, "/"))
+							return askMsg{addKeyAsk(p)}
+						}
+					}}}
 			}
 		}}
 }
 
+// customURLs are the APIs a provider of the user's own has a base URL
+// for, in customAPIs' order.
+func customURLs(p provider.Provider) []customAPI {
+	var out []customAPI
+	for _, c := range customAPIs {
+		if customURLOf(p, c) != "" {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// customURLOf is p's base URL on api.
+func customURLOf(p provider.Provider, api customAPI) string {
+	switch api.id {
+	case "custom-openai":
+		return p.Chat
+	case "custom-responses":
+		return p.Responses
+	case "custom-anthropic":
+		return p.Anthropic
+	}
+	return p.Gemini
+}
+
+// customURLsAsk asks for each of p's base URLs in turn, the one it has
+// now typed in, and saves those changed once all are answered: enter
+// alone keeps one, as typed or emptied.
+func customURLsAsk(p provider.Provider, apis []customAPI, typed []string) ask {
+	api := apis[len(typed)]
+	in := newInput(api.example)
+	in.SetValue(customURLOf(p, api))
+	return ask{crumbs: []string{tr("providers"), p.Name, tr("base URL")}, input: in, empty: true,
+		hint: tr(api.name) + " · " + tr("enter keeps it"),
+		onEnter: func(v string) tea.Cmd {
+			return func() tea.Msg {
+				if v != "" {
+					u, err := url.Parse(v)
+					if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+						return flashMsg{text: trf("the base URL is an http:// or https:// address, e.g. %s", api.example)}
+					}
+				}
+				typed := append(slices.Clone(typed), strings.TrimRight(v, "/"))
+				if len(typed) < len(apis) {
+					return askMsg{customURLsAsk(p, apis, typed)}
+				}
+				var set []int
+				var said []string
+				for i, c := range apis {
+					if typed[i] != "" && typed[i] != customURLOf(p, c) {
+						set = append(set, i)
+						said = append(said, typed[i])
+					}
+				}
+				if len(set) == 0 {
+					return flashMsg{text: trf("%s base URL unchanged", p.Name), ok: true}
+				}
+				return saveProvider(p.ID, func(q *provider.Provider) {
+					for _, i := range set {
+						apis[i].set(q, typed[i])
+					}
+					provider.ForgetBalances()
+				}, trf("%s base URL %s", p.Name, strings.Join(said, " · ")))()
+			}
+		}}
+}
+
+// addKeyAsk asks for the key of p, a preset's provider, and adds it.
+func addKeyAsk(p provider.Provider) ask {
+	in := newInput(tr("the API key"))
+	in.EchoMode = textinput.EchoPassword
+	in.EchoCharacter = '•'
+	hint := tr("the key is kept in magpie's providers file")
+	if p.KeysURL != "" {
+		hint = trf("keys: %s", p.KeysURL)
+	}
+	return ask{crumbs: []string{tr("providers"), tr("add"), p.Name}, input: in, hint: hint, empty: true,
+		onEnter: func(key string) tea.Cmd {
+			p.Key = key
+			return addCmd(p)
+		}}
+}
+
+// vertexProjectAsk asks for the Google Cloud project of p, a Google Vertex
+// AI provider, and adds it there. It takes no key: its requests are signed
+// with the user's Google credentials, whose file and service account are
+// set from the CLI, as its location is. Nothing typed is said to be needed,
+// as Save says it.
+func vertexProjectAsk(p provider.Provider) ask {
+	return ask{crumbs: []string{tr("providers"), tr("add"), p.Name, tr("project")}, input: newInput(tr("your Google Cloud project's id")), empty: true,
+		hint: tr("no key: signed with gcloud's Application Default Credentials (gcloud auth application-default login)") + "\n" +
+			trf("magpie provider set %s location=… credentials=… impersonate=… changes the rest", provider.FreeID(p.ID)),
+		onEnter: func(project string) tea.Cmd {
+			p.Vertex = &provider.Vertex{Project: project}
+			return addCmd(p)
+		}}
+}
+
+// addCmd adds p, a preset's provider, and says what came of asking its
+// vendor for its models.
+func addCmd(p provider.Provider) tea.Cmd {
+	return func() tea.Msg {
+		id, err := provider.Add(p)
+		if err != nil {
+			return flashMsg{text: err.Error()}
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		saved, err := provider.Find(id)
+		if err != nil {
+			return flashMsg{text: err.Error()}
+		}
+		// the vendor's list, and what came of asking it: a list that
+		// failed said so, not an "added" over 0 models (akic404 on
+		// Discord)
+		text := trf("added %s", saved.Name)
+		ms, err := saved.Fetch(ctx)
+		if err != nil && saved.DecideOnly() {
+			// a System One API: its list isn't what it is for
+			return flashMsg{text: text, ok: true}
+		}
+		if err != nil {
+			return flashMsg{text: text + " · " + fetchNote(err)}
+		}
+		return flashMsg{text: text + " · " + modelsNote(id, len(ms)), ok: len(ms) > 0}
+	}
+}
+
 // endpointAsk asks for the address of a vendor reached at the user's own
 // (pr.Endpoint is its example): a remote magpie's, as the other
-// computer's magpie shows it in Settings, under Share on local network.
+// computer's magpie shows it in Settings → Network and sharing, under
+// Share on local network.
 // Nothing typed is said to be needed, as the app's editor says it.
 func endpointAsk(pr provider.PresetDef, crumbs []string, now string, then func(string) tea.Cmd) ask {
 	in := newInput(pr.Endpoint)
 	in.SetValue(now)
 	hint := pr.EndpointHint
 	if hint == "" {
-		hint = "the address it is reached at, e.g. " + pr.Endpoint
+		hint = trf("the address it is reached at, e.g. %s", pr.Endpoint)
 	}
 	return ask{crumbs: crumbs, input: in, hint: hint, empty: true,
 		onEnter: func(v string) tea.Cmd {
 			if v == "" {
 				need := pr.EndpointNeeded
 				if need == "" {
-					need = "Your resource's endpoint is needed"
+					need = tr("Your resource's endpoint is needed")
 				}
 				return func() tea.Msg { return flashMsg{text: need} }
 			}
@@ -498,8 +722,27 @@ func endpointAsk(pr provider.PresetDef, crumbs []string, now string, then func(s
 		}}
 }
 
+// localAddressAsk asks where a local server's preset (KindLocal) is
+// reached, now being what it has; the preset's own address is the
+// placeholder. Enter alone keeps it, and a refused address is said.
+func localAddressAsk(pr provider.PresetDef, crumbs []string, now string, then func(string) tea.Cmd) ask {
+	in := newInput(provider.AddressOf(pr.Chat, pr.Responses, pr.Anthropic))
+	in.SetValue(now)
+	return ask{crumbs: crumbs, input: in, empty: true,
+		hint: tr("where the server listens: another port, or another computer's address"),
+		onEnter: func(v string) tea.Cmd {
+			if _, err := provider.AtAddress(pr, v); err != nil {
+				return func() tea.Msg { return flashMsg{text: err.Error()} }
+			}
+			return then(v)
+		}}
+}
+
 // listError is provider.Provider.ListError; tests stand in for it.
 var listError = provider.Provider.ListError
+
+// signedOut is Provider.SignedOut, for a test to stand in for.
+var signedOut = provider.Provider.SignedOut
 
 func (m model) viewProviders() string {
 	var b strings.Builder
@@ -510,7 +753,7 @@ func (m model) viewProviders() string {
 	}
 	if len(m.provs) == 0 {
 		if m.provsErr == nil {
-			b.WriteString(pad + "  " + sMuted.Render("no providers yet · a adds one"))
+			b.WriteString(pad + "  " + sMuted.Render(tr("no providers yet · a adds one")))
 		}
 		return b.String()
 	}
@@ -521,33 +764,49 @@ func (m model) viewProviders() string {
 		r := row{name: p.Name, id: p.ID}
 		switch {
 		case p.Off:
-			r.key = "○ switched off"
+			r.key = "○ " + tr("switched off")
+		case p.Account != nil && signedOut(p):
+			// every account in use refused, as magpie providers says it
+			r.key = "○ " + trf("%s is signed out", p.AccountShown(p.Account.User))
 		case p.Account != nil:
-			r.key = "● " + p.Account.User
+			r.key = "● " + p.AccountShown(p.Account.User)
+		case p.IsVertex() && !p.Ready():
+			r.key = "○ " + tr("needs a project")
+		case p.IsVertex():
+			// no key: a token minted from the user's Google credentials,
+			// as magpie providers says it
+			r.key = "● " + tr("Google credentials")
+			if p.Vertex != nil && p.Vertex.Impersonate != "" {
+				r.key += " " + trf("as %s", p.Vertex.Impersonate)
+			}
 		case p.Key != "":
 			r.key = "● " + provider.Mask(p.Key)
 		case p.Ready():
-			r.key = "● no key needed"
+			r.key = "● " + tr("no key needed")
 		default:
-			r.key = "○ no key"
+			r.key = "○ " + tr("no key")
 		}
-		r.models = fmt.Sprintf("%d models", len(p.Exposed()))
+		r.models = trf("%d models", len(p.Exposed()))
 		var notes []string
+		if p.Off {
+			// how to switch it on again, as magpie providers says it
+			notes = append(notes, tr("o switches it on"))
+		}
 		if v, ok := m.bal[p.ID]; ok {
 			notes = append(notes, v)
 		}
 		if p.Family != "" {
-			notes = append(notes, "family "+p.Family)
+			notes = append(notes, trf("family %s", p.Family))
 		}
 		if p.Unlisted {
-			notes = append(notes, "groups only")
+			notes = append(notes, tr("groups only"))
 		}
 		r.note = strings.Join(notes, " · ")
 		// a plugin's account showing its defaults alone says why, as the
 		// app's editor does (gnayiab on X: Cursor in WSL's TUI had Auto
 		// alone and nothing said)
 		if e := listError(p); e != "" {
-			r.warn = "couldn't list its models: " + e
+			r.warn = trf("couldn't list its models: %s", e)
 		}
 		for i, s := range []string{r.name, r.id, r.key, r.models} {
 			w[i] = max(w[i], lipgloss.Width(s))
@@ -588,16 +847,77 @@ var periods = []usage.Period{usage.Today, usage.Week, usage.Month, usage.All}
 var periodNames = map[usage.Period]string{usage.Today: "today", usage.Week: "7 days", usage.Month: "30 days", usage.All: "all time"}
 
 // quotaMsg is what is left of every subscription, plan bought with a key
-// and key balance, as the app's Usage page shows them.
-type quotaMsg []provider.SubscriptionQuota
+// and key balance, as the app's Usage page shows them. reading is that a
+// read of the accounts' usage was still under way, so qs may be the stale
+// copy it replaces; gen is the load it answers (model.qgen).
+type quotaMsg struct {
+	qs      []provider.SubscriptionQuota
+	reading bool
+	gen     int
+}
 
-func quotasCmd() tea.Msg {
-	provider.AskClaudeUsage() // the page opened, or r pressed
-	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+// The Usage page reads as the app's does (loadQuotas in app.js): opening
+// it is asking (an asked read, Claude Code's /usage run) unless the last
+// ask was within quotasOpenGap, and an answer given while a read is under
+// way is asked for again every quotasAgain, quotasTries times at most,
+// until the new one has landed (#959). The terminal asked only once a
+// session, so the page kept what it first read till r was pressed
+// (sean_80289 on Discord).
+var (
+	quotasOpenGap = 30 * time.Second
+	quotasAgain   = 1500 * time.Millisecond
+)
+
+const quotasTries = 20
+
+// readQuotas is every card, and whether a read is still under way; a var
+// so tests can stand in for the vendors.
+var readQuotas = func(asked bool) ([]provider.SubscriptionQuota, bool) {
+	ctx := context.Background()
+	if asked {
+		provider.AskClaudeUsage() // the page opened, or r pressed
+		ctx = provider.Asked(ctx)
+	}
+	ctx, cancel := context.WithTimeout(ctx, 12*time.Second)
 	defer cancel()
 	// a WorkBuddy (China) account's line says how its daily check-in went,
 	// as its card in the app does
-	return quotaMsg(provider.WithCheckins(provider.Quotas(ctx)))
+	qs := provider.InProviderOrder(provider.WithCheckins(provider.Quotas(ctx)))
+	return qs, provider.SubscriptionUsageReading()
+}
+
+func quotasCmd(asked bool, gen int) tea.Cmd {
+	return func() tea.Msg {
+		qs, reading := readQuotas(asked)
+		return quotaMsg{qs: usageShown(qs, settings.Load()), reading: reading, gen: gen}
+	}
+}
+
+// loadQuotas starts a read of the cards, asked or not, which stands in
+// for any read before it still on its way.
+func (m *model) loadQuotas(asked bool) tea.Cmd {
+	if asked {
+		m.qaskedAt = time.Now()
+	}
+	m.qasked = true
+	m.qgen++
+	m.qtries = 0
+	return quotasCmd(asked, m.qgen)
+}
+
+// gotQuotas takes a read's answer, and asks again while the read it was
+// given under is still on its way and the page is up.
+func (m *model) gotQuotas(msg quotaMsg) tea.Cmd {
+	if msg.gen != m.qgen {
+		return nil // a load since stands in for it
+	}
+	m.quotas = msg.qs
+	if !msg.reading || m.page != pageUsage || m.qtries >= quotasTries {
+		return nil
+	}
+	m.qtries++
+	gen := m.qgen
+	return tea.Tick(quotasAgain, func(time.Time) tea.Msg { return quotasCmd(false, gen)() })
 }
 
 // checkinMsg is what came of c, WorkBuddy's daily check-in pressed now.
@@ -677,7 +997,7 @@ func checkinCmd() tea.Msg {
 		}
 	}
 	if len(parts) == 0 {
-		return checkinMsg{text: "no WorkBuddy (China), Trae CN, MiniMax Code, Qoder or check-in plugin account is signed in · only they have the daily check-in"}
+		return checkinMsg{text: tr("no WorkBuddy (China), Trae CN, MiniMax Code, Qoder or check-in plugin account is signed in · only they have the daily check-in")}
 	}
 	return checkinMsg{text: strings.Join(parts, "; "), ok: failed == 0}
 }
@@ -704,30 +1024,97 @@ func checkinWords(r provider.WorkBuddyCheckin) string {
 		who = "WorkBuddy"
 	}
 	switch r.Outcome {
+	case provider.CheckinDone, provider.CheckinInactive, provider.CheckinIneligible:
+		if r.Again {
+			// maybe the vendor's day before (#3326)
+			return who + ": " + againWords(r) + checkinWhy(r)
+		}
+	}
+	switch r.Outcome {
 	case provider.CheckinClaimed, provider.CheckinDone:
-		s := who + " checked in today"
+		s := trf("%s checked in today", who)
 		if r.Credit > 0 {
 			s += fmt.Sprintf(" +%g", r.Credit)
 		}
 		if r.Streak > 0 {
-			s += fmt.Sprintf(" · a %d-day streak", r.Streak)
+			s += " · " + trf("a %d-day streak", r.Streak)
 		}
 		if r.Outcome == provider.CheckinDone || !r.Asked {
-			s += " · already"
+			s += " · " + tr("already")
 		}
 		return s
 	case provider.CheckinIneligible:
-		return who + " isn't eligible for the check-in"
+		return trf("%s isn't eligible for the check-in", who) + checkinWhy(r)
 	case provider.CheckinInactive:
-		return who + ": no check-in event now"
+		return who + ": " + tr("no check-in event now") + checkinWhy(r)
 	case provider.CheckinCaptcha:
-		return who + " asks for a captcha: check in in its own app"
+		return trf("%s asks for a captcha: check in in its own app", who)
+	case provider.CheckinOwnApp:
+		return who + ": " + ownAppWords(r)
 	}
 	msg := r.Msg
 	if msg == "" {
-		msg = "no answer"
+		msg = tr("no answer")
 	}
-	return who + " couldn't check in: " + msg
+	return trf("%s couldn't check in: %s", who, msg)
+}
+
+// checkinWhy is why an inactive or ineligible check-in had nothing to
+// claim, in the vendor's or plugin's own words, set after its label: a
+// bare "no check-in event now" left the user guessing (plugins#304).
+func checkinWhy(r provider.WorkBuddyCheckin) string {
+	switch r.Outcome {
+	case provider.CheckinInactive, provider.CheckinIneligible:
+		if m := strings.TrimSpace(r.Msg); m != "" {
+			return " · " + m
+		}
+	}
+	return ""
+}
+
+// againWords is a provisional answer (WorkBuddyCheckin.Again) in words:
+// it may be the vendor's day before, so magpie asks again later (#3326).
+func againWords(r provider.WorkBuddyCheckin) string {
+	switch r.Outcome {
+	case provider.CheckinDone:
+		return tr("says already checked in · its day may not have turned, magpie asks again later")
+	case provider.CheckinIneligible:
+		return tr("not eligible now · magpie asks again later")
+	}
+	return tr("no check-in event now · magpie asks again later")
+}
+
+// ownAppName is the vendor whose own app alone gets r's check-in credits.
+func ownAppName(r provider.WorkBuddyCheckin) string {
+	switch {
+	case r.By == "trae":
+		return "Trae CN"
+	case r.Vendor != "":
+		return r.Vendor
+	case r.By == "":
+		return "WorkBuddy"
+	}
+	return tr("the vendor")
+}
+
+// ownAppWords says a check-in the vendor pays only to its own app is to
+// be done in that app. Trae CN's (9074, #808) says what is known: Trae CN
+// refused it; that only its app is paid isn't so (#1920).
+func ownAppWords(r provider.WorkBuddyCheckin) string {
+	if r.By == "trae" {
+		return tr(provider.TraeRefusedWords)
+	}
+	name := ownAppName(r)
+	return trf("%[1]s only gives check-in credits to its own app; check in in the %[1]s app", name)
+}
+
+// whyHint points an inactive or ineligible check-in's line to c when its
+// answer says why: c asks again and says the reason.
+func whyHint(r provider.WorkBuddyCheckin) string {
+	if checkinWhy(r) == "" {
+		return ""
+	}
+	return " · " + tr("c says why")
 }
 
 // checkinCell is a WorkBuddy (China) or Trae CN account's check-in on its
@@ -739,7 +1126,11 @@ func checkinCell(q provider.SubscriptionQuota, now time.Time) string {
 	}
 	r := q.Checkin
 	if r == nil || r.Day != provider.CheckinDay(now) {
-		return sMuted.Render("签到 not yet today · c")
+		return sMuted.Render(tr("签到 not yet today · c"))
+	}
+	if r.Again && r.Outcome == provider.CheckinDone {
+		// "already in" that may be the vendor's day before (#3326)
+		return sMuted.Render(tr("签到 said already · asked again later · c"))
 	}
 	switch r.Outcome {
 	case provider.CheckinClaimed, provider.CheckinDone:
@@ -748,28 +1139,42 @@ func checkinCell(q provider.SubscriptionQuota, now time.Time) string {
 			s += sText.Render(fmt.Sprintf(" +%g", r.Credit))
 		}
 		if r.Streak > 0 {
-			s += sFaint.Render(fmt.Sprintf(" · %d-day streak", r.Streak))
+			s += sFaint.Render(" · " + trf("%d-day streak", r.Streak))
 		}
 		return s
+	// the reason is long (plugins#304): the line points to c, whose
+	// answer says it (checkinWords)
 	case provider.CheckinIneligible:
-		return sMuted.Render("签到 not eligible")
+		return sMuted.Render(tr("签到 not eligible") + whyHint(*r))
 	case provider.CheckinInactive:
-		return sMuted.Render("签到 no event now")
+		return sMuted.Render(tr("签到 no event now") + whyHint(*r))
 	case provider.CheckinCaptcha:
-		return sMuted.Render("签到 needs a captcha · check in in its app")
+		return sMuted.Render(tr("签到 needs a captcha · check in in its app"))
+	case provider.CheckinOwnApp:
+		if r.By == "trae" {
+			return sMuted.Render(tr("签到 refused by Trae CN (9074) · check in in its app"))
+		}
+		return sMuted.Render(trf("签到 only in %s's own app · check in there", ownAppName(*r)))
 	}
-	return sBad.Render("签到 failed") + sMuted.Render(" · c tries again")
+	return sBad.Render(tr("签到 failed")) + sMuted.Render(" · "+tr("c tries again"))
 }
 
 func (m model) updateUsage(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	i := slices.Index(periods, m.period)
 	switch msg.String() {
 	case "u":
+		// the choice is Settings' QuotaLeft, which the app and the menu bar
+		// read too: u turns it for them as well (#122)
 		m.qleft = !m.qleft
+		s := settings.Load()
+		s.QuotaLeft = m.qleft
+		if err := settings.Save(s); err != nil {
+			m.flash, m.flashOK = err.Error(), false
+		}
 		return m, nil
 	case "c":
 		// WorkBuddy's daily check-in, as the app's "Check in now"
-		m.flash, m.flashOK = "checking in…", true
+		m.flash, m.flashOK = tr("checking in…"), true
 		return m, checkinCmd
 	case "l", "right":
 		m.period = periods[(i+1)%len(periods)]
@@ -806,44 +1211,68 @@ func fmtTokens(n int) string {
 	return fmt.Sprint(n)
 }
 
-// costCurrency is Settings' currency choice and, for cny, the CNY-per-USD
-// rate to show costs at (internal/fx), refreshed at most once a second so
-// a page redrawn on every keypress doesn't reread the settings file or
-// touch the rate's own cache for each row fmtCost renders.
+// costCurrency is Settings' currency choice and the CNY-per-USD rate to
+// show costs at when one is in yuan (internal/fx), with, for the choice
+// "provider", the providers that sell in yuan, refreshed at most once a
+// second so a page redrawn on every keypress doesn't reread the settings
+// file or touch the rate's own cache for each row fmtCost renders.
 var (
 	costMu      sync.Mutex
 	costAt      time.Time
-	costCncy    string
+	costSet     settings.Settings
 	costRateVal float64
+	costYuan    map[string]bool
 )
 
-func costCurrency() (string, float64) {
+func costCurrency() (settings.Settings, float64, map[string]bool) {
 	costMu.Lock()
 	defer costMu.Unlock()
 	if time.Since(costAt) < time.Second {
-		return costCncy, costRateVal
+		return costSet, costRateVal, costYuan
 	}
-	costCncy = settings.Load().Currency
-	costRateVal = 0
-	if costCncy == "cny" {
+	costSet = settings.Load()
+	costRateVal, costYuan = 0, nil
+	if costSet.Currency == settings.CurrencyByProvider {
+		costYuan = provider.YuanPricedSet()
+	}
+	if costSet.Currency != "usd" && costSet.Currency != "" {
 		ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
 		costRateVal = fx.Get(ctx).CNYPerUSD
 		cancel()
 	}
 	costAt = time.Now()
-	return costCncy, costRateVal
+	return costSet, costRateVal, costYuan
 }
 
-func fmtCost(t usage.Totals) string {
+// fmtCost is a sum of several providers' costs, in the currency Settings
+// shows a total in.
+func fmtCost(t usage.Totals) string { return fmtCostOf(t, "") }
+
+// fmtCostOf is one provider's cost, in the currency Settings shows it in
+// (its own, with the choice "provider"); "" is a sum of several.
+func fmtCostOf(t usage.Totals, providerID string) string {
 	if t.Cost == 0 && t.Unpriced > 0 {
-		return "no price"
+		return tr("no price")
 	}
-	cncy, rate := costCurrency()
+	st, rate, yuan := costCurrency()
+	cncy := st.TotalCostIn()
+	if providerID != "" && providerID != usage.UnknownProvider {
+		cncy = st.CostIn(yuan[providerID])
+	}
 	s := usage.FormatCost(t.Cost, cncy, rate)
 	if t.Unpriced > 0 {
 		s += "+"
 	}
 	return "≈" + s
+}
+
+// credits is " · " and what the credited calls cost in their plans'
+// credits, as the replies said (#2512); "" when none said.
+func credits(t usage.Totals) string {
+	if c := usage.FormatCredits(t); c != "" {
+		return " · " + c
+	}
+	return ""
 }
 
 var bars = []rune(" ▁▂▃▄▅▆▇█")
@@ -856,9 +1285,9 @@ func (m model) viewUsage() string {
 	var tabs []string
 	for _, p := range periods {
 		if p == s.Period {
-			tabs = append(tabs, sPill.Render(periodNames[p]))
+			tabs = append(tabs, sPill.Render(tr(periodNames[p])))
 		} else {
-			tabs = append(tabs, sMuted.Render(" "+periodNames[p]+" "))
+			tabs = append(tabs, sMuted.Render(" "+tr(periodNames[p])+" "))
 		}
 	}
 	b.WriteString(pad + "  " + strings.Join(tabs, " ") + "\n\n")
@@ -871,7 +1300,7 @@ func (m model) viewUsage() string {
 	}
 	d := m.direct
 	if s.Calls == 0 && d.Calls == 0 {
-		b.WriteString(pad + "  " + sMuted.Render("no calls in this time · route an agent through magpie and its usage shows up here"))
+		b.WriteString(pad + "  " + sMuted.Render(tr("no calls in this time · route an agent through magpie and its usage shows up here")))
 		return b.String()
 	}
 	names := map[string]string{}
@@ -883,14 +1312,14 @@ func (m model) viewUsage() string {
 		room = max(2, room/2)
 	}
 	if s.Calls == 0 {
-		b.WriteString(pad + "  " + sMuted.Render("no calls through magpie in this time") + "\n\n")
+		b.WriteString(pad + "  " + sMuted.Render(tr("no calls through magpie in this time")) + "\n\n")
 	} else {
 		m.usageBlock(&b, s, room, names)
 	}
 	// the calls the agents made on their own, as the app's Requests tab
 	// counts them beside the gateway's (Kumo31 on Discord)
 	if d.Calls > 0 {
-		b.WriteString(pad + "  " + sFaint.Render("not through magpie · the agents' own requests, read from their session files") + "\n")
+		b.WriteString(pad + "  " + sFaint.Render(tr("not through magpie · the agents' own requests, read from their session files")) + "\n")
 		m.usageBlock(&b, d, room, names)
 	}
 	return strings.TrimRight(b.String(), "\n")
@@ -899,12 +1328,19 @@ func (m model) viewUsage() string {
 // usageBlock is one summary's totals, timeline and agents' and models'
 // tables, the gateway's or the agents' own calls.
 func (m model) usageBlock(b *strings.Builder, s usage.Summary, room int, names map[string]string) {
-	line := sName.Render(fmtTokens(s.Tokens())+" tokens") + sMuted.Render(fmt.Sprintf(" · %d call%s · ", s.Calls, plural(s.Calls))) + sOK.Render(fmtCost(s.Totals))
+	line := sName.Render(trf("%s tokens", fmtTokens(s.Tokens()))) + sMuted.Render(" · "+trf("%d call%s", s.Calls, plural(s.Calls))+" · ") + sOK.Render(fmtCost(s.Totals))
+	if s.Unpriced > 0 { // calls with no known price, not in the cost (#1856)
+		line += sMuted.Render(" " + trf("(%d call%s unpriced)", s.Unpriced, plural(s.Unpriced)))
+	}
+	line += sMuted.Render(credits(s.Totals))
 	if s.Errors > 0 {
-		line += sMuted.Render(" · ") + sBad.Render(fmt.Sprintf("%d error%s", s.Errors, plural(s.Errors)))
+		line += sMuted.Render(" · ") + sBad.Render(trf("%d error%s", s.Errors, plural(s.Errors)))
+	}
+	if s.Retried > 0 { // answered after a try that failed first, not an error
+		line += sMuted.Render(" · " + trf("%d answered on a retry", s.Retried))
 	}
 	b.WriteString(pad + "  " + line + "\n")
-	b.WriteString(pad + "  " + sMuted.Render("in "+fmtTokens(s.Input)+"  out "+fmtTokens(s.Output)+"  cache read "+fmtTokens(s.CacheRead)+"  cache write "+fmtTokens(s.CacheWrite)+"  reasoning "+fmtTokens(s.Reasoning)) + "\n\n")
+	b.WriteString(pad + "  " + sMuted.Render(trf("in %s  out %s  cache read %s  cache write %s  reasoning %s", fmtTokens(s.Input), fmtTokens(s.Output), fmtTokens(s.CacheRead), fmtTokens(s.CacheWrite), fmtTokens(s.Reasoning))) + "\n\n")
 
 	// the timeline, one bar a bucket
 	top := 0
@@ -932,21 +1368,21 @@ func (m model) usageBlock(b *strings.Builder, s usage.Summary, room int, names m
 		}
 		for i, g := range gs {
 			if i == room {
-				b.WriteString(pad + "  " + sFaint.Render(fmt.Sprintf("and %d more · magpie usage", len(gs)-room)) + "\n")
+				b.WriteString(pad + "  " + sFaint.Render(trf("and %d more · magpie usage", len(gs)-room)) + "\n")
 				break
 			}
 			share := fmt.Sprintf("%3.0f%%", 100*float64(g.Tokens())/float64(max(1, s.Tokens())))
-			b.WriteString(pad + "  " + sText.Render(padRight(name(g), w)) + "  " + sMuted.Render(share) + "  " + sText.Render(padRight(fmtTokens(g.Tokens()), 7)) + "  " + sFaint.Render(padRight(fmt.Sprintf("%d call%s", g.Calls, plural(g.Calls)), 10)) + "  " + sOK.Render(fmtCost(g.Totals)) + "\n")
+			b.WriteString(pad + "  " + sText.Render(padRight(name(g), w)) + "  " + sMuted.Render(share) + "  " + sText.Render(padRight(fmtTokens(g.Tokens()), 7)) + "  " + sFaint.Render(padRight(trf("%d call%s", g.Calls, plural(g.Calls)), 10)) + "  " + sOK.Render(fmtCostOf(g.Totals, g.Provider)) + sMuted.Render(credits(g.Totals)) + "\n")
 		}
 		b.WriteString("\n")
 	}
-	table("agents", s.Agents, func(g usage.Group) string {
+	table(tr("agents"), s.Agents, func(g usage.Group) string {
 		if n := names[g.ID]; n != "" {
 			return n
 		}
 		return g.ID
 	})
-	table("models", s.Models, func(g usage.Group) string {
+	table(tr("models"), s.Models, func(g usage.Group) string {
 		if g.Provider == usage.UnknownProvider {
 			return g.Model // a session file's call whose provider isn't known
 		}
@@ -963,7 +1399,7 @@ func quotaLines(qs []provider.SubscriptionQuota, asked, left bool, width int, no
 		if !asked {
 			return nil
 		}
-		return []string{sFaint.Render("accounts"), sMuted.Render("asking the vendors what is left…")}
+		return []string{sFaint.Render(tr("accounts")), sMuted.Render(tr("asking the vendors what is left…"))}
 	}
 	if len(qs) == 0 {
 		return nil
@@ -978,9 +1414,10 @@ func quotaLines(qs []provider.SubscriptionQuota, asked, left bool, width int, no
 			plain += " · " + t
 			styled += sFaint.Render(" · " + t)
 		}
-		if q.User != "" {
-			plain += " · " + q.User
-			styled += sFaint.Render(" · " + q.User)
+		// as the app's card names it: the user's own name, the plugin's, else the account (#4416)
+		if who := cmp.Or(q.Alias, q.User); who != "" {
+			plain += " · " + who
+			styled += sFaint.Render(" · " + who)
 		}
 		return
 	}
@@ -990,9 +1427,9 @@ func quotaLines(qs []provider.SubscriptionQuota, asked, left bool, width int, no
 		tw = max(tw, lipgloss.Width(p))
 	}
 	tw = min(tw, 44)
-	head := "accounts · % is how much is used"
+	head := tr("accounts · % is how much is used")
 	if left {
-		head = "accounts · % is how much is left"
+		head = tr("accounts · % is how much is left")
 	}
 	out := []string{sFaint.Render(head)}
 	for _, q := range qs {
@@ -1008,13 +1445,18 @@ func quotaLines(qs []provider.SubscriptionQuota, asked, left bool, width int, no
 		}
 		switch {
 		case q.Balance != "" && len(q.Windows) == 0:
-			out = append(out, line+"  "+sText.Render(q.Balance)+sMuted.Render(" left")+ci)
+			c := sText.Render(q.Balance) + sMuted.Render(" "+tr("left"))
+			if len(q.BalanceSplit) > 0 {
+				// what it is made of: DeepSeek's granted credit apart
+				c += sFaint.Render(" (" + provider.SplitWords(q.BalanceSplit) + ")")
+			}
+			out = append(out, line+"  "+c+ci)
 			continue
 		case q.Error != "":
 			out = append(out, line+"  "+sMuted.Render(trunc(q.Error, max(20, width-tw-2-lipgloss.Width(ci))))+ci)
 			continue
 		case len(q.Windows) == 0:
-			out = append(out, line+"  "+sMuted.Render("no usage reported")+ci)
+			out = append(out, line+"  "+sMuted.Render(tr("no usage reported"))+ci)
 			continue
 		}
 		// the windows follow the name, those that don't fit on lines below
@@ -1025,9 +1467,9 @@ func quotaLines(qs []provider.SubscriptionQuota, asked, left bool, width int, no
 			cells = append(cells, quotaCell(w, left, now))
 		}
 		if q.Balance != "" {
-			c := sText.Render(q.Balance) + sMuted.Render(" left")
+			c := sText.Render(q.Balance) + sMuted.Render(" "+tr("left"))
 			if q.Provider == "codex" && q.User != "" && !provider.CodexCredits(q.User) {
-				c += sFaint.Render(" · not spent") // held once a window is used up
+				c += sFaint.Render(" · " + tr("not spent")) // held once a window is used up
 			}
 			cells = append(cells, c)
 		}
@@ -1037,10 +1479,12 @@ func quotaLines(qs []provider.SubscriptionQuota, asked, left bool, width int, no
 		if r := q.Resets; r != nil {
 			c := sText.Render("↺ " + r.Words())
 			if r.Until != nil {
-				c += sFaint.Render(" until " + provider.ResetClock(*r.Until, now))
+				c += sFaint.Render(" " + trf("until %s", provider.ResetClock(*r.Until, now)))
 			}
-			if provider.AutoResets(q.Provider, q.User) {
-				c += sFaint.Render(" · auto") // spent by itself once the week is used up
+			if q.Provider == "codex" {
+				if auto := provider.AutoResetWords(q.User); auto != "" {
+					c += sFaint.Render(" · " + auto) // spent by itself: its week used up, before one expires, or both
+				}
 			}
 			cells = append(cells, c)
 		}
@@ -1063,12 +1507,12 @@ func quotaLines(qs []provider.SubscriptionQuota, asked, left bool, width int, no
 // and when it starts again: on the clock, and how long until then.
 func quotaCell(w provider.QuotaWindow, left bool, now time.Time) string {
 	if w.Unlimited {
-		return sMuted.Render(w.Name) + " " + sText.Render("Unlimited")
+		return sMuted.Render(w.Name) + " " + sText.Render(tr("Unlimited"))
 	}
 	used := int(math.Round(math.Max(0, math.Min(100, w.Used))))
-	n, word := used, "used"
+	n, word := used, tr("used")
 	if left {
-		n, word = 100-used, "left"
+		n, word = 100-used, tr("left")
 	}
 	const cells = 8
 	on := (n*cells + 50) / 100
@@ -1084,6 +1528,10 @@ func quotaCell(w provider.QuotaWindow, left bool, now time.Time) string {
 		pct = c + " · " + pct
 	}
 	c := sMuted.Render(w.Name) + " " + fill.Render(strings.Repeat("█", on)) + sFaint.Render(strings.Repeat("░", cells-on)) + " " + sText.Render(pct)
+	if w.Text {
+		// a row of text alone: no meter, no share to tell
+		c = sMuted.Render(w.Name) + " " + sText.Render(w.Display)
+	}
 	var at time.Time
 	if w.ResetsAt != nil {
 		at = *w.ResetsAt
@@ -1102,11 +1550,11 @@ func until(d time.Duration) string {
 	h := int(math.Round(float64(mins) / 60))
 	switch {
 	case mins < 60:
-		return fmt.Sprintf("%dm", mins)
+		return trf("%dm", mins)
 	case h < 48:
-		return fmt.Sprintf("%dh", h)
+		return trf("%dh", h)
 	}
-	return fmt.Sprintf("%dd", int(math.Round(float64(h)/24)))
+	return trf("%dd", int(math.Round(float64(h)/24)))
 }
 
 // ---- a line to type ---------------------------------------------------------

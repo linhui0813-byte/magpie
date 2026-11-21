@@ -1,8 +1,11 @@
 // Run with Node's test runner and Playwright on the module path; see README.md.
 // A plugin a built-in subscription is moved onto says so in Installed, and
 // removing it or switching it off asks first, in the row, naming the
-// subscription that goes back to the built-in with its accounts; only a
-// yes sends the request. English and Chinese; the API is faked here.
+// subscription that stops working with it (there is no built-in to go
+// back to) and saying its accounts are kept; only a yes sends the request.
+// A plugin magpie never had as a built-in that signs in to two providers
+// names them in the same chip (#3902), with no "in place of the built-in".
+// English and Chinese; the API is faked here.
 const assert = require("node:assert/strict");
 const fs = require("node:fs/promises");
 const path = require("node:path");
@@ -16,6 +19,7 @@ function server(lang, asked) {
   const installed = [
     { spec: ZED + "@0.1.2", providers: ["Zed"], version: "0.1.2", moved: ["zed"] },
     { spec: "opencode-gemini-auth", providers: ["Gemini"], version: "1.4.0", moved: [] },
+    { spec: "magpie-magicrew-auth", providers: ["超级麦吉", "MagiCrew"], version: "0.2.0", moved: [], serves: ["超级麦吉", "MagiCrew"] },
   ];
   const onPlugins = ["zed"];
   const market = () => ({ listings: [{ package: ZED, name: "Zed", icon: "zed", providers: ["zed"], community: true, replaces: "zed", npm: { version: "0.1.2" } }],
@@ -54,11 +58,11 @@ function server(lang, asked) {
 }
 
 const L = {
-  en: { installed: "Installed", serves: "Serves Zed", off: "Switch off", remove: "Remove", cancel: "Cancel",
-    askOff: "Zed goes back to the built-in, with its accounts, before the plugin is switched off.",
-    askRemove: "Zed goes back to the built-in, with its accounts, before the plugin is removed.", back: "Zed is back on the built-in" },
-  zh: { installed: "已安装", serves: "承载 Zed", off: "停用", remove: "移除", cancel: "取消",
-    askOff: "停用插件前，Zed 会带着它的账号回到内置的。", askRemove: "移除插件前，Zed 会带着它的账号回到内置的。", back: "Zed 已回到内置的" },
+  en: { installed: "Installed", serves: "Serves Zed", two: "Serves 超级麦吉, MagiCrew", off: "Switch off", remove: "Remove", cancel: "Cancel",
+    askOff: "Zed stops working while the plugin is off. Its accounts are kept.",
+    askRemove: "Zed stops working until the plugin is installed again. Its accounts are kept.", removed: "removed" },
+  zh: { installed: "已安装", serves: "承载 Zed", two: "承载 超级麦吉、MagiCrew", off: "停用", remove: "移除", cancel: "取消",
+    askOff: "插件停用期间，Zed 也会停用。它的账号会保留。", askRemove: "Zed 会停用，直到再次安装插件。它的账号会保留。", removed: "已移除" },
 };
 
 const shot = async (loc, name) => {
@@ -76,6 +80,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         const w = L[lang];
         const page = await (await browser.newContext({ viewport: { width: 980, height: 820 } })).newPage();
         page.setDefaultTimeout(5000);
+        page.setDefaultNavigationTimeout(60000);
         const errors = [], asked = [];
         page.on("pageerror", (e) => errors.push(e.message));
         await page.route("**/*", server(lang, asked));
@@ -83,13 +88,17 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await page.locator('#nav button[data-view="plugins"]').click();
         const view = page.locator("#view-plugins");
         await view.waitFor({ state: "visible" });
-        await view.locator(".lib-tabs .opt", { hasText: w.installed }).click();
+        await view.page().locator(":is(.lib-tabs .opt, .nav-s):visible", { hasText: w.installed }).click();
         const zed = view.locator(".pm-row").filter({ hasText: "Zed" });
         const chip = zed.locator(".pm-chip.moved");
         await chip.waitFor();
         assert.equal(await chip.innerText(), w.serves);
         assert.equal(await chip.locator(".dot").count(), 1);
+        assert.notEqual(await chip.getAttribute("title"), null);
         assert.equal(await view.locator(".pm-row").filter({ hasText: "opencode-gemini-auth" }).locator(".pm-chip.moved").count(), 0);
+        const two = view.locator(".pm-row").filter({ hasText: "magpie-magicrew-auth" }).locator(".pm-chip.moved");
+        assert.equal(await two.innerText(), w.two);
+        assert.equal(await two.getAttribute("title"), null, "nothing moved: no built-in to name");
         const top = await view.evaluate((e) => e.scrollTop);
 
         // switching off asks first; No leaves it on and sends nothing
@@ -100,13 +109,14 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await zed.locator(".sub.ask").waitFor({ state: "detached" });
         assert.deepEqual(asked, [], "nothing sent before a yes");
 
-        // removing asks too; yes moves Zed back and removes the plugin
+        // removing asks too; yes removes the plugin, nothing moved back
         await zed.locator("button", { hasText: new RegExp("^" + w.remove + "$") }).click();
         await zed.locator(".sub.ask", { hasText: w.askRemove }).waitFor();
         await zed.locator("button.primary", { hasText: w.remove }).click();
-        await page.waitForFunction(() => document.querySelectorAll("#view-plugins .pm-row").length === 1);
+        await page.waitForFunction(() => document.querySelectorAll("#view-plugins .pm-row").length === 2);
         assert.deepEqual(asked, [["remove", { spec: ZED + "@0.1.2" }]]);
-        await page.locator("#status", { hasText: w.back }).waitFor();
+        await page.locator("#status", { hasText: w.removed }).waitFor();
+        assert.doesNotMatch(await page.locator("#status").innerText(), /built-in|内置/);
         assert.equal(await view.evaluate((e) => e.scrollTop), top, "a click doesn't move the page");
         assert.deepEqual(asked.filter(([k]) => k === "fetched"), []);
         assert.deepEqual(errors, []);

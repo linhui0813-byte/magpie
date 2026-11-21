@@ -5,6 +5,7 @@ const fs = require("node:fs/promises");
 const path = require("node:path");
 const { test } = require("node:test");
 const { chromium, webkit } = require("playwright");
+const { watchSettingsReads, settingsDrawn, openPart } = require("./reader.cjs");
 
 const assets = path.resolve(__dirname, "../assets");
 
@@ -62,7 +63,9 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         const page = await context.newPage();
         page.on("pageerror", (e) => errors.push(e.message));
         await page.route("**/*", server(lang, posts));
+        await watchSettingsReads(page);
         await page.goto("http://magpie.test/?view=settings&tab=otel");
+        await settingsDrawn(page); // rows found are the ones that stay (#1659)
         await page.locator("#otelExportRow").waitFor();
         const off = lang === "zh" ? "关闭" : "Off";
         const modes = lang === "zh" ? ["仅元数据", "最多 256 KB", "完整内容"] : ["Metadata only", "Up to 256 KB", "Full content"];
@@ -76,6 +79,22 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         assert.equal(await mode.getAttribute("aria-pressed"), "true");
         assert.equal(await page.locator("#otelHeadersRow input").getAttribute("type"), "password");
         assert((await page.locator("#otelList").textContent()).includes(lang === "zh" ? "环境变量" : "Environment variables"));
+        // the groups are headed as every other Settings tab heads them: a
+        // small label over a card of its own, not a grey band inside one card
+        assert.deepEqual(await page.locator("#otelList > .row-head .label").allTextContents(),
+          lang === "zh" ? ["采集服务连接", "导出范围", "链路内容"] : ["Collector connection", "Export scope", "Trace content"]);
+        const heads = await page.evaluate(() => {
+          const look = (e) => { const c = getComputedStyle(e); return [c.fontSize, c.fontWeight, c.color, c.textTransform, c.letterSpacing, c.backgroundColor].join(" "); };
+          return {
+            otel: look(document.querySelector("#otelList > .row-head .label")),
+            network: look(document.querySelector("#setPage-network .row-head .label")),
+            carded: [...document.querySelectorAll("#otelList > .row-head")].every((h) => h.nextElementSibling?.matches(".list.prefs")),
+            inside: document.querySelectorAll("#otelList .list .row-head, #otelList .otel-section").length,
+          };
+        });
+        assert.equal(heads.otel, heads.network, "Observability's headings look like Network's");
+        assert(heads.carded, "each heading has its own card under it");
+        assert.equal(heads.inside, 0, "no heading inside a card");
         const saved = async (action) => {
           const n = posts.length + 1;
           const response = page.waitForResponse((r) => r.url().endsWith("/api/settings") && r.request().method() === "POST");
@@ -109,13 +128,13 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         assert.equal(p.otel.bodiesWhole, true);
         assert.equal(p.otel.bodies, true);
         assert.equal(await mode.textContent(), modes[2]);
-        await page.locator("#setTab-usage").click();
+        await openPart(page, "usage");
         p = await saved(() => page.locator("#currencySegs .opt").nth(1).click());
         assert.equal(p.otel.enabled, true);
         assert.equal(p.otel.bodiesWhole, true);
         assert.equal(p.otel.endpoint, "https://collector.test/api/public/otel");
         assert.equal(p.otel.headers.Authorization, "Basic YWJjZA==");
-        await page.locator("#setTab-otel").click();
+        await openPart(page, "otel");
         p = await saved(() => page.locator("#otelExportRow .opt").first().click());
         assert.equal(p.otel.enabled, false);
         await page.reload();
@@ -135,9 +154,17 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         // keep the controls inside their rows, and give URLs a full-width field.
         for (const width of [1100, 520, 360]) {
           await page.setViewportSize({ width, height: 1000 });
+          // Right after setViewportSize returns, WebKit can still lay the
+          // page out as it was at the old width: from 1100px to 520px the
+          // view still starts at the side nav's 212px with innerWidth already
+          // 520, and the rows measure 268px instead of 488px. Two frames
+          // later they are laid out at the new width, so measure then.
+          await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
           const layout = await page.locator("#otelList").evaluate((list) => {
             const sub = list.querySelector("#otelSessionsRow .sub");
-            const row = list.querySelector("#otelEndpointRow");
+            // the saved endpoint is Langfuse's, so after the reload the
+            // Langfuse fields stand where the endpoint's was
+            const row = list.querySelector("#otelEndpointRow, #otelLangfuseKeysRow");
             const field = row.querySelector("input");
             return {
               wraps: getComputedStyle(sub).whiteSpace === "normal",

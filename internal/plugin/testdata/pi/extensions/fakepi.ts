@@ -8,7 +8,7 @@ import { spawn } from "node:child_process"
 import { writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai"
-import { readStoredCredential, type ExtensionAPI } from "@earendil-works/pi-coding-agent"
+import { readStoredCredential, VERSION, type ExtensionAPI } from "@earendil-works/pi-coding-agent"
 import { Container, Input, SelectList, Text } from "@earendil-works/pi-tui"
 
 function stream(model, context, options) {
@@ -19,7 +19,7 @@ function stream(model, context, options) {
     api: model.api,
     provider: model.provider,
     model: model.id,
-    usage: { input: 11, output: 7, cacheRead: 3, cacheWrite: 2, totalTokens: 23, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+    usage: { input: 11, output: 0, cacheRead: 3, cacheWrite: 2, totalTokens: 16, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
     stopReason: "stop",
     timestamp: Date.now(),
   }
@@ -27,14 +27,30 @@ function stream(model, context, options) {
   const last = msgs[msgs.length - 1]
   const said = typeof last.content === "string" ? last.content : (last.content ?? []).map((c) => c.text ?? "").join("")
   const system = msgs.filter((m) => m.role === "system")
+  // pi's done names the whole turn's usage, what was written with it
+  const done = (reason) => {
+    out.usage.output = 7
+    out.usage.totalTokens = 23
+    s.push({ type: "done", reason, message: out })
+    s.end()
+  }
   queueMicrotask(() => {
-    s.push({ type: "start", partial: out })
+    if (said.includes("late")) {
+      // as pi-ai's anthropic-messages: start is pushed before the vendor's
+      // message_start is read, with nothing counted yet, and the usage is
+      // filled in on the message the events after it share
+      const counted = out.usage
+      out.usage = { ...counted, input: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0 }
+      s.push({ type: "start", partial: structuredClone(out) })
+      out.usage = counted
+    } else {
+      // as the start event of #1887: the prompt's usage named before
+      // anything is said
+      s.push({ type: "start", partial: structuredClone(out) })
+    }
     if (said.includes("quota")) {
       // as pi-zcode: a refusal sent as JSON, which it reads as nothing said
-      fetch('data:application/json,{"code":1005,"msg":"exceed quota limit"}').then(() => {
-        s.push({ type: "done", reason: "stop", message: out })
-        s.end()
-      })
+      fetch('data:application/json,{"code":1005,"msg":"exceed quota limit"}').then(() => done("stop"))
       return
     }
     if (said.includes("fail429")) {
@@ -60,8 +76,7 @@ function stream(model, context, options) {
       s.push({ type: "toolcall_start", contentIndex: i, partial: out })
       s.push({ type: "toolcall_end", contentIndex: i, toolCall: call, partial: out })
       out.stopReason = "toolUse"
-      s.push({ type: "done", reason: "toolUse", message: out })
-      s.end()
+      done("toolUse")
       return
     }
     // an empty text first, as some vendors send one
@@ -69,6 +84,7 @@ function stream(model, context, options) {
     s.push({ type: "text_start", contentIndex: out.content.length - 1, partial: out })
     s.push({ type: "text_end", contentIndex: out.content.length - 1, content: "", partial: out })
     const seen = {
+      pi: VERSION, // the pi its imports reached
       apiKey: options?.apiKey,
       reasoning: options?.reasoning ?? null,
       maxTokens: options?.maxTokens,
@@ -88,8 +104,7 @@ function stream(model, context, options) {
       s.push({ type: "text_delta", contentIndex: i, delta: part, partial: out })
     }
     s.push({ type: "text_end", contentIndex: i, content: text, partial: out })
-    s.push({ type: "done", reason: "stop", message: out })
-    s.end()
+    done("stop")
   })
   return s
 }

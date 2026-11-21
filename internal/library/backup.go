@@ -1,6 +1,9 @@
 package library
 
 import (
+	"errors"
+	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
@@ -28,6 +31,33 @@ func newBackups() *backups {
 	return &backups{done: map[string]bool{}}
 }
 
+// backupNow is the clock a backup folder is named by.
+var backupNow = time.Now
+
+// freshBackup makes a change's backup folder, one no other change has:
+// named by the millisecond, with -2, -3… after it when another change
+// took that millisecond's. Two changes in one millisecond (a fast
+// machine's loop) would otherwise share it, the second's file kept
+// under its folder's name beside the first's, and the copy at the name
+// the change wrote would be the other change's.
+func freshBackup() (string, error) {
+	if err := os.MkdirAll(BackupDir(), 0o700); err != nil {
+		return "", err
+	}
+	stamp := backupNow().Format("2006-01-02_15-04-05.000")
+	dir := filepath.Join(BackupDir(), stamp)
+	for i := 2; ; i++ {
+		err := os.Mkdir(dir, 0o700)
+		if err == nil {
+			return dir, nil
+		}
+		if !errors.Is(err, fs.ErrExist) {
+			return "", err
+		}
+		dir = filepath.Join(BackupDir(), fmt.Sprintf("%s-%d", stamp, i))
+	}
+}
+
 // keep copies path aside, as the agent had it, before it is written; a
 // file that isn't there has nothing to keep.
 func (b *backups) keep(agent, path string) error {
@@ -43,7 +73,11 @@ func (b *backups) keep(agent, path string) error {
 		return err
 	}
 	if b.dir == "" {
-		b.dir = filepath.Join(BackupDir(), time.Now().Format("2006-01-02_15-04-05.000"))
+		dir, err := freshBackup()
+		if err != nil {
+			return err
+		}
+		b.dir = dir
 	}
 	dst := filepath.Join(b.dir, fileName(agent), filepath.Base(path))
 	if _, err := os.Stat(dst); err == nil {

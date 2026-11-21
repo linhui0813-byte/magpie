@@ -65,7 +65,9 @@ function serve(lang, seen, ctl = {}) {
       const cwd = q.get("cwd");
       const tops = [0, 1, 2].map((i) => top(i, cwd || (i ? "/work/beta" : "/work/alpha")));
       return json({ count: cwd ? 7 : 42, median: 120000, p90: 880000, days: days.map((d) => d.usage.length ? 2 : 0),
-        top: { tokens: tops, cost: [...tops].reverse(), active: tops.slice(0, 2) },
+        // the last by cost: a Pi subagent's session seen only through the
+        // gateway, with no folder and no prompt recorded (#2285)
+        top: { tokens: tops, cost: [...tops].reverse().concat({ ...top(9, ""), key: "pi:sub-9", agent: "pi", id: "sub-9", title: "", gateway: true, cost: 0.5, models: ["deepseek-v4-pro"] }), active: tops.slice(0, 2) },
         messages: days.map((d) => d.usage.length ? 30 : 0), output: days.map(() => 0),
         shape: {
           messages: { edges: [1, 6, 16, 31, 61, 121], counts: [3, 10, 14, 9, 4, 2], total: 42 },
@@ -97,8 +99,10 @@ function serve(lang, seen, ctl = {}) {
 }
 
 const want = {
-  en: { median: "median 120K · p90 880K", share: /\d+% in alpha/, busiest: /^Busiest at \S+ 09:00$/, detail: "Time", idLine: "Session ID", none: "Active time isn't kept by model." },
-  zh: { median: "中位 120K · p90 880K", share: /alpha 占 \d+%/, busiest: /^最忙：\S+ 09:00$/, detail: "时间", idLine: "会话 ID", none: "活跃时长不按模型统计。" },
+  en: { median: "median 120K · p90 880K", share: /\d+% in alpha/, busiest: /^Busiest at \S+ 09:00$/, detail: "Time", idLine: "Session ID", none: "Active time isn't kept by model.",
+    gwName: "(prompt not recorded)", gwSub: /^Gateway session · pi · deepseek-v4-pro · /, gwTip: /Record gateway conversations/ },
+  zh: { median: "中位 120K · p90 880K", share: /alpha 占 \d+%/, busiest: /^最忙：\S+ 09:00$/, detail: "时间", idLine: "会话 ID", none: "活跃时长不按模型统计。",
+    gwName: "（未记录提示词）", gwSub: /^网关会话 · pi · deepseek-v4-pro · /, gwTip: /记录网关对话/ },
 };
 
 for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium", "webkit"])) {
@@ -108,6 +112,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       const context = await browser.newContext({ viewport: { width: 1100, height: 760 }, reducedMotion: "reduce", timezoneId: "Asia/Shanghai" });
       const page = await context.newPage();
       page.setDefaultTimeout(5000);
+      page.setDefaultNavigationTimeout(60000);
       const errors = [], seen = [], ctl = {};
       page.on("pageerror", (e) => errors.push(e.message));
       await page.route("**/*", serve(lang, seen, ctl));
@@ -173,7 +178,14 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         assert.ok(hs[2] > hs[1] && hs[1] > hs[3] && hs[3] > hs[0], String(hs));
         // wheeled to, as a person would: WebKit paints a scroll set from script late
         await page.mouse.move(500, 400);
-        for (let i = 0; i < 20 && (await shape.boundingBox()).y > 300; i++) await page.mouse.wheel(0, 200);
+        // no further than to a third down the view: a step past it can take the
+        // card out over the view's top, and the click then scrolls it back first
+        for (let i = 0; i < 20; i++) {
+          const y = (await shape.boundingBox()).y;
+          if (y <= 300) break;
+          await page.mouse.wheel(0, Math.min(200, y - 250));
+          await page.waitForTimeout(60);
+        }
         await page.waitForTimeout(300);
         const y = (await shape.boundingBox()).y;
         await shape.locator(".segs .opt").nth(2).click();
@@ -242,6 +254,12 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await page.locator("#sessTop .segs .opt").nth(1).click();
         assert.equal(await page.locator("#sessTop .sess-top .name").first().innerText(), "Top session 2");
         assert.equal(await page.evaluate(() => localStorage.getItem("magpie.sessTop")), "cost");
+        // a session only the gateway saw says so, not "(no prompt)" with no folder (#2285)
+        const gw = page.locator("#sessTop .sess-top").last();
+        assert.equal(await gw.locator(".name").innerText(), want[lang].gwName);
+        assert.match(await gw.locator(".sub").innerText(), want[lang].gwSub);
+        assert.match(await gw.locator(".sub").getAttribute("title"), want[lang].gwTip);
+        assert.equal(await page.locator("#sessTop .sess-top").first().locator(".sub").getAttribute("title"), "/work/beta");
       });
 
       await t.test("a project picked from its bar, the page left where it was", async () => {
@@ -326,6 +344,9 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await t.test("nothing overflows, wide or narrow", async () => {
         for (const width of [1100, 560]) {
           await page.setViewportSize({ width, height: 760 });
+          // a frame on: the sidebar's room let go is a transition, if a
+          // reduced-motion one, that WebKit starts and settles in a frame
+          await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
           const over = await page.evaluate(() => [...document.querySelectorAll("#sessionsPane *")].filter((e) => e.offsetParent && e.getBoundingClientRect().right > document.documentElement.clientWidth + 1).map((e) => e.className));
           assert.deepEqual(over, [], "width " + width);
         }

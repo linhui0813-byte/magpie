@@ -10,6 +10,7 @@ const fs = require("node:fs/promises");
 const path = require("node:path");
 const { test } = require("node:test");
 const { chromium, webkit } = require("playwright");
+const { openPart } = require("./reader.cjs");
 
 const assets = path.resolve(__dirname, "../assets");
 
@@ -65,10 +66,11 @@ async function open(browser, lang, posts, platform, over) {
   await context.addInitScript((p) => Object.defineProperty(Navigator.prototype, "platform", { get: () => p }), platform);
   const page = await context.newPage();
   page.setDefaultTimeout(5000);
+  page.setDefaultNavigationTimeout(60000);
   await page.route("**/*", server(lang, posts, over));
   await page.goto("http://magpie.test/?view=usage");
   await page.locator("#prefs").click();
-  await page.locator("#setTab-usage").click();
+  await openPart(page, "usage");
   await page.locator("#trayUsagePick button").waitFor();
   return { context, page };
 }
@@ -107,12 +109,25 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         // scrolled down with a real wheel, once the page has settled, the
         // row in sight; then clicked: no scroll
         await page.waitForTimeout(500);
-        await page.locator("#trayUsagePick button").hover();
-        for (let i = 0; i < 20 && !(await view(page)); i++) { await page.mouse.wheel(0, 120); await page.waitForTimeout(20); }
+        // what the wheel met is kept for a failure's message (#1850: Chromium
+        // zh stayed at 0 on some runs and could not be made to again)
+        const refused = [], tops = [];
+        page.on("console", (m) => { if (/refused/.test(m.text())) refused.push(m.text()); });
+        const pick = page.locator("#trayUsagePick button");
+        await pick.hover();
+        const at = await pick.boundingBox();
+        for (let i = 0; i < 20 && !(await view(page)); i++) { await page.mouse.wheel(0, 120); await page.waitForTimeout(20); tops.push(await view(page)); }
         await row.scrollIntoViewIfNeeded();
         await page.waitForTimeout(300);
         const before = await view(page);
-        assert(before > 0, "the settings list must be scrolled");
+        if (!(before > 0)) {
+          const seen = await page.evaluate(([x, y]) => {
+            const v = document.querySelector("#view-settings"), r = v.getBoundingClientRect();
+            const name = (e) => e.tagName.toLowerCase() + (e.id ? "#" + e.id : "") + (e.classList.length ? "." + [...e.classList].join(".") : "");
+            return { view: [r.top, r.bottom, v.scrollHeight, v.clientHeight, getComputedStyle(v).overflowY], under: document.elementsFromPoint(x, y).slice(0, 6).map(name) };
+          }, [at.x + at.width / 2, at.y + at.height / 2]);
+          assert.fail("the settings list must be scrolled: " + JSON.stringify({ at, tops, refused, ...seen }));
+        }
 
         await opts.nth(0).click();
         for (let i = 0; i < 50 && !posts.length; i++) await page.waitForTimeout(50);

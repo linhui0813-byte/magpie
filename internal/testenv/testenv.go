@@ -20,6 +20,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -42,6 +43,23 @@ const (
 
 // folderVars are the variables Isolate points into the temporary home.
 var folderVars = []string{"HOME", "USERPROFILE", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "APPDATA", "LOCALAPPDATA"}
+
+// proxyVars are the machine's proxy variables. net/http reads them once per
+// process, at its first routed request, so a test binary that lets them
+// stand freezes the machine's proxy into that read: a test that sets its
+// own afterwards reads the machine's instead (search's Auto, which follows
+// ALL_PROXY alone for that reason), and Offline's refused hosts are carried
+// for real by the machine's proxy standing on loopback.
+var proxyVars = []string{"HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy"}
+
+// ClearProxy unsets the machine's proxy variables. Isolate calls it before
+// the tests run; a package that isolates itself in its own TestMain calls
+// it too, before the first request any test makes.
+func ClearProxy() {
+	for _, k := range proxyVars {
+		os.Unsetenv(k)
+	}
+}
 
 // Main runs the package's tests in a home of their own and exits with
 // their code.
@@ -81,13 +99,22 @@ func RunIn(m *testing.M, setup func(home string)) int {
 	if setup != nil {
 		setup(home)
 	}
-	return m.Run()
+	code := m.Run()
+	for _, check := range []func() error{eagerHere, docsIndexHere} {
+		if err := check(); err != nil {
+			fmt.Fprintln(os.Stderr, "testenv:", err)
+			return 1
+		}
+	}
+	return code
 }
 
 // Isolate points the home and the config, cache and data folders into a
 // new temporary folder, clears the agents' variables, puts the stand-ins
 // first on PATH and gives the folder. It fails when Go would still
-// resolve any of them, or a stand-in's tool, outside that folder.
+// resolve any of them, or a stand-in's tool, outside that folder. The
+// system's config folders ($XDG_CONFIG_DIRS, /etc/xdg when unset), where
+// a package keeps its autostart entry (#3372), are one in it too.
 func Isolate() (string, error) {
 	home, err := os.MkdirTemp("", prefix)
 	if err != nil {
@@ -96,6 +123,7 @@ func Isolate() (string, error) {
 	for k, v := range map[string]string{
 		"HOME": home, "USERPROFILE": home,
 		"XDG_CONFIG_HOME": filepath.Join(home, ".config"),
+		"XDG_CONFIG_DIRS": filepath.Join(home, "etc", "xdg"),
 		"XDG_CACHE_HOME":  filepath.Join(home, ".cache"),
 		"XDG_DATA_HOME":   filepath.Join(home, ".local", "share"),
 		"XDG_STATE_HOME":  filepath.Join(home, ".local", "state"),
@@ -107,10 +135,14 @@ func Isolate() (string, error) {
 			return "", err
 		}
 	}
-	for _, k := range agentenv.Vars {
+	for _, k := range append(slices.Clone(agentenv.Vars), agentenv.ClaudeProviders...) {
 		if err := os.Unsetenv(k); err != nil {
 			return "", err
 		}
+	}
+	ClearProxy()
+	if err := dropWindowsPath(); err != nil {
+		return "", err
 	}
 	if err := inertTools(home); err != nil {
 		return "", err
@@ -168,8 +200,12 @@ func SetHome(t testing.TB, dir string) {
 
 // tools are the programs a test must never reach for real: the system
 // keychains (macOS' security, Linux's secret-tool), which hold the user's
-// sign-ins outside any home, and the agents' CLIs.
-var tools = []string{"security", "secret-tool", "claude", "codex", "cursor-agent", "devin", "grok", "kiro-cli"}
+// sign-ins outside any home, the agents' CLIs, and wsl.exe, which opens
+// the WSL distros' homes: a home of its own doesn't cover those, and a
+// test on Windows listed the real distro's Codex sessions beside its
+// fixtures (#4177). A test of the real WSL puts System32 before the
+// stand-in itself.
+var tools = []string{"security", "secret-tool", "claude", "codex", "cursor-agent", "devin", "grok", "kiro-cli", "wsl.exe"}
 
 // inertTools puts a failing stand-in for each of tools first on PATH, in
 // home/bin. Tests can still put their own fakes before it.
@@ -181,27 +217,69 @@ func inertTools(home string) error {
 	if err := StandIns(bin, tools); err != nil {
 		return err
 	}
-	for _, name := range tools {
-		// Windows finds a program by PATHEXT; a .bat comes before the
-		// user's claude.cmd further down PATH
-		if runtime.GOOS == "windows" {
-			if err := os.WriteFile(filepath.Join(bin, name+".bat"), []byte("@exit /b 1\r\n"), 0o755); err != nil {
-				return err
-			}
-		}
-	}
 	return os.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+// dropWindowsPath takes Windows' folders off PATH in WSL. WSL's interop
+// appends them (/mnt/c/Windows/System32, …\VS Code\bin and the rest)
+// over 9P, where a stat takes milliseconds, and a test binary takes the
+// PATH folders' stamp again at every look (proc's lookFreshInTests): a
+// `magpie <agent> <field>` run looked for each agent's command through
+// them, and internal/cli's TestEveryAgentFieldNameWritesNothing ran past
+// 40 minutes in the magpie-desktop distro (0.3s without them). They
+// also hold the machine's own Windows programs, such as VS Code's `code`
+// script, which no Linux test is to find.
+func dropWindowsPath() error {
+	if runtime.GOOS != "linux" || !inWSL() {
+		return nil
+	}
+	dirs := filepath.SplitList(os.Getenv("PATH"))
+	kept := slices.DeleteFunc(slices.Clone(dirs), windowsDrive)
+	if len(kept) == len(dirs) {
+		return nil
+	}
+	return os.Setenv("PATH", strings.Join(kept, string(os.PathListSeparator)))
+}
+
+// inWSL is whether this Linux runs in WSL, with Windows' interop on.
+func inWSL() bool {
+	if os.Getenv("WSL_DISTRO_NAME") != "" || os.Getenv("WSL_INTEROP") != "" {
+		return true
+	}
+	_, err := os.Stat("/proc/sys/fs/binfmt_misc/WSLInterop")
+	return err == nil
+}
+
+// windowsDrive is whether dir is on a Windows drive WSL mounts:
+// /mnt/<letter> or below it.
+func windowsDrive(dir string) bool {
+	rest, ok := strings.CutPrefix(dir, "/mnt/")
+	if !ok || rest == "" {
+		return false
+	}
+	c := rest[0] | 0x20
+	return c >= 'a' && c <= 'z' && (len(rest) == 1 || rest[1] == '/')
 }
 
 // StandIns writes a failing program for each name in bin. On macOS each
 // is run once now, in the background, so that the check macOS makes of a
 // new program's first run (Program) is made while the tests start rather
 // than in the first test to reach it, and without holding them up.
+// Windows finds a program by PATHEXT and passes over a file with no
+// extension, so there each also gets a .bat, which comes before the user's
+// own codex.cmd further down PATH: without it the gateway's tests, which
+// make their stand-ins here, read the installed Codex's version (#1827,
+// EdwinDigital: TestCodexPoolSaysTheClientsVersion saw 0.162.0).
 func StandIns(bin string, names []string) error {
 	for _, name := range names {
 		p := filepath.Join(bin, name)
 		if err := os.WriteFile(p, []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
 			return err
+		}
+		if runtime.GOOS == "windows" {
+			if err := os.WriteFile(p+".bat", []byte("@exit /b 1\r\n"), 0o755); err != nil {
+				return err
+			}
 		}
 		if runtime.GOOS == "darwin" {
 			warming.Add(1)

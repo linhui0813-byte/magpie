@@ -3,7 +3,9 @@
 // http://localhost:3000 couldn't read the gateway's answers): Settings ›
 // Network lists them by origin. One is added from a field and its Add
 // button (or Enter), saved as the gateway cleaned it, and taken away with
-// its Remove; a wildcard or a URL that isn't an origin is refused, said in
+// its Remove; a browser extension is added by its origin
+// (chrome-extension://<id>, SkyAerope on Discord); a wildcard, a URL that
+// isn't an origin or an extension id no browser gives is refused, said in
 // the page's language, and nothing is saved. At a 440px panel every row
 // fits, and no click moves the page. English and Chinese, Chromium and
 // WebKit; no backend, the API is faked here.
@@ -12,6 +14,7 @@ const fs = require("node:fs/promises");
 const path = require("node:path");
 const { test } = require("node:test");
 const { chromium, webkit } = require("playwright");
+const { watchSettingsReads, settingsDrawn } = require("./reader.cjs");
 
 const assets = path.resolve(__dirname, "../assets");
 
@@ -36,9 +39,17 @@ function clean(list) {
   const out = [];
   for (const raw of list) {
     if (raw.includes("*")) return { error: `"${raw}": name each origin; a wildcard would let every web page use magpie` };
+    const ext = /^(chrome-extension|moz-extension|safari-web-extension):\/\/(.*?)\/?$/.exec(raw.trim().toLowerCase());
+    if (ext) {
+      const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+      if (!(ext[1] === "chrome-extension" ? /^[a-p]{32}$/ : uuid).test(ext[2])) return { error: `"${raw}" is not an extension's origin: write it as ${ext[1]}://<its ID>, the ID as the browser's extensions page shows it` };
+      const o = ext[1] + "://" + ext[2];
+      if (!out.includes(o)) out.push(o);
+      continue;
+    }
     let u;
     try { u = new URL(raw); } catch { u = null; }
-    if (!u || !/^https?:$/.test(u.protocol) || (u.pathname !== "/" && u.pathname !== "")) return { error: `"${raw}" is not an origin: write it as http://localhost:3000 or https://app.example.com` };
+    if (!u || !/^https?:$/.test(u.protocol) || (u.pathname !== "/" && u.pathname !== "")) return { error: `"${raw}" is not an origin: write it as http://localhost:3000 or https://app.example.com, or an extension's as chrome-extension://<its ID>` };
     if (!out.includes(u.origin)) out.push(u.origin);
   }
   return { origins: out };
@@ -76,7 +87,7 @@ const words = {
     head: "Web pages", name: "Web pages that may call magpie", add: "Add", remove: "Remove",
     sub: "Scripts on these origins can call the gateway from a browser, each request with a gateway key from Gateway. A page from any other site is refused; pages on this computer are not",
     wildcard: "Name each origin: a wildcard would let every web page use magpie",
-    notOrigin: "Write an origin as http://localhost:3000 or https://app.example.com",
+    notOrigin: "Write an origin as http://localhost:3000 or https://app.example.com, or a browser extension's as chrome-extension://, moz-extension:// or safari-web-extension:// followed by its ID",
   },
   zh: {
     head: "网页", name: "允许调用 magpie 的网页", add: "添加", remove: "移除",
@@ -95,10 +106,13 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         const posts = [];
         const page = await (await browser.newContext({ viewport: { width: 440, height: 520 }, reducedMotion: "reduce" })).newPage();
         page.setDefaultTimeout(5000);
+        page.setDefaultNavigationTimeout(60000);
         const errors = [];
         page.on("pageerror", (e) => errors.push(e.message));
         await page.route("**/*", server(lang, posts));
+        await watchSettingsReads(page);
         await page.goto("http://127.0.0.1:4999/?view=settings&tab=network");
+        await settingsDrawn(page); // rows found are the ones that stay (#1659)
         const box = page.locator("#corsList");
         await box.locator(".rule-row").waitFor();
         const tr = (s) => page.evaluate((s) => t(s), s);
@@ -114,7 +128,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         assert.equal((await head.textContent()).trim(), w.head);
         const row = box.locator(".rule-row");
         assert.equal((await row.locator(".name").textContent()).trim(), w.name);
-        assert.equal((await row.locator(".sub").textContent()).trim(), w.sub);
+        assert.equal((await row.locator(".sub:not(.feat-go)").textContent()).trim(), w.sub);
 
         // every row fits the panel: nothing cut, nothing past the edge
         const fits = async () => {
@@ -162,15 +176,34 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await box.locator(".row:not(.rule-row) .name", { hasText: "https://app.example.com" }).waitFor();
         assert.deepEqual(posts.at(-1), ["http://localhost:3000", "https://app.example.com"]);
         await fits();
+        // a browser extension, by its origin as copied from its page
+        const ext = "chrome-extension://abcdefghijklmnopabcdefghijklmnop";
+        await row.locator("input").fill(ext.toUpperCase() + "/");
+        before = await scroll();
+        await row.locator("button", { hasText: w.add }).click();
+        await box.locator(".row:not(.rule-row) .name", { hasText: ext }).waitFor();
+        assert.deepEqual(posts.at(-1), ["http://localhost:3000", "https://app.example.com", ext.toUpperCase() + "/"]);
+        assert.equal(await scroll(), before, "adding an extension moved the page");
+        await fits();
 
         // refused, in the page's language, and nothing saved
-        for (const [bad, says] of [["*", w.wildcard], ["localhost:4000/v1", w.notOrigin]]) {
+        for (const [bad, says] of [["*", w.wildcard], ["localhost:4000/v1", w.notOrigin], ["chrome-extension://abc", w.notOrigin], ["chrome-extension://*", w.wildcard]]) {
+          // wheeled to the window's middle first, as a reader would: the row
+          // grows with each refusal (and with its Gateway keys line), and a
+          // click on a button under the view's floating foot is Playwright
+          // scrolling to it, not the page moving
+          for (let i = 0; i < 20; i++) {
+            const r = await add.boundingBox();
+            if (r && r.y + r.height < 400) break;
+            await page.mouse.wheel(0, 80);
+            await scroll();
+          }
           await row.locator("input").fill(bad);
           before = await scroll();
           await row.locator("button", { hasText: w.add }).click();
           await page.waitForFunction((s) => document.querySelector("#corsList .rule-row .sub.err")?.textContent.trim() === s, says);
           assert.equal(await row.locator("input").inputValue(), bad, "what the user wrote stays, to be corrected");
-          assert.equal(await box.locator(".row:not(.rule-row)").count(), 2);
+          assert.equal(await box.locator(".row:not(.rule-row)").count(), 3);
           assert.equal(await scroll(), before, "a refusal moved the page");
           await fits();
         }
@@ -179,10 +212,10 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         const gone = box.locator(".row:not(.rule-row)").filter({ hasText: "http://localhost:3000" });
         before = await scroll();
         await gone.locator("button", { hasText: w.remove }).click();
-        await page.waitForFunction(() => document.querySelectorAll("#corsList .row:not(.rule-row)").length === 1);
-        assert.deepEqual(posts.at(-1), ["https://app.example.com"]);
+        await page.waitForFunction(() => document.querySelectorAll("#corsList .row:not(.rule-row)").length === 2);
+        assert.deepEqual(posts.at(-1), ["https://app.example.com", "chrome-extension://abcdefghijklmnopabcdefghijklmnop"]);
         assert.equal(await scroll(), before, "Remove moved the page");
-        assert.equal((await row.locator(".sub").textContent()).trim(), w.sub, "a save clears the refusal");
+        assert.equal((await row.locator(".sub:not(.feat-go)").textContent()).trim(), w.sub, "a save clears the refusal");
 
         const border = await box.locator(".row").first().evaluate((r) => getComputedStyle(r).borderLeftWidth);
         assert(border === "0px" || border === "", "no left border accent: " + border);

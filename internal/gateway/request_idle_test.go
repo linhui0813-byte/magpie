@@ -21,9 +21,16 @@ func TestRequestBodyProgressRenewsIdleDeadline(t *testing.T) {
 			payload := bytes.Repeat([]byte("body"), 128)
 			wire := encodedBody(t, payload, encoding)
 			s := New()
-			s.requestLimits.readTimeout = 200 * time.Millisecond
+			// The idle window is ten times the gap between writes: the
+			// client and the gateway share one process with the whole
+			// package's tests, and a loaded runner stalled a 50ms gap past
+			// a 200ms window, a real idle the gateway rightly refused
+			// (#2567).
+			idle := time.Second
+			gap := idle / 10
+			s.requestLimits.readTimeout = idle
 			gw := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				body, ok := s.readRequestBody(w, r, provider.Responses, codexReader, 0)
+				body, ok := s.readRequestBody(w, r, provider.Responses, 0)
 				if !ok {
 					return
 				}
@@ -38,15 +45,24 @@ func TestRequestBodyProgressRenewsIdleDeadline(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer conn.Close()
-			conn.SetDeadline(time.Now().Add(3 * time.Second))
+			conn.SetDeadline(time.Now().Add(10 * time.Second))
 			fmt.Fprintf(conn, "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: %d\r\nContent-Encoding: %s\r\n\r\n", len(wire), encoding)
-			// Six progressing reads take longer than one idle interval.
-			step := (len(wire) + 5) / 6
+			// Sixteen progressing writes take longer than one idle window,
+			// so only renewing on progress lets the upload finish.
+			const writes = 16
+			step := (len(wire) + writes - 1) / writes
+			start := time.Now()
+			last, longest := start, time.Duration(0)
 			for offset := 0; offset < len(wire); offset += step {
-				time.Sleep(50 * time.Millisecond)
+				time.Sleep(gap)
+				longest = max(longest, time.Since(last))
+				last = time.Now()
 				if _, err := conn.Write(wire[offset:min(offset+step, len(wire))]); err != nil {
 					break
 				}
+			}
+			if took := time.Since(start); took <= idle {
+				t.Fatalf("upload took %v, inside one idle window of %v: nothing was renewed", took, idle)
 			}
 			res, err := http.ReadResponse(bufio.NewReader(conn), nil)
 			if err != nil {
@@ -54,7 +70,7 @@ func TestRequestBodyProgressRenewsIdleDeadline(t *testing.T) {
 			}
 			defer res.Body.Close()
 			if res.StatusCode != 200 {
-				t.Fatalf("progressing upload: %d", res.StatusCode)
+				t.Fatalf("progressing upload: %d (longest gap between writes %v, idle window %v)", res.StatusCode, longest, idle)
 			}
 			body, err := io.ReadAll(res.Body)
 			if err != nil || string(body) != "ok" {
@@ -97,7 +113,7 @@ func TestMCPBodyTooLarge(t *testing.T) {
 }
 
 func TestMediaJSONPastOldBodyLimit(t *testing.T) {
-	payload := append(bytes.Repeat([]byte(" "), 64<<20), []byte(`{"model":"fake/m1","prompt":"tail"}`)...)
+	payload := append(bytes.Repeat([]byte(" "), oldBodyLimit), []byte(`{"model":"fake/m1","prompt":"tail"}`)...)
 	for _, api := range []string{"images", "videos"} {
 		t.Run(api, func(t *testing.T) {
 			r := httptest.NewRequest("POST", "/", bytes.NewReader(payload))
@@ -124,6 +140,8 @@ func TestBodyRejectionErrorShapes(t *testing.T) {
 		want   string
 	}{
 		{provider.Anthropic, 413, `"type":"request_too_large"`},
+		{provider.Chat, 413, `"type":"request_too_large"`},
+		{provider.Responses, 413, `"type":"request_too_large"`},
 		{provider.Gemini, 413, `"status":"INVALID_ARGUMENT"`},
 		{provider.Gemini, 408, `"status":"DEADLINE_EXCEEDED"`},
 	} {

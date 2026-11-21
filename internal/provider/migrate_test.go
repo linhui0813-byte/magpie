@@ -3,8 +3,8 @@ package provider
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -12,13 +12,13 @@ import (
 	"time"
 
 	"github.com/yetone/magpie/internal/plugin"
-	"github.com/yetone/magpie/internal/zed"
+	"github.com/yetone/magpie/internal/testenv"
 )
 
 // fakeMover moves a made-up built-in, "fakeco", whose accounts keep a
 // token in logins.json, onto the test plugin: the token is the plugin's
 // refresh token.
-func fakeMover(t *testing.T, inUse *[]string) {
+func fakeMover(t *testing.T) {
 	t.Helper()
 	movers["fakeco"] = &mover{
 		pkg:    "fake",
@@ -41,12 +41,19 @@ func fakeMover(t *testing.T, inUse *[]string) {
 			return ls, ls[i].User, nil
 		},
 	}
-	oldInstall, oldInUse := installPlugin, modelsInUse
+	oldInstall, oldImport := installPlugin, importAuth
 	installPlugin = func(context.Context, string, string) error { return nil }
-	modelsInUse = func(string) []string { return *inUse }
+	// a sign-in "r-noimport" is one the plugin won't keep, failing the
+	// move part way, after the accounts before it went over
+	importAuth = func(ctx context.Context, id string, auth map[string]any) (string, error) {
+		if auth["refresh"] == "r-noimport" {
+			return "", errors.New("FakeCo won't keep this sign-in")
+		}
+		return plugin.Import(ctx, id, auth)
+	}
 	t.Cleanup(func() {
 		delete(movers, "fakeco")
-		installPlugin, modelsInUse = oldInstall, oldInUse
+		installPlugin, importAuth = oldInstall, oldImport
 	})
 }
 
@@ -77,10 +84,7 @@ func fakeSaved(t *testing.T) map[string]savedLogin {
 // Moved, the plugin has the accounts in the user's order; moved back, the
 // built-in has them again, fresh tokens and order included.
 func TestMoveToPlugin(t *testing.T) {
-	bun, err := exec.LookPath("bun")
-	if err != nil {
-		t.Skip("no bun on PATH")
-	}
+	bun := testenv.Bun(t)
 	claudeHome(t)
 	t.Setenv("MAGPIE_BUN", bun)
 	t.Cleanup(plugin.Settle)
@@ -93,8 +97,7 @@ func TestMoveToPlugin(t *testing.T) {
 	if _, err := plugin.Providers(ctx); err != nil {
 		t.Fatal(err)
 	}
-	inUse := []string{"fake-1", "fake-claude"}
-	fakeMover(t, &inUse)
+	fakeMover(t)
 	movers["fakeco"].pkg = abs
 	reset := func(ls ...savedLogin) {
 		t.Helper()
@@ -125,78 +128,44 @@ func TestMoveToPlugin(t *testing.T) {
 		return out
 	}
 
-	// an account the vendor refuses: nothing moves, and the other's token,
-	// spent by the plugin, comes back renewed
+	// an account the vendor refuses goes along: the built-in is retired,
+	// so nothing an account does holds the move back
 	reset(fakeLogin("a@fake", "rot-a", false, true), fakeLogin("c@fake", "r-dead", false, true))
-	err = Move(ctx, "fakeco")
-	if err == nil || !strings.Contains(err.Error(), "c@fake") {
+	if err := Move(ctx, "fakeco"); err != nil || !Moved("fakeco") {
 		t.Fatalf("Move with a refused account = %v", err)
+	}
+	if got := strings.Join(pluginUsers(), " "); got != "a@fake+ c@fake+" {
+		t.Fatalf("the plugin's accounts after moving a refused one: %s", got)
+	}
+
+	// a sign-in the plugin won't keep: nothing moves, and the one that went
+	// over before it comes back
+	reset(fakeLogin("a@fake", "rot-a", false, true), fakeLogin("c@fake", "r-noimport", false, true))
+	err := Move(ctx, "fakeco")
+	if err == nil || !strings.Contains(err.Error(), "c@fake") {
+		t.Fatalf("Move with a sign-in the plugin won't keep = %v", err)
 	}
 	if m, _ := MigrationOf("fakeco"); m.State != MoveFailed || Moved("fakeco") {
 		t.Fatalf("after a failed move: %+v", m)
 	}
-	if s := fakeSaved(t); !strings.HasPrefix(fakeToken(s["a@fake"]), "rot-a+") || fakeToken(s["c@fake"]) != "r-dead" {
+	if s := fakeSaved(t); !strings.HasPrefix(fakeToken(s["a@fake"]), "rot-a") || fakeToken(s["c@fake"]) != "r-noimport" {
 		t.Fatalf("the built-in's accounts after a failed move: %+v", s)
 	}
 	if plugin.SignedIn("fakeco") {
 		t.Fatal("the plugin kept an account of a failed move")
 	}
 
-	// a model in use the plugin doesn't serve: nothing moves
-	reset(fakeLogin("a@fake", "r-a", false, true))
-	inUse = []string{"fake-1", "gone-model"}
-	if err := Move(ctx, "fakeco"); err == nil || !strings.Contains(err.Error(), "gone-model") {
-		t.Fatalf("Move with a model the plugin lacks = %v", err)
-	}
-	if len(fakeSaved(t)) != 1 || plugin.SignedIn("fakeco") {
-		t.Fatal("a move short of a model moved")
-	}
-	// one the mover says the plugin serves though it doesn't list it (a
-	// Devin variant) isn't named, nor is a name twice
-	movers["fakeco"].served = func(m string, listed []string) bool { return m == "fake-1-high" && slices.Contains(listed, "fake-1") }
-	reset(fakeLogin("a@fake", "r-a", false, true))
-	inUse = []string{"fake-1", "fake-1-high", "gone-model", "gone-model"}
-	if err := Move(ctx, "fakeco"); err == nil || strings.Contains(err.Error(), "fake-1-high") || strings.Count(err.Error(), "gone-model") != 1 {
-		t.Fatalf("Move with a served variant and a model the plugin lacks = %v", err)
-	}
-	movers["fakeco"].served = nil
-	// one the built-in never served on the account either (a ZCode Start
-	// Plan account's GLM-5.3) is no loss and isn't named; one it did is,
-	// with the account and its plan
-	movers["fakeco"].builtin = func(_ context.Context, a Moving, m string) bool { return a.User != "a@fake" || m != "never-model" }
-	reset(func() savedLogin { l := fakeLogin("a@fake", "r-a", false, true); l.Plan = "Fake Start"; return l }())
-	inUse = []string{"fake-1", "never-model"}
-	if err := Move(ctx, "fakeco"); err != nil {
-		t.Fatalf("Move with a model the built-in didn't serve either = %v", err)
-	}
-	if err := MoveBack(ctx, "fakeco"); err != nil {
-		t.Fatal(err)
-	}
-	reset(func() savedLogin { l := fakeLogin("a@fake", "r-a", false, true); l.Plan = "Fake Start"; return l }())
-	inUse = []string{"fake-1", "never-model", "gone-model"}
-	err = Move(ctx, "fakeco")
-	if err == nil || strings.Contains(err.Error(), "never-model") || !strings.Contains(err.Error(), "gone-model for a@fake (Fake Start)") {
-		t.Fatalf("Move with a model the built-in served on the account = %v", err)
-	}
-	if w := WhyOf(err); w == nil || w.Code != "unserved" || w.Args["user"] != "a@fake (Fake Start)" || w.Args["models"] != "gone-model" {
-		t.Fatalf("its why: %+v", w)
-	}
-	movers["fakeco"].builtin = nil
-	inUse = []string{"fake-1", "fake-claude"}
-
 	// an account signed in through the plugin already gets back what it had
-	reset(fakeLogin("a@fake", "r-a", false, true))
+	reset(fakeLogin("a@fake", "r-a", false, true), fakeLogin("c@fake", "r-noimport", false, true))
 	if _, err := plugin.Import(ctx, "fakeco", map[string]any{"type": "oauth", "refresh": "r-mine", "access": "a", "expires": 9e15, "accountId": "a@fake"}); err != nil {
 		t.Fatal(err)
 	}
-	inUse = []string{"gone-model"}
 	if err := Move(ctx, "fakeco"); err == nil {
-		t.Fatal("moved short of a model")
+		t.Fatal("moved a sign-in the plugin won't keep")
 	}
 	if a := plugin.Auths("fakeco"); len(a) != 1 || a["fakeco"]["refresh"] != "r-mine" {
 		t.Fatalf("the plugin's own account after a failed move: %v", a)
 	}
-	inUse = []string{"fake-1", "fake-claude"}
 
 	// a move through: b first, a on behind it, d off; a lapsed one goes
 	// along untried
@@ -239,53 +208,13 @@ func TestMoveToPlugin(t *testing.T) {
 			Moved("fakeco"), len(plugin.Cached()), len(pluginUsageLogins(mustPlugin(t))), qs)
 	}
 
-	// the user reorders on the plugin, and it renews a's token; back, the
-	// built-in has both
-	if err := switchPluginLogin(mustPlugin(t), "a@fake"); err != nil {
-		t.Fatal(err)
-	}
-	for k, a := range plugin.Auths("fakeco") {
-		if a["accountId"] == "a@fake" {
-			if _, err := plugin.Check(ctx, "fakeco", k); err != nil {
-				t.Fatal(err)
-			}
-		}
-	}
-	if err := MoveBack(ctx, "fakeco"); err != nil {
-		t.Fatal(err)
-	}
-	if m, _ := MigrationOf("fakeco"); m.State != MovedBack || Moved("fakeco") {
-		t.Fatalf("after moving back: %+v", m)
-	}
-	s := fakeSaved(t)
-	if len(s) != 4 || !strings.HasPrefix(fakeToken(s["a@fake"]), "rot-a++") || plugin.SignedIn("fakeco") || !s["a@fake"].First || s["b@fake"].First || !s["b@fake"].On || s["d@fake"].On {
-		t.Fatalf("the built-in's accounts moved back: %+v", s)
-	}
-	if plugin.SignedIn("fakeco") {
-		t.Fatal("the plugin kept accounts moved back")
-	}
-	loginsMu.Lock()
-	for _, l := range readLogins() {
-		if l.Agent == "plugin:fakeco" {
-			t.Errorf("the plugin's row of %s stayed after moving back", l.User)
-		}
-	}
-	loginsMu.Unlock()
-	// the user moved it back: it isn't moved again by itself
-	Retiring = []string{"fakeco"}
-	t.Cleanup(func() { Retiring = nil })
-	if errs := MoveRetiring(ctx); len(errs) != 0 || Moved("fakeco") {
-		t.Fatalf("MoveRetiring moved one moved back: %v", errs)
-	}
 }
 
 // A move cut short (magpie quit mid-way) is put back before it is tried
-// again, and a failed one waits before magpie tries it by itself again.
+// again, and a failed one waits before magpie tries it by itself again:
+// hours while the built-in serves its accounts, minutes once it is retired.
 func TestMoveCutShort(t *testing.T) {
-	bun, err := exec.LookPath("bun")
-	if err != nil {
-		t.Skip("no bun on PATH")
-	}
+	bun := testenv.Bun(t)
 	claudeHome(t)
 	t.Setenv("MAGPIE_BUN", bun)
 	t.Cleanup(plugin.Settle)
@@ -298,11 +227,10 @@ func TestMoveCutShort(t *testing.T) {
 	if _, err := plugin.Providers(ctx); err != nil {
 		t.Fatal(err)
 	}
-	inUse := []string{"fake-1"}
-	fakeMover(t, &inUse)
+	fakeMover(t)
 	movers["fakeco"].pkg = abs
-	Retiring = []string{"fakeco"}
-	t.Cleanup(func() { Retiring = nil })
+	retiring = func() []string { return []string{"fakeco"} }
+	t.Cleanup(func() { retiring = MovableIDs })
 	loginsMu.Lock()
 	_ = writeLogins([]savedLogin{fakeLogin("a@fake", "rot-a", false, true)})
 	loginsMu.Unlock()
@@ -312,29 +240,55 @@ func TestMoveCutShort(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// as a move records it: the sign-in sent, which the built-in still has
+	out, _ := movers["fakeco"].out()
 	_ = setMigration("fakeco", func(m *Migration) {
-		*m = Migration{State: MoveMoving, At: time.Now(), Accounts: []movedAccount{{Key: key, User: "a@fake"}}}
+		*m = Migration{State: MoveMoving, At: time.Now(), Accounts: []movedAccount{{Key: key, User: "a@fake", Sent: signinHash(out[0].Auth)}}}
 	})
 	if movingNow("fakeco") && len(pluginAccounts()) != 0 {
 		t.Fatal("a plugin provider mid-move is listed")
 	}
-	// the built-in fails now (its models aren't the plugin's): put back,
+	// the move fails now (a sign-in the plugin won't keep): put back,
 	// with the renewed token
-	inUse = []string{"gone-model"}
+	loginsMu.Lock()
+	_ = writeLogins(append(readLogins(), fakeLogin("n@fake", "r-noimport", false, true)))
+	loginsMu.Unlock()
 	if errs := MoveRetiring(ctx); errs["fakeco"] == nil {
-		t.Fatal("moved short of a model")
+		t.Fatal("moved a sign-in the plugin won't keep")
 	}
 	if s := fakeSaved(t); !strings.HasPrefix(fakeToken(s["a@fake"]), "rot-a+") || plugin.SignedIn("fakeco") {
 		t.Fatalf("after putting back a move cut short: %+v", s)
 	}
 	// failed just now: not tried again by itself until moveRetry has gone
-	inUse = []string{"fake-1"}
+	loginsMu.Lock()
+	_ = writeLogins(slices.DeleteFunc(readLogins(), func(l savedLogin) bool { return l.User == "n@fake" }))
+	loginsMu.Unlock()
 	if errs := MoveRetiring(ctx); len(errs) != 0 || Moved("fakeco") {
 		t.Fatalf("tried again at once: %v", errs)
 	}
-	_ = setMigration("fakeco", func(m *Migration) { m.At = time.Now().Add(-moveRetry - time.Minute) })
+	// past retiredRetry, still within moveRetry: the built-in serves its
+	// accounts yet, so it waits the hours
+	_ = setMigration("fakeco", func(m *Migration) { m.At = time.Now().Add(-retiredRetry - time.Minute) })
+	if errs := MoveRetiring(ctx); len(errs) != 0 || Moved("fakeco") {
+		t.Fatalf("a built-in still serving it tried again within moveRetry: %v", errs)
+	}
+	if d := nextRetiringRun(); d != time.Hour {
+		t.Fatalf("the next run with no retired built-in failed: %s, not an hour", d)
+	}
+	// retired, nothing serves its accounts: tried again after retiredRetry,
+	// the run brought forward to it
+	retiredBuiltins["fakeco"] = true
+	t.Cleanup(func() { delete(retiredBuiltins, "fakeco") })
+	_ = setMigration("fakeco", func(m *Migration) { m.At = time.Now() })
+	if d := nextRetiringRun(); d > retiredRetry || d < retiredRetry-time.Minute {
+		t.Fatalf("the next run after a retired built-in's failed move: %s, not %s", d, retiredRetry)
+	}
+	if errs := MoveRetiring(ctx); len(errs) != 0 || Moved("fakeco") {
+		t.Fatalf("a retired built-in tried again at once: %v", errs)
+	}
+	_ = setMigration("fakeco", func(m *Migration) { m.At = time.Now().Add(-retiredRetry - time.Minute) })
 	if errs := MoveRetiring(ctx); errs["fakeco"] != nil || !Moved("fakeco") {
-		t.Fatalf("after moveRetry: %v", errs)
+		t.Fatalf("a retired built-in after retiredRetry: %v", errs)
 	}
 	// a magpie that stopped between the record and logins.json: tidied
 	loginsMu.Lock()
@@ -361,10 +315,7 @@ func mustPlugin(t *testing.T) plugin.Provider {
 // when it renewed one, the built-in's when that renewed it meanwhile (a
 // request went to it), none when neither did.
 func TestPutBackKeepsNewer(t *testing.T) {
-	bun, err := exec.LookPath("bun")
-	if err != nil {
-		t.Skip("no bun on PATH")
-	}
+	bun := testenv.Bun(t)
 	claudeHome(t)
 	t.Setenv("MAGPIE_BUN", bun)
 	t.Cleanup(plugin.Settle)
@@ -377,8 +328,7 @@ func TestPutBackKeepsNewer(t *testing.T) {
 	if _, err := plugin.Providers(ctx); err != nil {
 		t.Fatal(err)
 	}
-	inUse := []string{"fake-1"}
-	fakeMover(t, &inUse)
+	fakeMover(t)
 	mv := movers["fakeco"]
 	sent := func(tok, user string) string {
 		return signinHash(map[string]any{"type": "oauth", "refresh": tok, "access": "a", "expires": 9e15, "accountId": user})
@@ -410,54 +360,77 @@ func TestPutBackKeepsNewer(t *testing.T) {
 	}
 }
 
-// A built-in moved onto its plugin shows no card of its own, even with
-// an account of it still on this machine (the agent's own sign-in), and
-// signs in no more: an account signed in to there would be served by
-// nothing.
-func TestMovedBuiltinQuiet(t *testing.T) {
+// A retired built-in shows no card of its own, even with an account of it
+// still on this machine, unmoved, and signs in no more: an account signed
+// in to there would be served by nothing.
+func TestRetiredBuiltinQuiet(t *testing.T) {
 	claudeHome(t)
 	loginsMu.Lock()
 	_ = writeLogins([]savedLogin{{Agent: "zed", User: "left@example.com", On: true, First: true, Auth: []byte(`{"userId":"u1","accessToken":"a"}`)}})
 	loginsMu.Unlock()
-	zedCloud = "http://127.0.0.1:1" // no network: the card shows its error
-	t.Cleanup(func() { zedCloud = zed.CloudURL })
-	cards := func() int {
-		n := 0
-		for _, q := range fetchSubscriptionUsage(context.Background()) {
-			if q.Provider == "zed" {
-				n++
-			}
+	if !BuiltinRetired("zed") {
+		t.Fatal("zed isn't retired")
+	}
+	for _, q := range fetchSubscriptionUsage(context.Background()) {
+		if q.Provider == "zed" {
+			t.Fatalf("a card of the retired built-in: %+v", q)
 		}
-		return n
-	}
-	if cards() != 1 {
-		t.Fatal("the built-in's card isn't there to go")
-	}
-	_ = setMigration("zed", func(m *Migration) { *m = Migration{State: MovePlugin, At: time.Now()} })
-	if n := cards(); n != 0 {
-		t.Fatalf("%d cards of the moved built-in", n)
 	}
 	if _, err := StartSignIn("zed"); err == nil || !strings.Contains(err.Error(), "plugin") {
-		t.Fatalf("a sign-in to the moved built-in: %v", err)
+		t.Fatalf("a sign-in to the retired built-in: %v", err)
+	}
+	if c := MoveCandidates(); len(c) != 1 || c[0].ID != "zed" || c[0].Accounts != 1 {
+		t.Fatalf("the unmoved account isn't offered its move: %+v", c)
+	}
+}
+
+// plugins#404 (Gruu6y): Grok moved onto its plugin, then the plugin, the
+// provider and its sign-ins removed. migrations.json says "removed", but a
+// login row of the built-in's left behind kept it a move candidate, and the
+// Providers page said for good that its accounts hadn't moved yet, with a
+// Move that would install the plugin again. Removed is the user's answer:
+// no candidate, until the plugin is installed again (HandOver).
+func TestRemovedPluginIsNoMoveCandidate(t *testing.T) {
+	claudeHome(t)
+	loginsMu.Lock()
+	_ = writeLogins([]savedLogin{{Agent: "zed", User: "left@example.com", On: true, First: true, Auth: []byte(`{"userId":"u1","accessToken":"a"}`)}})
+	loginsMu.Unlock()
+	if c := MoveCandidates(); len(c) != 1 || c[0].ID != "zed" {
+		t.Fatalf("the unmoved account isn't offered its move: %+v", c)
+	}
+	if err := setMigration("zed", func(m *Migration) {
+		*m = Migration{State: MoveRemoved, Package: MovePackage("zed"), Installed: true}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if c := MoveCandidates(); len(c) != 0 {
+		t.Fatalf("one whose plugin the user removed is still offered a move: %+v", c)
+	}
+	// one whose move failed still is, with why
+	if err := setMigration("zed", func(m *Migration) { m.State, m.Err = MoveFailed, "boom" }); err != nil {
+		t.Fatal(err)
+	}
+	if c := MoveCandidates(); len(c) != 1 || c[0].Error != "boom" {
+		t.Fatalf("a failed move isn't offered again: %+v", c)
 	}
 }
 
 // A moved built-in's plugin is updated to the version its move needs, as
-// the built-in came up to date with magpie; one moved back isn't touched.
+// the built-in came up to date with magpie; one whose plugin the user
+// removed isn't installed again.
 func TestKeepMovedCurrent(t *testing.T) {
 	claudeHome(t)
-	var inUse []string
-	fakeMover(t, &inUse)
+	fakeMover(t)
 	movers["fakeco"].min = "0.2.0"
 	var asked []string
 	installPlugin = func(_ context.Context, pkg, min string) error {
 		asked = append(asked, pkg+"@"+min)
 		return nil
 	}
-	_ = setMigration("fakeco", func(m *Migration) { m.State = MovedBack })
+	_ = setMigration("fakeco", func(m *Migration) { m.State = MoveRemoved })
 	keepMovedCurrent(context.Background())
 	if len(asked) != 0 {
-		t.Fatalf("one moved back was updated: %v", asked)
+		t.Fatalf("one whose plugin was removed was installed: %v", asked)
 	}
 	_ = setMigration("fakeco", func(m *Migration) { m.State = MovePlugin })
 	keepMovedCurrent(context.Background())
@@ -466,62 +439,91 @@ func TestKeepMovedCurrent(t *testing.T) {
 	}
 }
 
-// Removing the plugin a built-in is moved onto, or turning it off, moves
-// the built-in back first: its accounts go back to it rather than out of
-// sight with the plugin.
-func TestReleasePlugin(t *testing.T) {
-	bun, err := exec.LookPath("bun")
-	if err != nil {
-		t.Skip("no bun on PATH")
+// The plugin a move installs is installed at the spec the user pinned, not at
+// <pkg>@latest. Add installs what it is given and appends @latest to a bare
+// package name, so handing it a bare name replaced the pin with the newest
+// version behind the user's back, and switched one they turned off back on.
+func TestInstallPluginKeepsTheUsersPin(t *testing.T) {
+	claudeHome(t)
+	// where plugin.Load reads the list from: settings.Dir(), the plugins
+	// folder's parent. The installed package's package.json is what
+	// plugin.Version reads, so it is where the plugins folder keeps it.
+	list := filepath.Join(filepath.Dir(plugin.Dir()), "plugins.json")
+	pkg := filepath.Join(plugin.Dir(), "node_modules", "fake")
+	writeList := func(body string) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Dir(list), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(list, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
 	}
-	for _, op := range []string{"off", "remove"} {
-		t.Run(op, func(t *testing.T) {
-			claudeHome(t)
-			t.Setenv("MAGPIE_BUN", bun)
-			t.Cleanup(plugin.Settle)
-			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-			defer cancel()
-			abs, _ := filepath.Abs("../plugin/testdata/fake/index.js")
-			if _, err := plugin.Add(ctx, abs); err != nil {
-				t.Fatal(err)
-			}
-			if _, err := plugin.Providers(ctx); err != nil {
-				t.Fatal(err)
-			}
-			inUse := []string{"fake-1"}
-			fakeMover(t, &inUse)
-			movers["fakeco"].pkg = abs
-			loginsMu.Lock()
-			if err := writeLogins([]savedLogin{fakeLogin("a@fake", "r-a", true, true), fakeLogin("b@fake", "r-b", false, true)}); err != nil {
-				t.Fatal(err)
-			}
-			loginsMu.Unlock()
-			if err := Move(ctx, "fakeco"); err != nil {
-				t.Fatal(err)
-			}
-			if got := MovedOnto(abs); len(got) != 1 || got[0] != "fakeco" {
-				t.Fatalf("moved onto the plugin: %v", got)
-			}
-			if op == "off" {
-				err = SetPluginOff(ctx, abs, true)
-			} else {
-				err = RemovePlugin(ctx, abs)
-			}
-			if err != nil {
-				t.Fatal(err)
-			}
-			if Moved("fakeco") {
-				t.Fatal("still moved onto a plugin that is gone")
-			}
-			if s := fakeSaved(t); len(s) != 2 || !s["a@fake"].First {
-				t.Fatalf("the built-in's accounts: %+v", s)
-			}
-			if op == "off" && (len(plugin.Load().Plugins) != 1 || !plugin.Load().Plugins[0].Off) {
-				t.Fatalf("not turned off: %+v", plugin.Load().Plugins)
-			}
-			if op == "remove" && len(plugin.Load().Plugins) != 0 {
-				t.Fatalf("not removed: %+v", plugin.Load().Plugins)
-			}
-		})
+	writeInstalled := func(version string) {
+		t.Helper()
+		if err := os.MkdirAll(pkg, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		pj := `{"name":"fake","version":"` + version + `"}`
+		if err := os.WriteFile(filepath.Join(pkg, "package.json"), []byte(pj), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeList(`{"plugins":[{"spec":"fake@0.1.5"}]}`)
+	writeInstalled("0.1.5")
+	oldAdd, oldUp := addPlugin, upgradePlugin
+	t.Cleanup(func() { addPlugin, upgradePlugin = oldAdd, oldUp })
+	var asked []string
+	addPlugin = func(_ context.Context, spec string) (plugin.Entry, error) {
+		asked = append(asked, "add "+spec)
+		return plugin.Entry{}, nil
+	}
+	upgradePlugin = func(_ context.Context, name string) error {
+		asked = append(asked, "upgrade "+name)
+		return nil
+	}
+
+	// what is installed is the user's pin, and the move needs newer: the
+	// pin stays, and the move says why it can't go on — rather than Add
+	// quietly installing <pkg>@latest over it
+	err := installPlugin(context.Background(), "fake", "0.2.0")
+	if len(asked) != 0 {
+		t.Fatalf("a pinned plugin was reinstalled: %v", asked)
+	}
+	if err == nil || !strings.Contains(err.Error(), "pinned at fake@0.1.5") || !strings.Contains(err.Error(), "0.2.0 or newer") {
+		t.Fatalf("a pin older than the move needs: %v, want the pin and the version it needs named", err)
+	}
+
+	// one the user didn't pin still goes to npm's newest through Upgrade,
+	// not bun's latest, which a minimumReleaseAge holds back without a
+	// word (sweanng424 on Discord)
+	writeList(`{"plugins":[{"spec":"fake@latest"}]}`)
+	asked = nil
+	_ = installPlugin(context.Background(), "fake", "0.2.0")
+	if strings.Join(asked, " ") != "upgrade fake" {
+		t.Fatalf("an unpinned plugin below the move's min: asked %v, want upgrade fake", asked)
+	}
+
+	// a git one is reinstalled from its own repository, not swapped for
+	// npm's; the plugins folder's package.json is what names it
+	writeList(`{"plugins":[{"spec":"github:someone/fake"}]}`)
+	deps := `{"dependencies":{"fake":"github:someone/fake"}}`
+	if err := os.WriteFile(filepath.Join(plugin.Dir(), "package.json"), []byte(deps), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	asked = nil
+	_ = installPlugin(context.Background(), "fake", "0.2.0")
+	if strings.Join(asked, " ") != "add github:someone/fake" {
+		t.Fatalf("a git plugin below the move's min: asked %v, want its own spec added", asked)
+	}
+
+	// a plugin the user turned off is not switched back on either
+	writeList(`{"plugins":[{"spec":"fake@0.1.5","off":true}]}`)
+	asked = nil
+	if err := installPlugin(context.Background(), "fake", "0.2.0"); err == nil {
+		t.Fatal("a plugin the user turned off was installed")
+	}
+	if len(asked) != 0 {
+		t.Fatalf("a plugin the user turned off was asked for: %v", asked)
 	}
 }

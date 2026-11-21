@@ -24,13 +24,13 @@ import (
 	"fmt"
 	"maps"
 	"os"
-	"regexp"
 	"slices"
 	"strings"
 
 	"gopkg.in/yaml.v3"
 
 	"github.com/yetone/magpie/internal/edit"
+	"github.com/yetone/magpie/internal/lazyre"
 )
 
 const dshMCPPlugin = "@deepseek-ai/dsh-mcp-client"
@@ -38,7 +38,7 @@ const dshMCPPlugin = "@deepseek-ai/dsh-mcp-client"
 const dshMark = "- insert: # magpie"
 
 // dshServerName is what dsh-mcp-client takes as a serverName.
-var dshServerName = regexp.MustCompile(`^[A-Za-z0-9_-]{1,32}$`)
+var dshServerName = lazyre.New(`^[A-Za-z0-9_-]{1,32}$`)
 
 // errDshName is what the page says of a server whose name dsh can't take.
 var errDshName = errors.New("DeepSeek Harness takes a server name of at most 32 letters, digits, - and _")
@@ -89,14 +89,24 @@ func dshRead(path string) (*dshPatches, error) {
 	if s == "" {
 		return p, nil
 	}
+	opened := false // a "---" or "[]" came before the first entry
 	for _, l := range strings.Split(s, "\n") {
 		t := strings.TrimSpace(l)
 		switch {
 		case strings.HasPrefix(l, "- ") || l == "-":
 			p.items = append(p.items, []string{l})
 		case len(p.items) == 0:
-			if t != "" && !strings.HasPrefix(t, "#") && t != "[]" {
+			// "---" is YAML's document start marker: a patch list may open
+			// with one (#2667), and it stays in the head it is written back
+			// with, so the file keeps it. Only at the left edge and before
+			// anything but comments: a second one starts a second
+			// document, which is no list magpie can edit.
+			marker := dshDocStart(l) && !opened
+			if t != "" && !strings.HasPrefix(t, "#") && t != "[]" && !marker {
 				return nil, fmt.Errorf("%s is not a list of entries magpie can edit", path)
+			}
+			if t != "" && !strings.HasPrefix(t, "#") {
+				opened = true
 			}
 			if t != "[]" {
 				p.head = append(p.head, l)
@@ -288,7 +298,7 @@ func dshScalar(s string) string {
 	return strings.TrimSpace(b.String())
 }
 
-var dshPlain = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_-]*$`)
+var dshPlain = lazyre.New(`^[A-Za-z_][A-Za-z0-9_-]*$`)
 
 // dshKey is a key bare where YAML reads it so, quoted where not.
 func dshKey(k string) string {
@@ -304,6 +314,11 @@ func dshYAML(indent, k string, v any) []string {
 	key := indent + dshKey(k) + ":"
 	switch x := v.(type) {
 	case dshJS:
+		// a variable whole bare, as dsh-mcp-client's README has it; the
+		// rest quoted, which dsh's YAML reads as the same expression
+		if dshEnvRef.MatchString(string(x)) {
+			return []string{key + " !!js " + string(x)}
+		}
 		return []string{key + " !!js " + dshScalar(string(x))}
 	case string:
 		return []string{key + " " + dshScalar(x)}
@@ -342,4 +357,21 @@ func dshYAML(indent, k string, v any) []string {
 	enc.SetEscapeHTML(false)
 	enc.Encode(v)
 	return []string{key + " " + strings.TrimSpace(b.String())}
+}
+
+// dshDocStart says whether l is YAML's document start marker, "---" at the
+// left edge with at most a comment after it.
+func dshDocStart(l string) bool {
+	r, ok := strings.CutPrefix(l, "---")
+	if !ok {
+		return false
+	}
+	if r == "" {
+		return true
+	}
+	if r[0] != ' ' && r[0] != '\t' {
+		return false
+	}
+	r = strings.TrimSpace(r)
+	return r == "" || strings.HasPrefix(r, "#")
 }

@@ -8,11 +8,12 @@ package provider
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
-	"regexp"
 	"strings"
 	"time"
 
+	"github.com/yetone/magpie/internal/lazyre"
 	"github.com/yetone/magpie/internal/plugin"
 )
 
@@ -29,7 +30,7 @@ var movedCards = map[string]struct{ name, icon, site string }{
 	"workbuddy":       {"WorkBuddy", "workbuddy-color", "https://www.codebuddy.cn"},
 	WorkBuddyAIID:     {"WorkBuddy AI", "workbuddy-color", "https://www.workbuddy.ai"},
 	"cursor":          {"Cursor", "cursor", "https://cursor.com"},
-	"grok":            {"Grok (SuperGrok)", "xai", "https://x.ai/cli"},
+	"grok":            {"Grok", "xai", "https://x.ai/cli"},
 	"devin":           {"Devin", "devin", "https://devin.ai"},
 }
 
@@ -58,7 +59,7 @@ var movedNames = map[string]string{CommandCodePlanID: "Command Code Plan"}
 
 // pluginCard is the name and icon pp's usage cards show.
 func pluginCard(pp plugin.Provider) (string, string) {
-	if c, ok := movedCards[pp.ID]; ok && Moved(pp.ID) {
+	if c, ok := movedCards[pp.ID]; ok && PluginServes(pp.ID) {
 		return c.name, c.icon
 	}
 	name := pp.Name
@@ -77,7 +78,7 @@ func pluginUsageLogins(pp plugin.Provider) []Login {
 }
 
 // signInGone is a plugin's usage saying the account's sign-in is gone.
-var signInGone = regexp.MustCompile(`(?i)sign-in has (expired|lapsed)|sign in again`)
+var signInGone = lazyre.New(`(?i)sign-in has (expired|lapsed)|sign in again`)
 
 // pluginLoginQuota is the allowance of one of a plugin provider's
 // accounts, l.Agent being "plugin:" and its id.
@@ -101,6 +102,7 @@ func pluginLoginQuota(ctx context.Context, l Login) SubscriptionQuota {
 	}
 	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
+	began := pluginSignInAt()
 	u, err := plugin.AccountUsage(ctx, pp.ID, key)
 	if err != nil {
 		q.Error = err.Error()
@@ -108,20 +110,53 @@ func pluginLoginQuota(ctx context.Context, l Login) SubscriptionQuota {
 	}
 	// the plugin says what the read means for the sign-in, as a built-in's
 	// usage read marked the account or left it; one that doesn't say has
-	// an error to sign in again mark it and a clean read clear it
+	// an error to sign in again mark it and a clean read clear it. What a
+	// request was answered while it read is newer, and stands.
 	switch {
 	case u.SignIn == "expired":
-		notePluginLapse(pp, key, http.StatusUnauthorized)
+		notePluginLapseSince(pp, key, http.StatusUnauthorized, began)
 	case u.SignIn == "renewed":
-		notePluginLapse(pp, key, http.StatusOK)
+		notePluginLapseSince(pp, key, http.StatusOK, began)
 	case u.SignIn == "kept":
 	case signInGone.MatchString(u.Error):
-		notePluginLapse(pp, key, http.StatusUnauthorized)
+		notePluginLapseSince(pp, key, http.StatusUnauthorized, began)
 	case u.Error == "":
-		notePluginLapse(pp, key, http.StatusOK)
+		notePluginLapseSince(pp, key, http.StatusOK, began)
 	}
 	keepPluginPlan(pp, key, u.Plan)
-	return quotaOfPlugin(q, u)
+	// a wallet's spend counted, for a cap to hold it (#5770)
+	return withWalletSpend(namedModelWindows(quotaOfPlugin(q, u), pp.Models), l.User, time.Now())
+}
+
+// namedModelWindows scopes each window that says no models but is named
+// by a model the provider serves to that model alone. Google AI Studio
+// limits each model's day on its own, and its plugin
+// (magpie-gemini-web's ai-studio) tells a model's cooldown as a window
+// named after it, full till the cooldown ends, with no model said. Read
+// as the whole account's, gemini-4-hydrogen's 429 held the account
+// from every model till the reset (WangYeruo on X), while argon still
+// answered. A window named otherwise ("所有模型", "5 hours") is the
+// whole account's, as before.
+func namedModelWindows(q SubscriptionQuota, models []plugin.Model) SubscriptionQuota {
+	if len(models) == 0 {
+		return q
+	}
+	for i, w := range q.Windows {
+		if w.Model != "" || w.matches != nil || w.Family != "" || w.Pool != "" || w.Text || w.Aside {
+			continue
+		}
+		name := strings.ToLower(strings.TrimSpace(w.Name))
+		if name == "" {
+			continue
+		}
+		for _, m := range models {
+			if strings.ToLower(m.ID) == name {
+				q.Windows[i].matches = idSetOf([]string{name}).has
+				break
+			}
+		}
+	}
+	return q
 }
 
 // quotaOfPlugin fills q with what the plugin told.
@@ -133,41 +168,130 @@ func quotaOfPlugin(q SubscriptionQuota, u plugin.Usage) SubscriptionQuota {
 		q.User = u.User
 	}
 	q.Balance, q.Renew, q.Error = u.Balance, u.Renew, u.Error
+	q.PluginError = u.Error != ""
 	if t, err := time.Parse(time.RFC3339, u.Until); err == nil {
 		q.Until = &t
 	}
 	if r := u.Resets; r != nil {
-		q.Resets = &ResetCredits{Count: r.Count, ByWindow: r.ByWindow, FiveHour: r.FiveHour, Weekly: r.Weekly}
+		q.Resets = &ResetCredits{Count: r.Count, ByWindow: r.ByWindow, FiveHour: r.FiveHour, Weekly: r.Weekly, Team: r.Team}
 		if t, err := time.Parse(time.RFC3339, r.Until); err == nil {
 			q.Resets.Until = &t
 		}
+		for _, e := range r.Each {
+			c := ResetCard{Window: e.Window}
+			if t, err := time.Parse(time.RFC3339, e.Until); err == nil {
+				c.Until = &t
+			}
+			q.Resets.Each = append(q.Resets.Each, c)
+		}
+		sortResetCards(q.Resets.Each)
 	}
 	for _, x := range u.Windows {
-		w := QuotaWindow{Name: x.Name, Used: x.Used, ResetSecs: x.ResetSecs, Display: x.Display,
+		w := QuotaWindow{Name: x.Name, ResetSecs: x.ResetSecs, Display: x.Display,
 			Amount: x.Amount, Limit: x.Limit, Unit: x.Unit,
-			Span: time.Duration(x.Span * float64(time.Second)), Model: strings.ToLower(x.Model), Aside: x.Aside}
+			Span: time.Duration(x.Span * float64(time.Second)), Model: strings.ToLower(x.Model), Aside: x.Aside,
+			Pool: x.Pool, Family: x.Family}
+		if x.Balance != nil {
+			// a wallet's balance: a reading, though it tells no share (#3950)
+			b := *x.Balance
+			w.Balance = &b
+		}
+		used := x.Used
+		if used == nil && x.Limit > 0 && x.Amount > 0 && x.Balance == nil {
+			// the plugin told the window's count and not its share: the share
+			// is the count's. Before, such a window was text alone and an
+			// account with no other was unknown to routing (plugins#468). An
+			// amount of 0 is what a count left out reads as, so it says
+			// nothing yet.
+			u := x.Amount / x.Limit * 100
+			used = &u
+		}
+		if used != nil {
+			w.Used = *used
+		} else if x.Aside {
+			// a window set aside that says no share: its Used is 0 for want
+			// of one said, not a reading at 0, which quota history drew as
+			// a flat 100% left line (#4825)
+			w.noShare = true
+		} else if x.Balance == nil {
+			// the plugin didn't say how much of it is used: its text is all
+			// there is, and routing has no share to count (#3650)
+			w.Text, w.Aside = true, true
+		}
+		// a row set aside with text and nothing counted is that text: a
+		// window that counts nothing yet says 0 with a count, or with no
+		// text, and one that stops the account is a reading at 0
+		w.Text = w.Text || x.Aside && x.Display != "" && (used == nil || *used == 0) && x.Amount == 0 && x.Limit == 0 && x.Balance == nil
+		if x.Credits && used != nil && !w.Text {
+			// the account goes on past it on credits it holds: routed as
+			// used, with the account on its credits (Allowance.OnCredits);
+			// aside only for a magpie that doesn't know it
+			w.Aside, w.Credits = false, true
+		}
 		if t, err := time.Parse(time.RFC3339, x.ResetsAt); err == nil {
 			w.ResetsAt = &t
 		}
-		if set := lowerSet(x.Models); set != nil {
-			w.matches = func(model string) bool { return set[strings.ToLower(model)] }
-		} else if set := lowerSet(x.NotModels); set != nil {
-			w.matches = func(model string) bool { return !set[strings.ToLower(model)] }
+		if t, err := time.Parse(time.RFC3339, x.RunsOutAt); err == nil {
+			w.RunsOutAt, w.RunsOut = &t, x.RunsOut
+		}
+		if set := idSetOf(x.Models); set != nil {
+			w.matches = set.has
+		} else if set := idSetOf(x.NotModels); set != nil {
+			w.matches = func(model string) bool { return !set.has(model) }
 		}
 		q.Windows = append(q.Windows, w)
 	}
 	return q
 }
 
-func lowerSet(ids []string) map[string]bool {
-	if len(ids) == 0 {
+// idSet is the models a plugin's window lists (models or notModels), in
+// lower case. A plugin that offers a model at its context sizes lists it by
+// those (Cursor's grok-4.7@256k, grok-4.7@500k), while the model is still
+// asked for by its bare id (grok-4.7, picked before the list had sizes,
+// which the plugin runs at its default size): that is the same model, on
+// the same allowance. So a bare id is in the set when one of its @sizes
+// is, and an @size when its bare id is (Will on Discord). Any other suffix
+// (ZCode's -Trial) names a model of its own, and one @size doesn't stand
+// for another.
+type idSet struct {
+	ids  map[string]bool
+	bare map[string]bool // the bare id of each listed id@size
+}
+
+func idSetOf(list []string) *idSet {
+	if len(list) == 0 {
 		return nil
 	}
-	m := map[string]bool{}
-	for _, id := range ids {
-		m[strings.ToLower(id)] = true
+	s := &idSet{ids: map[string]bool{}, bare: map[string]bool{}}
+	for _, id := range list {
+		id = strings.ToLower(id)
+		s.ids[id] = true
+		if b, ok := bareID(id); ok {
+			s.bare[b] = true
+		}
 	}
-	return m
+	return s
+}
+
+func (s *idSet) has(model string) bool {
+	model = strings.ToLower(model)
+	if s.ids[model] {
+		return true
+	}
+	if b, ok := bareID(model); ok {
+		return s.ids[b]
+	}
+	return s.bare[model]
+}
+
+// bareID is id without the @size a plugin names a context size with
+// (grok-4.7@256k → grok-4.7), and whether it had one.
+func bareID(id string) (string, bool) {
+	i := strings.LastIndexByte(id, '@')
+	if i <= 0 {
+		return id, false
+	}
+	return id[:i], true
 }
 
 // pluginUsageFetches are a card's fetch for each plugin account that
@@ -184,8 +308,7 @@ func pluginUsageFetches(via func(string) context.Context, hidden, placed map[str
 		if len(ls) == 0 {
 			continue
 		}
-		name, icon := pluginCard(pp)
-		out = append(out, perLogin(via(id), ls, name, icon)...)
+		out = append(out, perLogin(via(id), ls, pluginCardFace(pp))...)
 	}
 	return out
 }
@@ -194,8 +317,7 @@ func pluginUsageFetches(via func(string) context.Context, hidden, placed map[str
 func pluginUsageFetchesOf(via func(string) context.Context, id string) []func() SubscriptionQuota {
 	for _, pp := range plugin.Cached() {
 		if pp.ID == id {
-			name, icon := pluginCard(pp)
-			return perLogin(via(id), pluginUsageLogins(pp), name, icon)
+			return perLogin(via(id), pluginUsageLogins(pp), pluginCardFace(pp))
 		}
 	}
 	return nil
@@ -208,4 +330,14 @@ func (a *Account) UsageAgent() string {
 		return "plugin:" + a.plugin.ID
 	}
 	return a.Agent
+}
+
+// PluginAllowanceForTest is the allowance a plugin's usage answer gives
+// routing, for the gateway's tests.
+func PluginAllowanceForTest(usage []byte, now time.Time) Allowance {
+	var u plugin.Usage
+	if json.Unmarshal(usage, &u) != nil {
+		return nil
+	}
+	return allowanceOf(quotaOfPlugin(SubscriptionQuota{}, u).Windows, now)
 }

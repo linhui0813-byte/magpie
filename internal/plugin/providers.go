@@ -1,17 +1,24 @@
 package plugin
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
+	"math"
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/yetone/magpie/internal/filememo"
+	"github.com/yetone/magpie/internal/lastgood"
 	"github.com/yetone/magpie/internal/settings"
 	"github.com/yetone/magpie/internal/steady"
 )
@@ -21,10 +28,23 @@ import (
 type Method struct {
 	Type  string `json:"type"`
 	Label string `json:"label"`
+	// Labels is Label by the window's language ("zh", "zh-TW", "ja",
+	// "de"), magpie's own field beside OpenCode's (host.js byLang)
+	Labels map[string]string `json:"labels,omitempty"`
 	// Placeholder is the hint an "api" method gives in its key's field
 	// (magpie's own field: OpenCode's says "API key")
 	Placeholder string `json:"placeholder,omitempty"`
+	// Keyless skips personal-key entry; authorize supplies the credential.
+	Keyless bool `json:"keyless,omitempty"`
+	// KeyAsked is an "api" method whose own prompts ask its key: its
+	// authorize turns their answers into it (host.js keyAsked), so no key
+	// is asked beside them.
+	KeyAsked bool `json:"keyAsked,omitempty"`
 }
+
+// NoKey is whether an "api" method is signed in to with no key of
+// magpie's asking: keyless, or its prompts ask the key.
+func (m Method) NoKey() bool { return m.Keyless || m.KeyAsked }
 
 // KeyTitle is what an "api" method's key is asked as: its label, as
 // OpenCode's dialog titles it, unless that only says "API key" (or
@@ -35,6 +55,17 @@ func (m Method) KeyTitle(name string) string {
 		return name + " API key"
 	}
 	return l
+}
+
+// Cost is a model's price as a plugin gives it: OpenCode's cost, in USD
+// per 1M tokens, 0 where it gives none.
+type Cost struct {
+	Input  float64 `json:"input"`
+	Output float64 `json:"output"`
+	Cache  struct {
+		Read  float64 `json:"read"`
+		Write float64 `json:"write"`
+	} `json:"cache"`
 }
 
 // Model is a model a plugin's provider serves, as OpenCode lists it.
@@ -62,13 +93,56 @@ type Model struct {
 	// m.rateWas); 0 is none.
 	Rate    float64 `json:"rate"`
 	RateWas float64 `json:"rateWas"`
-	Cost    *struct {
-		Input  float64 `json:"input"`
-		Output float64 `json:"output"`
-	} `json:"cost"`
+	// Cost is the model's price as the plugin gives it (Devin's own list,
+	// 0.1.18)
+	Cost *Cost `json:"cost"`
 	// ImageSaid is whether the plugin (or models.dev) said if it takes
 	// images: Image false without it is not known
 	ImageSaid bool `json:"imageSaid"`
+	// Inputs and Outputs are the kinds capabilities.input and .output say
+	// the model takes and gives (text, image, audio, video, pdf), in
+	// OpenCode's order: not image alone (#1595)
+	Inputs  []string `json:"inputs,omitempty"`
+	Outputs []string `json:"outputs,omitempty"`
+	// OutputsSaid is whether capabilities.output said yes or no to any
+	// kind: an embedding's {"text": false} gives no Outputs and is still
+	// said (#3279), where a model said nothing of gives none and isn't
+	OutputsSaid bool `json:"outputsSaid,omitempty"`
+	// Temperature is whether the model takes temperature and top_p, where
+	// something said so: the config model's temperature (Factory's OpenAI
+	// route, plugins#154), models.dev's own, or the models hook's. Unsaid
+	// is nil, which keeps what the client sent.
+	Temperature *bool `json:"temperature,omitempty"`
+	// InputsSaid is whether capabilities.input is someone's word on what
+	// the model takes (models.dev, the config, the plugin's own models
+	// hook): the host's default for a config model said nothing of, input
+	// {"text": true} alone, is nobody's word (#1595, #4436)
+	InputsSaid bool `json:"inputsSaid,omitempty"`
+	// Fast is set by the plugin on a model it runs in its vendor's fast
+	// mode when the request says service_tier "priority" (m.fast: Cursor's
+	// plugin from 0.2.2, for a model Cursor has a fast variant of)
+	Fast bool `json:"fast"`
+	// ServiceTiers are the service tiers the plugin says its vendor serves
+	// the model at (m.serviceTiers: "priority", "ultrafast"): Codex is
+	// offered them, and a request asking for one reaches the plugin's
+	// fetch with its service_tier (#2514)
+	ServiceTiers []string `json:"serviceTiers,omitempty"`
+	// Decides is set by the plugin on a model that answers System One's
+	// questions rather than a conversation (m.decides: a decision model
+	// not named jev-…, Clef or a vendor's own). It counts only where the
+	// provider says it serves a decision API (Provider.Decide).
+	Decides bool `json:"decides,omitempty"`
+	// Searches is set by the plugin on a model that searches the web by
+	// itself when asked in plain words (m.searches: Trae's search model),
+	// which magpie may then search with for other models.
+	Searches bool `json:"searches,omitempty"`
+	// Also are the AI SDK packages of the other APIs the plugin says its
+	// vendor serves the model on besides its own (NPM), as the packages
+	// name them (m.also: Open Design's amr-link serves every model on
+	// chat completions, Responses and Anthropic's messages, plugins#888).
+	// A client's request on one of them is relayed there as it was sent,
+	// not translated to the model's own API (gaubeebangeel on X).
+	Also []string `json:"also,omitempty"`
 }
 
 // Provider is a provider a plugin signs in to.
@@ -86,7 +160,36 @@ type Provider struct {
 	Usage bool `json:"usage"`
 	// Checkin says the plugin presses its vendor's daily check-in for each
 	// account (auth.checkin)
-	Checkin   bool    `json:"checkin,omitempty"`
+	Checkin bool `json:"checkin,omitempty"`
+	// Calls says the plugin lists each account's calls made outside
+	// magpie, for the Usage page (auth.calls)
+	Calls bool `json:"calls,omitempty"`
+	// Renews says the plugin renews its accounts' sign-ins through magpie
+	// (auth.refresh) and lets the gateway's magpie do it in the background
+	// as each comes due (auth.keepAlive not false); RenewLead is how long
+	// before a token expires it is due, in milliseconds (auth.refreshLead,
+	// 5 minutes when not said), as the host reckons it (RenewAt).
+	Renews    bool  `json:"renews,omitempty"`
+	RenewLead int64 `json:"renewLead,omitempty"`
+	// Rotating is the auth hook declaring that the vendor spends a refresh
+	// token once (auth.rotating): renewed, the old one is refused
+	// (invalid_grant). Two computers holding a copy would race to renew it
+	// and the loser is signed out for good, so its sign-ins are never
+	// carried by a backup or a sync (provider.CollectSignIns, #5583).
+	Rotating bool `json:"rotating,omitempty"`
+	// Options are the switches the plugin declares for the provider
+	// (auth.options, #2038), as the host checked them
+	Options []Option `json:"options,omitempty"`
+	// Decide says the plugin serves a decision API (TypeSafe's System
+	// One) for this provider: its config hook set decide on it. magpie
+	// posts the questions to the provider's own base, at /systemone,
+	// through the plugin's fetch (#1514).
+	Decide bool `json:"decide,omitempty"`
+	// Searches says the provider's upstream answers a web search tool
+	// offered on its Anthropic or Responses API by itself, as a custom
+	// provider's Searches does (#825): its config hook set searches on it
+	// (#2027), for a plugin in front of Claude's or Codex's API.
+	Searches  bool    `json:"searches,omitempty"`
 	SignedIn  bool    `json:"signedIn"`
 	AuthType  string  `json:"authType"`
 	AccountID string  `json:"accountId"`
@@ -100,12 +203,83 @@ type Provider struct {
 	// Accounts are the accounts signed in to it, the one kept under its
 	// own id first; SignedIn, AuthType and AccountID are that one's.
 	Accounts []Account `json:"accounts"`
+	// Single is the auth hook declaring that sign-in replaces one identity.
+	Single bool `json:"single,omitempty"`
+	// Importable says the plugin takes accounts from a file the user picks
+	// (auth.import, magpie's own hook); ImportFrom is which file, as the
+	// plugin says it, and ImportFroms the same in other languages.
+	Importable  bool              `json:"importable,omitempty"`
+	ImportFrom  string            `json:"importFrom,omitempty"`
+	ImportFroms map[string]string `json:"importFroms,omitempty"`
+	// CLI is the vendor CLI the plugin runs through and can install itself
+	// (auth.cli, magpie's own hook): a sign-in on a machine without it,
+	// magpie in a container above all, installs it first (CLIInstalled,
+	// InstallCLI). nil for a plugin that names none.
+	CLI *CLI `json:"cli,omitempty"`
 	// MaxConcurrency is how many requests the plugin says each of its
 	// accounts takes at once (magpie's own field, which OpenCode ignores:
 	// the auth hook's maxConcurrency, else package.json's
 	// magpie.maxConcurrency); 0 for none said. The user's setting on the
 	// provider goes over it.
 	MaxConcurrency int `json:"maxConcurrency,omitempty"`
+	// MaxAccounts is how many of its accounts the plugin says may take
+	// requests at the same time (the auth hook's maxAccounts, else
+	// package.json's magpie.maxAccounts: a vendor that blocks an address
+	// asking for more accounts at once); 0 for none said. The user's
+	// setting on the provider goes over it.
+	MaxAccounts int `json:"maxAccounts,omitempty"`
+}
+
+// Option is a switch a plugin declares for its provider (auth.options,
+// #2038): magpie shows it, keeps the user's value in settings'
+// PluginOptions and hands it to the plugin (input.magpie.option). A change
+// has the providers listed again (SetProviderOptions); nothing else runs.
+type Option struct {
+	Key         string `json:"key"`
+	Label       string `json:"label"`
+	Description string `json:"description,omitempty"`
+	Default     bool   `json:"default,omitempty"`
+	// Confirm is asked before the switch is turned on, when the plugin
+	// says turning it on does something the user should agree to
+	Confirm string `json:"confirm,omitempty"`
+	// Labels, Descriptions and Confirms are the same words in the window's
+	// other languages, by its language ("zh", "zh-TW", "ja", "de"), as a
+	// page's Titles are (plugins#590); the plain ones are the fallback
+	Labels       map[string]string `json:"labels,omitempty"`
+	Descriptions map[string]string `json:"descriptions,omitempty"`
+	Confirms     map[string]string `json:"confirms,omitempty"`
+	// FiltersModels says the plugin's model list leaves models out while
+	// the switch is on (WorkBuddy's "Free models only"): the editor says
+	// so by the models
+	FiltersModels bool `json:"filtersModels,omitempty"`
+	// Placement is where the editor draws the switch: "top" under the
+	// accounts, above Routing, for a switch about the whole plugin
+	// (#5269); "" under the models
+	Placement string `json:"placement,omitempty"`
+}
+
+// OptionOn is option o of a provider as it stands with the user's values
+// in chosen (settings' PluginOptions): theirs, else the plugin's default.
+func OptionOn(chosen map[string]map[string]bool, provider string, o Option) bool {
+	if v, ok := chosen[provider][o.Key]; ok {
+		return v
+	}
+	return o.Default
+}
+
+// SetProviderOptions hands the user's option values (settings' PluginOptions) to
+// the host running now; a host started later reads them at its start. The
+// providers kept are asked again after: a models hook may list by an
+// option (WorkBuddy's "Free models only", plugins#430), and the list
+// follows the switch without a restart.
+func SetProviderOptions(ctx context.Context) error {
+	if !Running() {
+		forgetProviders()
+		return nil
+	}
+	err := Call(ctx, "setProviderOptions", map[string]any{"options": settings.Load().PluginOptions}, nil)
+	forgetProviders()
+	return err
 }
 
 // Account is one account a provider is signed in to: Key is where
@@ -136,6 +310,9 @@ var (
 	// provEpoch counts the invalidations (forgetProviders), so a refresh
 	// that began before one doesn't put what it read over the newer state.
 	provEpoch uint64
+	// provSettling is set while Settle runs: no refresh starts, nor goes
+	// on to a newer invalidation, to start a host in a folder going away.
+	provSettling bool
 )
 
 func providersPath() string { return filepath.Join(settings.Dir(), "plugin-providers.json") }
@@ -165,7 +342,7 @@ func forgetProviders() {
 // need be, and keeps the answer for Cached.
 func Providers(ctx context.Context) ([]Provider, error) {
 	var ps []Provider
-	if err := Call(ctx, "providers", map[string]any{"proxies": listingProxies()}, &ps); err != nil {
+	if err := Call(ctx, "providers", listingArgs(), &ps); err != nil {
 		return nil, err
 	}
 	ps = commitProviders(ps, nil)
@@ -187,12 +364,34 @@ func commitProviders(ps []Provider, epoch *uint64) []Provider {
 	}
 	ps = keepListed(ps, provCache)
 	ps = keepUnloaded(ps, provCache)
+	was := provCache
 	provCache, provGood, provTried = ps, true, true
 	provMu.Unlock()
-	if b, err := json.Marshal(ps); err == nil {
+	b, err := json.Marshal(ps)
+	if err == nil {
+		if was == nil {
+			// what an earlier run kept: a start that lists the same is no
+			// change
+			if kept, err := steady.ReadFile(providersPath()); err == nil {
+				_ = json.Unmarshal(kept, &was)
+			}
+		}
 		_ = writeWhole(providersPath(), b)
 	}
+	if err != nil || !sameList(was, b) {
+		listed()
+	}
 	return ps
+}
+
+// sameList reports whether the providers was and the list b marshals to
+// say the same.
+func sameList(was []Provider, b []byte) bool {
+	if was == nil {
+		return false
+	}
+	w, err := json.Marshal(was)
+	return err == nil && bytes.Equal(w, b)
 }
 
 // refreshDeadline bounds one providers RPC after host initialization: a plugin host
@@ -213,7 +412,7 @@ var (
 // under still stood. Tests replace it to stall or fail an ask without Bun.
 var refreshProviders = func(ctx context.Context, epoch uint64) error {
 	var ps []Provider
-	if err := callWithTimeout(ctx, "providers", map[string]any{"proxies": listingProxies()}, &ps, refreshDeadline); err != nil {
+	if err := callWithTimeout(ctx, "providers", listingArgs(), &ps, refreshDeadline); err != nil {
 		return err
 	}
 	commitProviders(ps, &epoch)
@@ -261,7 +460,7 @@ func refreshProvidersInBackground(ctx context.Context, epoch uint64) {
 		}
 		provMu.Lock()
 		provCancel()
-		if provEpoch != epoch && !provGood && !provTried {
+		if provEpoch != epoch && !provGood && !provTried && !provSettling {
 			epoch = provEpoch
 			ctx, provCancel = context.WithCancel(context.Background())
 			provTried = true
@@ -279,6 +478,26 @@ func refreshProvidersInBackground(ctx context.Context, epoch uint64) {
 // magpie keeps, which know them.
 var ProxyFor func(provider, key string) string
 
+// ListingOff is the plugin providers (by the plugin's own id) switched off
+// in magpie: set by the providers magpie keeps, which know them. A
+// listing asks none of them their models (ChangQiu on Discord): Off means no request
+// goes to the provider, and a models hook asks its vendor, renewing the
+// sign-in first.
+var ListingOff func() []string
+
+// listingArgs is what a providers call is given: the proxies each list is
+// asked through, and the providers not to ask (ListingOff), which keep the
+// list they told last.
+func listingArgs() map[string]any {
+	args := map[string]any{"proxies": listingProxies()}
+	if ListingOff != nil {
+		if off := ListingOff(); len(off) > 0 {
+			args["off"] = off
+		}
+	}
+	return args
+}
+
 // listingProxies are the proxies each provider's model list is asked
 // through, by provider and account key ("" the provider's own): a
 // built-in's list is fetched through the account's proxy, so a plugin's
@@ -288,11 +507,7 @@ func listingProxies() map[string]map[string]string {
 	if ProxyFor == nil {
 		return out
 	}
-	var m map[string]json.RawMessage
-	if b, err := steady.ReadFile(AuthPath()); err == nil {
-		_ = json.Unmarshal(b, &m)
-	}
-	for k := range m {
+	for k := range authRaw() {
 		id := ProviderOf(k)
 		if out[id] == nil {
 			out[id] = map[string]string{"": forHost(ProxyFor(id, ""))}
@@ -353,16 +568,19 @@ func keepUnloaded(ps, last []Provider) []Provider {
 			_ = json.Unmarshal(b, &last)
 		}
 	}
-	told := map[string]bool{}
+	told, ids := map[string]bool{}, map[string]bool{}
 	for _, p := range ps {
-		told[p.Spec] = true
+		told[p.Spec], ids[p.ID] = true, true
 	}
 	installed := map[string]bool{}
 	for _, e := range list().Plugins {
 		installed[e.Spec] = true
 	}
 	for _, p := range last {
-		if installed[p.Spec] && !told[p.Spec] {
+		// a provider another plugin serves now (two plugins sign in to
+		// it, and the other was installed or picked for it) isn't kept as
+		// this one's too: it would be listed twice under one id
+		if installed[p.Spec] && !told[p.Spec] && !ids[p.ID] {
 			ps = append(ps, p)
 		}
 	}
@@ -383,22 +601,96 @@ func UseCached(ps []Provider) {
 	provMu.Unlock()
 	// as asked with the plugins as they are now
 	listSeen.Lock()
-	listSeen.stamp, listSeen.set = listStamp(), ps != nil
+	listSeen.stamp, listSeen.set = seenStamp(), ps != nil
 	listSeen.Unlock()
+}
+
+// Listed is every provider the plugins last listed, an off plugin's among
+// them, as Cached keeps them, with no sign-in read: false when no listing
+// is known (none kept, plugin-providers.json missing or unreadable), which
+// is never "no providers".
+func Listed() ([]Provider, bool) {
+	provMu.Lock()
+	ps := provCache
+	provMu.Unlock()
+	if ps != nil {
+		return slices.Clone(ps), true
+	}
+	b, err := steady.ReadFile(providersPath())
+	if err != nil || json.Unmarshal(b, &ps) != nil {
+		return nil, false
+	}
+	return ps, true
 }
 
 // refreshing is Cached's refreshes in the background.
 var refreshing sync.WaitGroup
 
+// ListInBackground sets whether Cached, finding the plugins not asked
+// since this magpie started or since they changed, asks them in the
+// background: true until it is set. The app, serve, web, tray and the TUI
+// do; a command that does its work and ends (magpie version, magpie group
+// <id>) reads what was listed last and asks nothing. Its ask started a
+// second plugin host beside the running gateway's, which the command left
+// running as it exited, its call to a browser-backed plugin's models still
+// pending: that orphan opened the same Chrome profiles as the gateway's
+// host, and Chrome refused them (#7146). It gives what was set before.
+func ListInBackground(on bool) (was bool) { return !noBackgroundList.Swap(!on) }
+
+var noBackgroundList atomic.Bool
+
 // Refreshed waits for Cached's refreshes in the background to end, the
 // host left running: for tests that watch the providers' list on disk.
 func Refreshed() { refreshing.Wait() }
 
-// Settle waits for Cached's refreshes to end, then stops the host: for
-// tests, whose folders the host runs in go when they end. Each ask is
-// bounded and the retries are few, so this waits a bounded time even for
-// a host that never answers.
+// Told waits for the hooks told of a change or a sign-in (OnChange,
+// OnSignIn) to end: for tests, so that a change one test made is not told
+// in the next, nor written into its folder as it goes.
+func Told() {
+	telling.Lock()
+	for telling.n > 0 {
+		telling.Wait()
+	}
+	telling.Unlock()
+}
+
+// Answered is whether what Cached gives now is the plugins' own answer,
+// rather than what was kept from before they were last asked. A page that
+// would otherwise read "signs in to nothing" out of an empty list can say
+// so only when this holds: an empty list before the answer arrives means
+// "not asked yet", not "none" (#1112).
+func Answered() bool {
+	provMu.Lock()
+	defer provMu.Unlock()
+	return provGood
+}
+
+// Settle waits for Cached's refreshes to end, stops the host, waits for
+// the hooks told of a change (Told) and forgets the plugins (UseCached
+// nil): for tests, whose folders the host runs in go when they end, so
+// the next test starts with nothing of this one's running or seen. Each
+// ask is bounded and the retries are few, so this waits a bounded time
+// even for a host that never answers.
+//
+// No refresh starts meanwhile: one a hook started after the last wait
+// went on once Settle had returned, and its host started in the test's
+// folder as it went, or in the next test's, while that one signed in
+// (#2449).
 func Settle() {
+	provMu.Lock()
+	provSettling = true
+	provMu.Unlock()
+	defer func() {
+		provMu.Lock()
+		provSettling = false
+		provMu.Unlock()
+	}()
+	refreshing.Wait()
+	Restart()
+	// what the host said of a sign-in is written before the folder goes
+	// (#1935); a hook that read the providers to know the account's
+	// started a host again, which goes too
+	Told()
 	refreshing.Wait()
 	Restart()
 	// and no host goes on finishing its calls in a folder going away
@@ -411,6 +703,15 @@ func Settle() {
 	for _, h := range hs {
 		h.stop()
 	}
+	// nor is the restart, or a sign-in a host saved, told in the next test
+	Told()
+	// and the plugins go with the folder: the next test's, in a folder of
+	// its own, are not taken for the plugins changed (checkList), nor
+	// answered with these
+	UseCached(nil)
+	cancelCatalogSyncs()
+	// nor a Bun download, which writes in the test's folder
+	endBunFetches()
 }
 
 // Cached is the plugins' providers as last asked, without starting the
@@ -424,9 +725,7 @@ func Cached() []Provider {
 	good := provGood
 	provMu.Unlock()
 	if ps == nil {
-		if b, err := steady.ReadFile(providersPath()); err == nil {
-			_ = json.Unmarshal(b, &ps)
-		}
+		ps = savedProviders()
 	}
 	if len(l.Plugins) == 0 {
 		return nil
@@ -465,7 +764,7 @@ func Cached() []Provider {
 		// Whether one is already in flight is read and set under one lock,
 		// so two callers asking at once start one refresh, not two.
 		provMu.Lock()
-		start := !provBusy && !provGood && !provTried
+		start := !provBusy && !provGood && !provTried && !provSettling && !noBackgroundList.Load()
 		var ctx context.Context
 		if start {
 			ctx, provCancel = context.WithCancel(context.Background())
@@ -481,14 +780,88 @@ func Cached() []Provider {
 	return out
 }
 
+// savedProviders is plugin-providers.json, what the plugins last listed,
+// parsed once for each version of the file: while the host hasn't
+// listed them (just started, or it can't start, offline or a plugin that
+// fails), every Cached read and decoded the whole file again, a few
+// hundred KB for each look at a model of a plugin. What it gives is
+// shared: the caller must not change it.
+func savedProviders() []Provider {
+	ps, _ := filememo.Read("plugin-providers", providersPath(), func(b []byte) ([]Provider, error) {
+		var ps []Provider
+		_ = json.Unmarshal(b, &ps) // what decodes is kept, as it always was
+		return ps, nil
+	})
+	return ps
+}
+
 type storedAuth struct {
-	Type      string `json:"type"`
-	AccountID string `json:"accountId"`
-	Email     string `json:"email"`
-	Key       string `json:"key"`
+	Type string `json:"type"`
+	// Expires is when an OAuth sign-in's token ends, in epoch
+	// milliseconds, as the host reads it (a number, or a string of one)
+	Expires   json.RawMessage `json:"expires"`
+	AccountID string          `json:"accountId"`
+	Email     string          `json:"email"`
+	Key       string          `json:"key"`
 	Metadata  struct {
 		Email string `json:"email"`
 	} `json:"metadata"`
+}
+
+// RenewAt is when the sign-in kept under key, an account of p, comes due
+// to be renewed in the background, as host.js's renewAt reckons it: an
+// OAuth sign-in's expires less p.RenewLead. False when it never does: p
+// doesn't renew in the background, the sign-in isn't OAuth, has no
+// expiry or isn't kept.
+func RenewAt(p Provider, key string) (time.Time, bool) {
+	if !p.Renews {
+		return time.Time{}, false
+	}
+	a, ok := readAuth()[key]
+	if !ok || a.Type != "oauth" {
+		return time.Time{}, false
+	}
+	exp, ok := expiresOf(a.Expires)
+	if !ok {
+		return time.Time{}, false
+	}
+	return time.UnixMilli(max(1, exp-p.RenewLead)), true
+}
+
+// expiresOf is a sign-in's expires as JavaScript's Number reads it, when
+// it is a time after the epoch.
+func expiresOf(raw json.RawMessage) (int64, bool) {
+	v := strings.TrimSpace(string(raw))
+	if s, err := strconv.Unquote(v); err == nil {
+		v = strings.TrimSpace(s)
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil || math.IsNaN(f) || math.IsInf(f, 0) || f <= 0 || f > math.MaxInt64/2 {
+		return 0, false
+	}
+	return int64(f), true
+}
+
+// KeptSignedIn is what came of KeepSignedIn: Due false, the sign-in
+// wasn't due (renewed meanwhile); Renewed, it is a new one; else Err is
+// why it couldn't be, Gone whether the vendor turned it away for good
+// (the host marks the account, as OnSignIn tells), and Waiting that a
+// renewal failed lately and isn't tried again yet.
+type KeptSignedIn struct {
+	Due     bool   `json:"due"`
+	Renewed bool   `json:"renewed"`
+	Waiting bool   `json:"waiting"`
+	Gone    bool   `json:"gone"`
+	Err     string `json:"error"`
+}
+
+// KeepSignedIn renews account's sign-in of provider if it is due, as a
+// request on it would, under the same once-at-a-time renewal and lock,
+// and waits for it.
+func KeepSignedIn(ctx context.Context, provider, account string) (KeptSignedIn, error) {
+	var k KeptSignedIn
+	err := Call(ctx, "keepSignedIn", map[string]any{"provider": provider, "account": account, "proxy": proxyOf(ctx)}, &k)
+	return k, err
 }
 
 // ProviderOf is the provider an account key is one of.
@@ -532,13 +905,61 @@ func firstNonEmpty(ss ...string) string {
 	return ""
 }
 
+// readAuth is plugin-auth.json's sign-ins as storedAuth, by key. What it
+// returns is shared: the caller must not change it.
 func readAuth() map[string]storedAuth {
-	var m map[string]storedAuth
-	if b, err := steady.ReadFile(AuthPath()); err == nil {
-		_ = json.Unmarshal(b, &m)
-	}
+	m, _ := filememo.Read("plugin-auth:stored", AuthPath(), func(b []byte) (map[string]storedAuth, error) {
+		raw, err := parseAuth(b)
+		out := make(map[string]storedAuth, len(raw))
+		for k, v := range raw {
+			var a storedAuth
+			_ = json.Unmarshal(v, &a)
+			out[k] = a
+		}
+		return out, err
+	})
 	return m
 }
+
+// authRaw is plugin-auth.json's sign-ins by key, each as it is written.
+// What it returns is shared: the caller must not change it.
+func authRaw() map[string]json.RawMessage {
+	m, _ := filememo.Read("plugin-auth", AuthPath(), parseAuth)
+	return m
+}
+
+// authParses counts plugin-auth.json's parses, for tests.
+var authParses atomic.Int64
+
+// parseAuth is plugin-auth.json's contents b, or its last good generation
+// when b doesn't read (#1505). It is parsed once for each version of the
+// file (filememo): the providers' every build read it whole, and parsed
+// it twice over, for each plugin signed in to, on every request the
+// gateway served (#2502).
+func parseAuth(b []byte) (map[string]json.RawMessage, error) {
+	authParses.Add(1)
+	var m map[string]json.RawMessage
+	if json.Unmarshal(b, &m) != nil {
+		bak, err := lastgood.Fallback(AuthPath(), b, validAuth)
+		if err != nil {
+			return nil, err
+		}
+		m = nil
+		_ = json.Unmarshal(bak, &m)
+	}
+	return m, nil
+}
+
+// validAuth is plugin-auth.json's contents: one object of sign-ins.
+func validAuth(b []byte) bool {
+	var m map[string]json.RawMessage
+	return json.Unmarshal(b, &m) == nil
+}
+
+// readAuthFile is plugin-auth.json, or its last good generation when a
+// crash left it all zero (#1505): sign-ins that don't read are unknown,
+// never none.
+func readAuthFile() ([]byte, error) { return lastgood.Read(AuthPath(), validAuth) }
 
 // SignedIn is whether a plugin sign-in is kept for provider.
 func SignedIn(provider string) bool {
@@ -547,14 +968,19 @@ func SignedIn(provider string) bool {
 
 // Prompt is a question a sign-in method asks before it starts.
 type Prompt struct {
-	Type        string `json:"type"` // text, select
-	Key         string `json:"key"`
-	Message     string `json:"message"`
-	Placeholder string `json:"placeholder,omitempty"`
+	Type    string `json:"type"` // text, select, password (text typed unseen, #1982)
+	Key     string `json:"key"`
+	Message string `json:"message"`
+	// Messages, an option's Labels and Hints are those words by the
+	// window's language, as Method.Labels
+	Messages    map[string]string `json:"messages,omitempty"`
+	Placeholder string            `json:"placeholder,omitempty"`
 	Options     []struct {
-		Label string `json:"label"`
-		Value string `json:"value"`
-		Hint  string `json:"hint,omitempty"`
+		Label  string            `json:"label"`
+		Value  string            `json:"value"`
+		Hint   string            `json:"hint,omitempty"`
+		Labels map[string]string `json:"labels,omitempty"`
+		Hints  map[string]string `json:"hints,omitempty"`
 	} `json:"options,omitempty"`
 }
 
@@ -591,6 +1017,9 @@ type Authorization struct {
 	URL          string `json:"url"`
 	Instructions string `json:"instructions"`
 	Method       string `json:"method"`
+	// Opened is a page the plugin (its vendor's CLI) opened already, not
+	// to be opened again
+	Opened bool `json:"opened"`
 }
 
 // NewAccount is the account a sign-in goes to when it is a new one: the
@@ -598,11 +1027,24 @@ type Authorization struct {
 // already signed in replaces that one's instead.
 const NewAccount = "new"
 
-// Authorize begins an OAuth sign-in to account (a key, or NewAccount).
+// Authorize begins an OAuth sign-in to account (a key, or NewAccount),
+// through the proxy ctx names (netproxy.With): the plugin's requests for
+// it, there and in Finish, go through that one (#1663).
+// A plugin that can't start one says why ({ type: "failed", error }), and
+// that is the error (plugins#658).
 func Authorize(ctx context.Context, provider string, method int, inputs map[string]string, account string) (Authorization, error) {
-	var a Authorization
-	err := Call(ctx, "authorize", map[string]any{"provider": provider, "method": method, "inputs": inputs, "account": account}, &a)
-	return a, err
+	var r struct {
+		OK    bool   `json:"ok"`
+		Error string `json:"error"`
+		Authorization
+	}
+	if err := Call(ctx, "authorize", map[string]any{"provider": provider, "method": method, "inputs": inputs, "account": account, "proxy": proxyOf(ctx)}, &r); err != nil {
+		return Authorization{}, err
+	}
+	if !r.OK {
+		return Authorization{}, failure(r.Error)
+	}
+	return r.Authorization, nil
 }
 
 // Saved is where a sign-in was kept: the provider (a plugin may sign in
@@ -624,8 +1066,8 @@ func failure(why string) error {
 }
 
 // Finish waits for an OAuth sign-in to finish: an "auto" one on its own,
-// a "code" one with the code pasted back. It gives where the sign-in was
-// saved.
+// a "code" one with the code pasted back, through the proxy Authorize was
+// given. It gives where the sign-in was saved.
 func Finish(ctx context.Context, session, code string) (Saved, error) {
 	var r struct {
 		OK    bool   `json:"ok"`
@@ -642,20 +1084,70 @@ func Finish(ctx context.Context, session, code string) (Saved, error) {
 }
 
 // APIKey signs in to account (a key, or NewAccount) with a key, as an
-// "api" method does.
+// "api" method does, through the proxy ctx names.
 func APIKey(ctx context.Context, provider string, method int, inputs map[string]string, key, account string) (Saved, error) {
 	var r struct {
 		OK    bool   `json:"ok"`
 		Error string `json:"error"`
 		Saved
 	}
-	if err := Call(ctx, "apiKey", map[string]any{"provider": provider, "method": method, "inputs": inputs, "key": key, "account": account}, &r); err != nil {
+	if err := Call(ctx, "apiKey", map[string]any{"provider": provider, "method": method, "inputs": inputs, "key": key, "account": account, "proxy": proxyOf(ctx)}, &r); err != nil {
 		return Saved{}, err
 	}
 	if !r.OK {
 		return Saved{}, failure(r.Error)
 	}
 	return r.Saved, nil
+}
+
+// Imported is one account a plugin's import from a file gave: Status
+// "added", "updated" (the account was signed in already) or "failed",
+// with why; Provider and Account are where it is kept.
+type Imported struct {
+	Status   string `json:"status"`
+	User     string `json:"user"`
+	Error    string `json:"error"`
+	Provider string `json:"provider"`
+	Account  string `json:"account"`
+}
+
+// ImportFiles hands the texts of the files the user picked to provider's
+// import hook (auth.import) and keeps each account it took, through the
+// proxy ctx carries.
+func ImportFiles(ctx context.Context, provider string, texts []string) ([]Imported, error) {
+	var r struct {
+		Results []Imported `json:"results"`
+	}
+	if err := Call(ctx, "importFiles", map[string]any{"provider": provider, "texts": texts, "proxy": proxyOf(ctx)}, &r); err != nil {
+		return nil, err
+	}
+	return r.Results, nil
+}
+
+// CLI is a vendor CLI a plugin can install: its name, and how a person
+// installs it, told when the plugin's install fails ("" for none said).
+type CLI struct {
+	Name   string `json:"name"`
+	Manual string `json:"manual,omitempty"`
+}
+
+// CLIInstalled asks the plugin whether the CLI its Provider.CLI names is
+// on this machine.
+func CLIInstalled(ctx context.Context, provider string) (bool, error) {
+	var r struct {
+		Installed bool `json:"installed"`
+	}
+	if err := Call(ctx, "cliInstalled", map[string]any{"provider": provider}, &r); err != nil {
+		return false, err
+	}
+	return r.Installed, nil
+}
+
+// InstallCLI has the plugin install the CLI its Provider.CLI names,
+// through the proxy ctx carries; it returns once the plugin says it is
+// there, or why not.
+func InstallCLI(ctx context.Context, provider string) error {
+	return Call(ctx, "installCli", map[string]any{"provider": provider, "proxy": proxyOf(ctx)}, nil)
 }
 
 // SignOut forgets one account of the provider's, every one when account
@@ -667,9 +1159,12 @@ func SignOut(ctx context.Context, provider, account string) error {
 	unlock := lockAuth()
 	defer unlock()
 	var m map[string]json.RawMessage
-	b, err := steady.ReadFile(AuthPath())
-	if err != nil {
+	b, err := readAuthFile()
+	if errors.Is(err, fs.ErrNotExist) {
 		return nil
+	}
+	if err != nil {
+		return err // sign-ins that don't read are not written over
 	}
 	if err := json.Unmarshal(b, &m); err != nil {
 		return err
@@ -680,6 +1175,9 @@ func SignOut(ctx context.Context, provider, account string) error {
 		}
 	}
 	b, _ = json.MarshalIndent(m, "", "  ")
+	if err := lastgood.Keep(AuthPath(), validAuth, 0o600); err != nil {
+		return err
+	}
 	if err := writeWhole(AuthPath(), append(b, '\n')); err != nil {
 		return err
 	}
@@ -773,15 +1271,15 @@ func Check(ctx context.Context, provider, account string) (Checked, error) {
 
 // Auths are provider's sign-ins as plugin-auth.json keeps them, by key.
 func Auths(provider string) map[string]map[string]any {
-	var m map[string]map[string]any
-	if b, err := steady.ReadFile(AuthPath()); err == nil {
-		_ = json.Unmarshal(b, &m)
-	}
 	out := map[string]map[string]any{}
-	for k, v := range m {
-		if ProviderOf(k) == provider {
-			out[k] = v
+	for k, v := range authRaw() {
+		if ProviderOf(k) != provider {
+			continue
 		}
+		// the caller's own: decoded afresh from what is shared
+		var a map[string]any
+		_ = json.Unmarshal(v, &a)
+		out[k] = a
 	}
 	return out
 }
@@ -825,11 +1323,16 @@ type UsageResets struct {
 	ByWindow bool   `json:"byWindow"`
 	FiveHour int    `json:"fiveHour"`
 	Weekly   int    `json:"weekly"`
+	Team     bool   `json:"team"` // a team plan's, not the person's own
+	Each     []struct {
+		Until  string `json:"until"` // RFC 3339, "": it never runs out
+		Window string `json:"window"`
+	} `json:"each"`
 }
 
 type UsageWindow struct {
 	Name      string   `json:"name"`
-	Used      float64  `json:"used"`     // percent
+	Used      *float64 `json:"used"`     // percent; nil when the plugin didn't say
 	ResetsAt  string   `json:"resetsAt"` // RFC 3339
 	ResetSecs int64    `json:"resetSecs"`
 	Display   string   `json:"display"`
@@ -841,16 +1344,37 @@ type UsageWindow struct {
 	Models    []string `json:"models"`
 	NotModels []string `json:"notModels"`
 	Aside     bool     `json:"aside"`
+	// Pool is the group of models that share one allowance, and Family the
+	// model family a per-model window belongs to, as Antigravity's quota
+	// says them (QuotaWindow.Pool, QuotaWindow.Family)
+	Pool   string `json:"pool"`
+	Family string `json:"family"`
+	// RunsOutAt (RFC 3339) is when the soonest credits left in the window
+	// are lost, and RunsOut how many, when the vendor's credits expire
+	// apart from the window's reset (WorkBuddy's packages)
+	RunsOutAt string  `json:"runsOutAt"`
+	RunsOut   float64 `json:"runsOut"`
+	// Credits: used up, the window doesn't stop the account, which goes on
+	// past it on credits it holds and its vendor spends after the
+	// window's (a Kiro trial's). Sent with Aside, which a magpie that
+	// doesn't know it goes by (provider.QuotaWindow.Credits).
+	Credits bool `json:"credits"`
+	// Balance is how much is left in Unit, a prepaid wallet's reading,
+	// with no share to tell (#3950); nil when the plugin didn't say.
+	Balance *float64 `json:"balance"`
 }
 
 // Checkin is what came of an account's daily check-in, as the plugin's
 // auth.checkin said: Outcome is one of claimed, done, ineligible,
-// inactive, captcha and failed.
+// inactive, captcha and failed. Until (RFC 3339, "" when not told) is when
+// the vendor's own day turns and the answer stops holding: Qoder's daily
+// credits open at 10:00 UTC+8, not at Beijing midnight.
 type Checkin struct {
 	Outcome string  `json:"outcome"`
 	Credit  float64 `json:"credit"`
 	Streak  int     `json:"streak"`
 	Message string  `json:"message"`
+	Until   string  `json:"until"`
 }
 
 // AccountCheckin asks the plugin to check account of provider in for the
@@ -859,6 +1383,32 @@ func AccountCheckin(ctx context.Context, provider, account string) (Checkin, err
 	var c Checkin
 	err := Call(ctx, "checkin", map[string]any{"provider": provider, "account": account, "proxy": proxyOf(ctx)}, &c)
 	return c, err
+}
+
+// OutsideCall is one call an account made outside magpie, as the plugin's
+// auth.calls said it: RID is the vendor's id of it, T its time (epoch ms),
+// In the input tokens with the cache apart, Cost its USD price as the
+// vendor gave it (nil when not said), Session the conversation it was in.
+type OutsideCall struct {
+	RID        string   `json:"rid"`
+	T          int64    `json:"t"`
+	Model      string   `json:"model"`
+	In         int64    `json:"in"`
+	Out        int64    `json:"out"`
+	CacheRead  int64    `json:"cache_read"`
+	CacheWrite int64    `json:"cache_write"`
+	Cost       *float64 `json:"cost"`
+	Session    string   `json:"session"`
+}
+
+// AccountCalls asks the plugin for account's calls of provider made
+// outside magpie, from since on.
+func AccountCalls(ctx context.Context, provider, account string, since time.Time) ([]OutsideCall, error) {
+	var r struct {
+		Calls []OutsideCall `json:"calls"`
+	}
+	err := Call(ctx, "calls", map[string]any{"provider": provider, "account": account, "proxy": proxyOf(ctx), "since": since.UnixMilli()}, &r)
+	return r.Calls, err
 }
 
 // AccountUsage asks the plugin for account's usage of provider.

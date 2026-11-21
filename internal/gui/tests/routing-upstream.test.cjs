@@ -76,6 +76,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       const context = await browser.newContext({ viewport: { width: 1100, height: 760 }, reducedMotion: "reduce" });
       const page = await context.newPage();
       page.setDefaultTimeout(5000);
+      page.setDefaultNavigationTimeout(60000);
       const errors = [];
       page.on("pageerror", (e) => errors.push(e.message));
       await page.route("**/*", serve(lang));
@@ -105,7 +106,19 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
 
       // its story says so, and the click leaves the row where it is
       const row = page.locator(".rt-req").nth(0);
-      const was = await row.evaluate((e) => e.getBoundingClientRect().top);
+      // measure once the page holds still: the day's rows arriving grow the
+      // page above the list, and the day button's click is kept in place by
+      // scrolling the view, which can land after the last row is in
+      const was = await row.evaluate(async (e) => {
+        let last = NaN;
+        for (let i = 0; i < 60; i++) {
+          await new Promise((r) => requestAnimationFrame(r));
+          const top = e.getBoundingClientRect().top;
+          if (top === last) return top;
+          last = top;
+        }
+        return last;
+      });
       const scrolled = await page.evaluate(() => [scrollX, scrollY, document.scrollingElement.scrollTop]);
       await row.click();
       await page.waitForTimeout(600);
@@ -121,23 +134,24 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
 
       // the Usage page's Requests: a request's details name it
       await page.locator('[data-view="usage"]').first().click();
-      await page.locator("#usageTab .opt").nth(1).click();
+      await page.locator(":is(#usageTab .opt, .nav-s):visible").nth(1).click();
       const rows = page.locator(".led tbody tr.led-row");
       await rows.nth(1).waitFor();
       const top = () => page.locator("#view-usage").evaluate((v) => v.scrollTop);
       const dd = async (i) => {
-        // brought into view by the wheel; the click itself moves nothing
+        // brought into view by the wheel; back from the request's page is
+        // the list where it was
         await reader.inView(page, rows.nth(i));
         const was = await top();
-        await rows.nth(i).click();
-        await page.waitForTimeout(200);
-        assert.equal(await top(), was, "a click moved the page");
-        const box = page.locator(".led-detail").nth(i);
-        await box.waitFor();
-        return box.evaluate((b, dt) => [...b.querySelectorAll("dt")].find((d) => d.textContent === dt)?.nextElementSibling?.textContent || "", want[lang].dt);
+        const box = await reader.openRequest(page, rows.nth(i));
+        const said = await box.evaluate((b, dt) => [...b.querySelectorAll("dt")].find((d) => d.textContent === dt)?.nextElementSibling?.textContent || "", want[lang].dt);
+        if (i === 0) return said; // the next looks at the page's border
+        await reader.closeRequest(page);
+        assert.equal(await top(), was, "back to the list where it was left");
+        return said;
       };
-      assert.equal(await dd(0), "DeepInfra");
       assert.equal(await dd(1), "");
+      assert.equal(await dd(0), "DeepInfra");
       const border = await page.evaluate(() => [...document.querySelectorAll(".rt-req .upstream, .led-detail dd")].map((e) => getComputedStyle(e).borderLeftWidth).filter((b) => parseFloat(b) > 1));
       assert.deepEqual(border, [], "no left-border accent");
       for (const l of ["zh", "ja", "de"]) {

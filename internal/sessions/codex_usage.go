@@ -31,6 +31,12 @@ type codexUsageState struct {
 	SnapshotThread string
 	SnapshotTotal  *cxUsage
 	SnapshotOffset *cxUsage
+	// Copied are the checkpoints of the rollout this one was forked from,
+	// which it holds copies of (codex_fork.go), until the fork's first turn
+	// of its own; the map is never written to after it is read.
+	Copied map[cxCheckpoint]bool
+	// CopiedTurns are that rollout's turn ids, nil when it names none.
+	CopiedTurns map[string]bool
 }
 
 // A paginated subagent starts with a restored compaction and a zero-last
@@ -93,15 +99,16 @@ type cxCompaction struct {
 }
 
 type codexContribution struct {
-	ResponseID, Session, Turn, Model string
-	Epoch                            int
-	At, Updated                      time.Time
-	Usage                            cxUsage
-	Total                            *cxUsage
-	CountTotal                       *cxUsage
-	CountEpoch                       int
-	ExpectedCount                    *cxUsage
-	Compaction                       bool
+	ResponseID, Session, ThreadID, Turn, Model string
+	ThreadIDConflict                           bool
+	Epoch                                      int
+	At, Updated                                time.Time
+	Usage                                      cxUsage
+	Total                                      *cxUsage
+	CountTotal                                 *cxUsage
+	CountEpoch                                 int
+	ExpectedCount                              *cxUsage
+	Compaction                                 bool
 }
 
 type codexChange struct {
@@ -134,10 +141,11 @@ func (s *codexUsageState) compacted(at time.Time, model string, p cxCompaction) 
 		}
 		v := old
 		v.Compaction = true
+		v.ThreadID, v.ThreadIDConflict = mergeCodexThreadID(old, codexContribution{ThreadID: r.ThreadID})
 		s.Entries[i] = v
 		change = &codexChange{Index: i, Old: &old, Value: v}
 	} else {
-		change = s.record(codexContribution{ResponseID: r.ResponseID, Session: session, Turn: r.TurnID, Model: model, At: at, Usage: *r.Usage, Total: r.ThreadUsage, Compaction: true})
+		change = s.record(codexContribution{ResponseID: r.ResponseID, Session: session, ThreadID: r.ThreadID, Turn: r.TurnID, Model: model, At: at, Usage: *r.Usage, Total: r.ThreadUsage, Compaction: true})
 		if change == nil {
 			return nil
 		}
@@ -317,6 +325,7 @@ func (s *codexUsageState) model(turn, fallback string) string {
 }
 
 func (s *codexUsageState) context(session, turn, model string) {
+	s.ownTurn(turn)
 	if turn != "" && turn != s.Turn {
 		s.Pending = 0
 	}
@@ -356,6 +365,19 @@ func codexIntervalKey(v codexContribution) codexInterval {
 		return codexInterval{}
 	}
 	return codexInterval{v.Session, epoch, total.Input, total.Output, v.Usage.Input, v.Usage.Output, true}
+}
+
+func mergeCodexThreadID(old, next codexContribution) (string, bool) {
+	if old.ThreadIDConflict {
+		return "", true
+	}
+	if old.ThreadID == "" {
+		return next.ThreadID, false
+	}
+	if next.ThreadID == "" || next.ThreadID == old.ThreadID {
+		return old.ThreadID, false
+	}
+	return "", true
 }
 
 func (s *codexUsageState) index(i int, v codexContribution) {
@@ -401,25 +423,37 @@ func (s *codexUsageState) record(v codexContribution) *codexChange {
 			s.Conflicts++
 			return nil
 		}
+		threadID, threadIDConflict := mergeCodexThreadID(old, v)
+		identityChanged := threadID != old.ThreadID || threadIDConflict != old.ThreadIDConflict
 		if old.Usage.equal(v.Usage) && old.Usage.Known == v.Usage.Known && old.Model == v.Model && !(old.Total == nil && v.Total != nil) {
-			if !v.Updated.After(old.Updated) {
+			updated := old
+			updated.ThreadID, updated.ThreadIDConflict = threadID, threadIDConflict
+			if !v.Updated.After(old.Updated) && !identityChanged {
 				return nil
 			}
 			// A repeated current snapshot advances revision order, but not the
 			// completion time or counting date. Keep the watermark in the live
 			// index; a changed cold source reconstructs it from the original events.
-			updated := old
-			updated.Updated = v.Updated
+			if v.Updated.After(old.Updated) {
+				updated.Updated = v.Updated
+			}
 			s.Entries[i] = updated
 			return &codexChange{Index: i, Old: &old, Value: updated}
 		}
 		// Event time is the source's revision order. A replay of an older
 		// snapshot cannot undo an accepted update; a tied conflict is ambiguous.
 		if !v.Updated.After(old.Updated) {
+			if identityChanged {
+				updated := old
+				updated.ThreadID, updated.ThreadIDConflict = threadID, threadIDConflict
+				s.Entries[i] = updated
+				return &codexChange{Index: i, Old: &old, Value: updated}
+			}
 			s.Conflicts++
 			return nil
 		}
 		v.At = old.At
+		v.ThreadID, v.ThreadIDConflict = threadID, threadIDConflict
 		s.Entries[i] = v
 		if codexIntervalKey(old) != codexIntervalKey(v) {
 			s.index(i, v)
@@ -469,6 +503,11 @@ func (s *codexUsageState) record(v codexContribution) *codexChange {
 
 func (s *codexUsageState) count(at time.Time, model string, total, last *cxUsage) *codexChange {
 	if total == nil || !total.valid() || total.Known&3 != 3 || at.IsZero() {
+		return nil
+	}
+	if s.copied(total, last) {
+		// the parent's call, which its own rollout counts
+		s.advance(at, total)
 		return nil
 	}
 	s.alignSnapshot(at, total, last)
@@ -595,11 +634,17 @@ func (s *codexUsageState) count(at time.Time, model string, total, last *cxUsage
 		return nil
 	}
 	s.advance(at, total)
-	// Preserve the legacy delta when there is no paired RECORD. A missing
-	// last value or an unexplained gap must not silently discard token usage.
-	if prev != nil {
+	// Without a paired RECORD, last is still the request's own usage, exact
+	// even when zero. Only a missing last falls back to the counter's delta,
+	// so no token usage is silently lost. The counter isn't always this
+	// request's: a Codex Desktop fork (thread_spawn) replays its parent's
+	// checkpoints, each with last=0, between its own, and its delta would
+	// book the parent's whole lead again on each switch back (#2234).
+	if last != nil && last.valid() {
+		v.Usage = *last
+	} else if prev != nil {
 		v.Usage = total.less(*prev)
-	} else if last == nil || !last.valid() {
+	} else {
 		v.Usage = *total
 	}
 	if v.Usage.zero() || !v.Usage.valid() {

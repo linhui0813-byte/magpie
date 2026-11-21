@@ -12,7 +12,7 @@ import (
 
 // These connections belong to the trace reader, not the Sessions listing cache.
 // Updates are read in timestamp/ID order in bounded batches; large histories
-// neither hold dbReadMu nor force the entire conversation to be re-exported.
+// neither hold storeMu nor force the entire conversation to be re-exported.
 type ocTraceState struct {
 	messages      map[string]ocTraceMessage
 	order         []string
@@ -47,12 +47,7 @@ func (r *TraceReader) pollOpenCodeDB(path string, bodies bool, budget *int64) ([
 		}
 		files = append(files, ocDBRows(db, fmt.Sprintf(q, "session", where), "opencode", path, ocDB{db}, parent)...)
 	}
-	files = ocRoots(files, parent)
-	// Retain only the latest stores, as for JSONL discovery.
-	sortTraceOCFiles(files)
-	if len(files) > Limit {
-		files = files[:Limit]
-	}
+	files = traceOpenCodeWindow(ocRoots(files, parent))
 	var out []TraceSpan
 	pending := false
 	seen := map[string]bool{}
@@ -80,7 +75,7 @@ func (r *TraceReader) pollOpenCodeDB(path string, bodies bool, budget *int64) ([
 		}
 		snap := r.snapshot(key)
 		v2 := false
-		if _, ok := f.oc.(ocV2DB); ok {
+		if _, ok := f.m().oc.(ocV2DB); ok {
 			v2 = true
 		}
 		if snap.oc == nil || snap.oc.v2 != v2 {
@@ -95,10 +90,10 @@ func (r *TraceReader) pollOpenCodeDB(path string, bodies bool, budget *int64) ([
 		}
 		// A row too large for the retained body window is read as metadata;
 		// body export is bounded independently from traversal progress.
-		more, ok := state.readRows(db, table, kind, f.sid, false, bodies, budget, changed)
+		more, ok := state.readRows(db, table, kind, f.m().sid, false, bodies, budget, changed)
 		pending = pending || more || !ok
 		if !v2 && *budget > 0 {
-			more, ok = state.readRows(db, "part", "''", f.sid, true, bodies, budget, changed)
+			more, ok = state.readRows(db, "part", "''", f.m().sid, true, bodies, budget, changed)
 			pending = pending || more || !ok
 		}
 		// Part-only updates may refer to messages evicted from the body window.
@@ -108,7 +103,7 @@ func (r *TraceReader) pollOpenCodeDB(path string, bodies bool, budget *int64) ([
 				continue
 			}
 			var raw []byte
-			if db.QueryRow(`SELECT CASE WHEN length(data)>8388608 THEN json_remove(data,'$.text','$.content') ELSE data END FROM message WHERE id=? AND session_id=?`, mid, f.sid).Scan(&raw) == nil {
+			if db.QueryRow(`SELECT CASE WHEN length(data)>8388608 THEN json_remove(data,'$.text','$.content') ELSE data END FROM message WHERE id=? AND session_id=?`, mid, f.m().sid).Scan(&raw) == nil {
 				*budget -= int64(len(raw))
 				var doc ocTraceMessage
 				if json.Unmarshal(raw, &doc) == nil {
@@ -139,7 +134,7 @@ func (r *TraceReader) pollOpenCodeDB(path string, bodies bool, budget *int64) ([
 				continue
 			}
 			m.ParentID = user.ID
-			spans := traceOpenCode(f.sid, []ocTraceMessage{user, m}, bodies)
+			spans := traceOpenCode(f.m().sid, []ocTraceMessage{user, m}, bodies)
 			for i, span := range spans {
 				if span.Parent != "" {
 					continue

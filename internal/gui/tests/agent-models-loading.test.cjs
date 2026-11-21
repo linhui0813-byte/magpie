@@ -47,6 +47,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
     const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: "chromium" }));
     const page = await browser.newPage({ viewport: { width: 1000, height: 700 } });
     page.setDefaultTimeout(5000);
+    page.setDefaultNavigationTimeout(60000);
     const errors = [];
     page.on("pageerror", (e) => errors.push(e.message));
     await page.route("**/*", serve);
@@ -54,6 +55,10 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
     await page.goto("http://magpie.test/");
     // the list opens from Pick in the connected row, opened
     await page.locator('.row.agent[data-id="codex"] .ag-link').click();
+    // "elsewhere" is the page's lead line: the opened row holds Codex's own
+    // settings and its Disconnect button, so a fixed point could hit one
+    const lead = await page.locator("#agentsLead").boundingBox();
+    const away = () => page.mouse.click(lead.x + lead.width / 2, lead.y + lead.height / 2);
     const entry = page.locator('.row.agent[data-id="codex"] .ag-exp .ag-chips .ag-quiet');
     await entry.waitFor();
     const boxes = () => page.locator(".am-pop:not(.leaving)").count();
@@ -70,13 +75,13 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
     await entry.click();
     await page.waitForTimeout(1000);
     assert.equal(await boxes(), 1, "one box at most");
-    await page.mouse.click(900, 650);
+    await away();
     await page.waitForTimeout(500);
     assert.equal(await boxes(), 0, "a click elsewhere closes it");
 
     // a click elsewhere while it loads: it doesn't come up
     await entry.click();
-    await page.mouse.click(900, 650);
+    await away();
     await page.waitForTimeout(1000);
     assert.equal(await boxes(), 0, "a click away while it loads takes it back");
 

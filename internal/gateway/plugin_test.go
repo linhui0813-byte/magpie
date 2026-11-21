@@ -6,7 +6,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -16,6 +15,7 @@ import (
 
 	"github.com/yetone/magpie/internal/plugin"
 	"github.com/yetone/magpie/internal/provider"
+	"github.com/yetone/magpie/internal/testenv"
 )
 
 // A plugin's provider signed in to is a provider like the others: each of
@@ -23,10 +23,7 @@ import (
 // base URL the plugin's loader gives, and the plugin's fetch carries the
 // request with the sign-in it keeps.
 func TestPluginProvider(t *testing.T) {
-	bun, err := exec.LookPath("bun")
-	if err != nil {
-		t.Skip("no bun on PATH")
-	}
+	bun := testenv.Bun(t)
 	fresh(t)
 	t.Setenv("MAGPIE_BUN", bun)
 	t.Cleanup(plugin.Settle)
@@ -38,7 +35,7 @@ func TestPluginProvider(t *testing.T) {
 	var got []seen
 	limited := "" // the Authorization answered 429
 	refused := "" // and 401
-	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	up := testenv.FakeVendor(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		b, _ := io.ReadAll(r.Body)
 		mu.Lock()
 		got = append(got, seen{r.URL.RequestURI(), r.Header.Get("Authorization"), r.Header.Get("X-Plugin-Model"), string(b)})
@@ -80,7 +77,6 @@ func TestPluginProvider(t *testing.T) {
 		}
 	}))
 	defer up.Close()
-	t.Setenv("FAKE_BASE", up.URL+"/v1")
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
@@ -127,6 +123,24 @@ func TestPluginProvider(t *testing.T) {
 		if strings.Contains(last.body, `"request"`) {
 			t.Fatalf("%s kept Code Assist's envelope: %s", c.model, last.body)
 		}
+	}
+
+	// Pi's Google API request still uses the plugin's loader and fetch,
+	// including its account key and model header (#3282).
+	req := httptest.NewRequest(http.MethodPost, "/v1beta/models/fakeco/fake-gemini:streamGenerateContent?alt=sse",
+		strings.NewReader(`{"contents":[{"role":"user","parts":[{"text":"hello from Pi"}]}]}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-goog-api-key", "magpie")
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "hi from gemini") {
+		t.Fatalf("Pi Gemini request: %d %s", rec.Code, rec.Body.String())
+	}
+	mu.Lock()
+	piLast := got[len(got)-1]
+	mu.Unlock()
+	if piLast.path != "/v1/models/fake-gemini:streamGenerateContent?alt=sse" || piLast.auth != "Bearer k1" || piLast.model != "fake-gemini" || !strings.Contains(piLast.body, "hello from Pi") {
+		t.Fatalf("Pi Gemini request bypassed the plugin: %+v", piLast)
 	}
 
 	// the vendor refuses the first account's sign-in: it shows lapsed, as a

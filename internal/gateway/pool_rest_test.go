@@ -39,6 +39,13 @@ func TestPoolRefusalRestsTheModelOnly(t *testing.T) {
 	if r.Why != failQuota || r.Key != opus.restID() || r.By != "window" {
 		t.Fatalf("Opus out of its week rests %+v", r)
 	}
+	// the app shows it on Opus's rows only (#1960)
+	if r.Model != opus.model {
+		t.Fatalf("Opus's own rest says model %q", r.Model)
+	}
+	if kept, _ := restOf(opus.restID()); kept.Model != opus.model {
+		t.Fatalf("Opus's rest, read back, says model %q", kept.Model)
+	}
 	if _, ok := restOf(sonnet.restKey()); ok {
 		t.Fatal("Opus out of its own week rests the account")
 	}
@@ -50,8 +57,8 @@ func TestPoolRefusalRestsTheModelOnly(t *testing.T) {
 	}
 
 	whole := acct("out@x.com", "claude-sonnet-4-6")
-	if r := s.restAfter(whole, 429, http.Header{}, refused); r.Key != whole.restKey() {
-		t.Fatalf("the account's week used up rests %s, not the account", r.Key)
+	if r := s.restAfter(whole, 429, http.Header{}, refused); r.Key != whole.restKey() || r.Model != "" {
+		t.Fatalf("the account's week used up rests %s (model %q), not the account", r.Key, r.Model)
 	}
 	if _, ok := restOf(acct("out@x.com", "claude-opus-4-7").restKey()); !ok {
 		t.Fatal("the account's week used up leaves its other models in")

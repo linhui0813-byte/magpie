@@ -21,7 +21,8 @@ const agent = (id, used) => ({
 });
 const state = {
   agents: [...Array.from({ length: 10 }, (_, i) => agent("agent-" + i, true)), agent("codex", true), agent("unset-1", false), agent("unset-2", false)],
-  profiles: [], settings: { lang: "en", theme: "light" },
+  // Get started put away: the list and its scroll are what is measured
+  profiles: [], settings: { lang: "en", theme: "light", guideHidden: true },
 };
 
 async function serve(route) {
@@ -66,7 +67,7 @@ async function stays(page, what, sel, watch = sel) {
 // are in sight or the button is at the view's top.
 async function unrolls(page, what) {
   await page.evaluate(() => {
-    const more = document.querySelector(".agent-more"), above = more.previousElementSibling;
+    const more = document.querySelector(".agent-more"), above = (more.closest(".ag-manage-bar") || more).previousElementSibling;
     window.frames = [];
     window.ro?.disconnect();
     window.ro = new ResizeObserver(() => {
@@ -75,7 +76,7 @@ async function unrolls(page, what) {
     });
     window.ro.observe(document.querySelector("#agents"));
   });
-  const gap = await page.locator(".agent-more").evaluate((m) => m.getBoundingClientRect().top - m.previousElementSibling.getBoundingClientRect().top);
+  const gap = await page.locator(".agent-more").evaluate((m) => m.getBoundingClientRect().top - (m.closest(".ag-manage-bar") || m).previousElementSibling.getBoundingClientRect().top);
   await page.locator(".agent-more").click();
   await page.waitForTimeout(1200);
   const frames = await page.evaluate(() => window.frames);
@@ -122,6 +123,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       const page = await (await browser.newContext({ viewport })).newPage();
       pages.push(page);
       page.setDefaultTimeout(5000);
+      page.setDefaultNavigationTimeout(60000);
       page.on("pageerror", (e) => errors.push(e.message));
       await page.route("**/*", serve);
       await page.goto(url);

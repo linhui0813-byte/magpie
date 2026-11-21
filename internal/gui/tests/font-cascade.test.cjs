@@ -9,7 +9,7 @@ const choice = (family, weight, style) => ({ family, name: "Chosen", weight, sty
 
 for (const [name, engine] of [["chromium", chromium], ["webkit", webkit]]) {
   test(`${name}: font reset restores the original cascade and explicit emphasis`, async () => {
-    const css = (await Promise.all(["app.css", "library.css", "routing.css", "sessions.css", "plugins.css"].map(f => fs.readFile(path.join(assets, f), "utf8")))).join("\n");
+    const css = (await Promise.all(["app.css", "plugins/library/library.css", "plugins/routing/routing.css", "plugins/sessions/sessions.css", "plugins.css"].map(f => fs.readFile(path.join(assets, f), "utf8")))).join("\n");
     const js = await fs.readFile(path.join(assets, "fonts.js"), "utf8");
     const browser = await engine.launch();
     try {

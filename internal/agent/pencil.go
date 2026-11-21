@@ -45,13 +45,16 @@ func pencil(home string) *Agent {
 		detect: func() bool { return isDir(dir) || pencilApp(home) },
 		Notice: func() string {
 			if runtime.GOOS == "windows" || Running(`Pencil\.app/`, `pen\.dev\.app/`, `(^|/)[Pp]encil( |$)`) {
-				return "Pencil reads its custom models at start-up — restart Pencil to see magpie's models in its model picker."
+				return noticePencil.String()
 			}
 			return ""
 		},
+		ListOnly: true,
 		Sync: func() error {
-			return syncJSON(path, key, func() any { return pencilProviderJSON(gateway.URL()) })
+			return syncJSON(path, key, theirsKept(path, key, func() any { return pencilProviderJSON(gateway.URL()) }, "models"))
 		},
+		// its picker lists the models picked for it (#1508)
+		ListsModels: true,
 		Fields: []Field{{
 			Key: "provider", Label: "provider",
 			Get: func() string {
@@ -64,7 +67,7 @@ func pencil(home string) *Agent {
 				if v == "" {
 					return edit.DelJSON(path, key)
 				}
-				return edit.SetJSON(path, edit.KV{Path: key, Value: pencilProviderJSON(gateway.URL())})
+				return edit.SetJSON(path, edit.KV{Path: key, Value: theirsKept(path, key, func() any { return pencilProviderJSON(gateway.URL()) }, "models")()})
 			},
 			Options: func(map[string]string) []Option {
 				return []Option{{Value: magpieID, Label: "magpie", Icon: "magpie", Note: "every magpie model in Pencil's model picker"}}
@@ -79,7 +82,7 @@ func pencilApp(home string) bool {
 	if runtime.GOOS != "darwin" {
 		return false
 	}
-	for _, d := range []string{"/Applications", filepath.Join(home, "Applications")} {
+	for _, d := range macAppFolders(home) {
 		for _, n := range []string{"Pencil.app", "pen.dev.app"} {
 			if _, err := os.Stat(filepath.Join(d, n)); err == nil {
 				return true
@@ -96,13 +99,13 @@ func pencilApp(home string) bool {
 // spend being counted by magpie.
 func pencilProviderJSON(gw string) map[string]any {
 	ms := []map[string]any{}
-	for _, m := range magpieModels("pencil") {
+	for _, m := range sharedModels("pencil") {
 		e := piModelJSON(m, gw, false)
 		if _, ok := e["input"]; !ok {
 			e["input"] = []string{"text"}
 		}
 		if _, ok := e["contextWindow"]; !ok {
-			e["contextWindow"] = 128000
+			e["contextWindow"] = unknownWindow(128000)
 		}
 		if _, ok := e["maxTokens"]; !ok {
 			e["maxTokens"] = min(16384, e["contextWindow"].(int))
@@ -112,5 +115,10 @@ func pencilProviderJSON(gw string) map[string]any {
 		ms = append(ms, e)
 	}
 	return map[string]any{"name": "magpie", "baseUrl": gw + "/v1", "api": "openai-completions",
-		"apiKey": gateway.TokenFor("pencil"), "models": ms}
+		"apiKey": agentKeyAt("pencil", gw), "models": ms}
 }
+
+// what pencil says after a change (notice.go)
+var (
+	noticePencil = newNotice("Pencil reads its custom models at start-up — restart Pencil to see magpie's models in its model picker.")
+)

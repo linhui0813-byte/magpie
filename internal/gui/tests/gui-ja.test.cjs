@@ -7,13 +7,13 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs/promises");
 const path = require("node:path");
 const { test } = require("node:test");
+const { strings } = require("./strings.cjs");
 const { chromium, webkit } = require("playwright");
 
 const assets = path.resolve(__dirname, "../assets");
 
 test("ja has every zh string, with its placeholders and tags", async () => {
-  const src = await fs.readFile(path.join(assets, "i18n.js"), "utf8");
-  const I18N = new Function(src.slice(0, src.indexOf("\n};") + 3) + "; return I18N;")();
+  const { I18N } = strings(); // i18n.js's and the plugins'
   const zh = Object.keys(I18N.zh), ja = I18N.ja;
   assert.deepEqual(zh.filter((k) => !(k in ja)), [], "missing in ja");
   assert.deepEqual(Object.keys(ja).filter((k) => !(k in I18N.zh)), [], "ja only");
@@ -50,6 +50,7 @@ for (const [name, engine] of [["webkit", webkit], ["chromium", chromium]]) {
       for (const [lang, sys, want] of [["ja", "en-US", "ja"], ["system", "ja-JP", "ja"], ["system", "en-US", "en"], ["system", "zh-CN", "zh"]]) {
         const page = await (await browser.newContext({ locale: sys, viewport: { width: 1000, height: 760 } })).newPage();
         page.setDefaultTimeout(5000);
+        page.setDefaultNavigationTimeout(60000);
         await page.route("**/*", serve(lang));
         await page.goto("http://magpie.test/");
         await page.waitForFunction(() => typeof locale === "string" && document.documentElement.lang);
@@ -62,7 +63,7 @@ for (const [name, engine] of [["webkit", webkit], ["chromium", chromium]]) {
         assert.ok(got.offered.includes("ja:日本語"));
         if (want === "ja") {
           assert.equal(got.lang, "ja-JP");
-          assert.deepEqual(got.nav, ["エージェント", "プロバイダ", "ゲートウェイ", "ルーティング", "使用量"]);
+          assert.deepEqual(got.nav, ["エージェント", "セッション", "ライブラリ", "プロバイダ", "ルーティング"]);
         }
         await page.close();
       }

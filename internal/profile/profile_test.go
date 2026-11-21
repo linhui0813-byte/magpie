@@ -2,14 +2,17 @@ package profile
 
 import (
 	"encoding/json"
+	"github.com/yetone/magpie/internal/testenv"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
 
+	"github.com/yetone/magpie/internal/agent"
 	"github.com/yetone/magpie/internal/agentenv"
 	"github.com/yetone/magpie/internal/library"
+	"github.com/yetone/magpie/internal/provider"
 )
 
 // sandbox is a home with Claude Code and Codex in it and nothing on PATH.
@@ -19,7 +22,14 @@ func sandbox(t *testing.T) string {
 	t.Setenv("HOME", h)
 	t.Setenv("USERPROFILE", h)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(h, ".config"))
-	t.Setenv("PATH", "")
+	// Claude Code's and Codex's CLIs are here: an agent whose CLI is gone
+	// is no Library target (#2254), and these tests carry its library
+	bin := filepath.Join(h, "bin")
+	for _, cli := range []string{"claude", "codex"} {
+		testenv.Program(t, filepath.Join(bin, cli), "#!/bin/sh\n")
+		write(t, filepath.Join(bin, cli+".exe"), "")
+	}
+	t.Setenv("PATH", bin)
 	for _, k := range agentenv.Vars {
 		t.Setenv(k, "")
 	}
@@ -158,5 +168,117 @@ func TestProfileCarriesLibrary(t *testing.T) {
 	}
 	if !strings.Contains(read(t, filepath.Join(h, ".codex/config.toml")), "mcp_servers.fs") {
 		t.Error("codex has no fs after b")
+	}
+}
+
+// A profile can name agents this computer doesn't have: profiles sync
+// between computers. Applying one leaves those agents alone, so it never
+// writes a config that makes an agent look installed here (qtwaiter on X).
+func TestApplySkipsUndetectedAgents(t *testing.T) {
+	sandbox(t)
+	if err := provider.Save(provider.Provider{ID: "relay", Name: "Relay", Chat: "https://relay.example.com/v1",
+		Key: "synthetic-key", Models: []string{"pro"}}); err != nil {
+		t.Fatal(err)
+	}
+	p := Profile{Fields: map[string]string{"claude.model": "relay/pro"}}
+	for _, a := range agent.All() {
+		if a.Detected() || a.Field("model") == nil {
+			continue
+		}
+		p.Fields[a.ID+".model"] = "relay/pro"
+	}
+	if len(p.Fields) < 2 {
+		t.Fatal("no undetected agent with a model field")
+	}
+	_, err := Apply(p)
+	if got := must[*agent.Agent](t)(agent.Find("claude")).Field("model").Get(); got != "relay/pro" {
+		t.Errorf("claude's model is %q", got)
+	}
+	for k := range p.Fields {
+		a := must[*agent.Agent](t)(agent.Find(strings.TrimSuffix(k, ".model")))
+		if a.ID != "claude" && a.Detected() {
+			t.Errorf("applying the profile made %s look installed", a.ID)
+		}
+	}
+	if err != nil {
+		t.Error(err)
+	}
+}
+
+// Rename moves a profile's key without snapshotting it again: what it held
+// is the same under the new name, a name differing only in case is a rename,
+// and each refusal writes nothing (#2721, erlinerd).
+func TestRename(t *testing.T) {
+	sandbox(t)
+	work := Profile{Fields: map[string]string{"codex.model": "gpt-5"}, Library: &library.Setup{}}
+	if err := Save("work", work); err != nil {
+		t.Fatal(err)
+	}
+	if err := Save("taken", Profile{Fields: map[string]string{"claude.model": "acme/m1"}}); err != nil {
+		t.Fatal(err)
+	}
+	keys := func() []string { return Names(must[map[string]Profile](t)(Load())) }
+
+	if err := Rename("  work ", " home  "); err != nil {
+		t.Fatal(err)
+	}
+	ps := must[map[string]Profile](t)(Load())
+	if got := Names(ps); !slices.Equal(got, []string{"home", "taken"}) {
+		t.Fatalf("after work → home: %v", got)
+	}
+	if got := ps["home"]; got.Fields["codex.model"] != "gpt-5" || got.Library == nil {
+		t.Errorf("home lost what work held: %+v", got)
+	}
+	if err := Rename("home", "Home"); err != nil {
+		t.Fatal(err)
+	}
+	if got := keys(); !slices.Equal(got, []string{"Home", "taken"}) {
+		t.Errorf("a rename by case only: %v", got)
+	}
+
+	before := read(t, Path())
+	for _, c := range []struct{ old, to, err string }{
+		{"Home", "   ", "profile name is empty"},
+		{"Home", "taken", `a profile named "taken" already exists`},
+		{"nope", "other", `no profile named "nope"`},
+		{"Home", "Home", ""},
+	} {
+		err := Rename(c.old, c.to)
+		if (err == nil) != (c.err == "") || (err != nil && err.Error() != c.err) {
+			t.Errorf("Rename(%q, %q) = %v, want %q", c.old, c.to, err, c.err)
+		}
+		if got := read(t, Path()); got != before {
+			t.Errorf("Rename(%q, %q) wrote profiles.json: %s", c.old, c.to, got)
+		}
+	}
+
+	// profiles.json unreadable (here a folder): an error, nothing written
+	sandbox(t)
+	if err := os.MkdirAll(Path(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := Rename("Home", "moved"); err == nil {
+		t.Error("a rename over an unreadable profiles.json went through")
+	}
+	if fi, err := os.Stat(Path()); err != nil || !fi.IsDir() {
+		t.Errorf("an unreadable profiles.json was written over: %v", err)
+	}
+}
+
+// A profile is magpie's routing, not the user's own settings of an agent:
+// Claude Code's permission mode is neither saved in one nor written by one
+// (EricChenChannel on X: bypassPermissions kept coming back as it was).
+func TestProfileLeavesPermissionMode(t *testing.T) {
+	h := sandbox(t)
+	path := filepath.Join(h, ".claude/settings.json")
+	write(t, path, `{"permissions": {"defaultMode": "bypassPermissions"}}`)
+	if _, ok := Fields()["claude.permission_mode"]; ok {
+		t.Error("a profile keeps the permission mode")
+	}
+	if _, err := ApplyFields(map[string]string{"claude.permission_mode": "default"}); err != nil {
+		t.Fatal(err)
+	}
+	if s := read(t, path); !strings.Contains(s, "bypassPermissions") {
+		t.Errorf("a profile wrote the permission mode:\n%s", s)
 	}
 }

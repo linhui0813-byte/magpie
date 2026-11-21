@@ -9,9 +9,28 @@ import (
 // Recent sources take priority over idle windows, then compete by reparse
 // cost (source size). Cold-only historical Claude sources keep no window;
 // an already retained idle window can use spare capacity. Codex still expires.
-const revisionIdle = 5 * time.Minute
+//
+// A Codex window lives an hour past its file's last change, as a working
+// Claude one does. At five minutes, the turn after any longer pause read
+// the whole rollout again from its first line, for the summary and the
+// calls alike (#4369: a 21 MB real rollout read whole for one line). The
+// windows held are bounded as before (revisionFiles, revisionEntries,
+// revisionActiveFiles): only how long an idle one is held grew, so the
+// most held is what one working session held already.
+const revisionIdle = time.Hour
 const revisionFiles = 8
 const revisionEntries = 8192
+
+// A Codex session being written keeps its window even past the shared
+// budget. Its index holds every call (about six entries each), so a session
+// over ~1,400 calls lost it, and every append (each turn, each poll that
+// read it) parsed the whole rollout again from its first line: a full core
+// while Codex ran (yetone/magpie-releases#24). The full parse built the same
+// index each time anyway, so keeping it costs no more at its peak. At most
+// revisionActiveFiles such windows, each up to revisionActiveEntries, and
+// only while the file changed in the last revisionIdle.
+const revisionActiveFiles = 2
+const revisionActiveEntries = 16 * revisionEntries
 
 // A pause longer than five minutes must not demote a large working session
 // behind tiny subagent logs. After an hour, recent work takes priority; idle
@@ -23,7 +42,7 @@ func workingRevision(mod int64, now time.Time) bool {
 }
 
 func recentRevision(mod int64, weight int, now time.Time) bool {
-	return weight > 0 && weight <= revisionEntries && mod >= now.Add(-revisionIdle).UnixNano()
+	return weight > 0 && weight <= revisionActiveEntries && mod >= now.Add(-revisionIdle).UnixNano()
 }
 
 func (s *codexUsageState) weight() int {
@@ -126,9 +145,20 @@ func retainedRevisions(candidates []revisionCandidate, now time.Time) map[string
 		return candidates[i].path < candidates[j].path
 	})
 	keep := map[string]bool{}
-	used := 0
+	used, active := 0, 0
 	for _, c := range candidates {
-		if !c.eligible(now) || len(keep) == revisionFiles || used+c.weight > revisionEntries {
+		if !c.eligible(now) || len(keep) == revisionFiles {
+			continue
+		}
+		if !c.bounded && c.weight > revisionEntries {
+			// an active Codex session past the shared budget: outside it
+			if active < revisionActiveFiles {
+				keep[c.path] = true
+				active++
+			}
+			continue
+		}
+		if used+c.weight > revisionEntries {
 			continue
 		}
 		keep[c.path] = true

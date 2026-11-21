@@ -1,12 +1,16 @@
 package provider
 
 import (
+	"context"
 	"maps"
+	"slices"
 	"strings"
+
+	"github.com/yetone/magpie/internal/catalog"
 )
 
 // A remote magpie is another computer's magpie gateway, shared on its
-// network (Settings → Share on local network), as a provider: the
+// network (Settings → Network and sharing → Share on local network), as a provider: the
 // computers' agents stay wired by their own magpie, while the providers,
 // routing groups and usage are the one magpie's they all share. Its
 // address serves every API magpie does, so the provider speaks them all
@@ -24,9 +28,26 @@ import (
 // Each model's label is the other magpie's name for it, with its provider
 // there after it ("Claude Sonnet 5 · RelayA"), as its own agents see it:
 // two of its providers' models of one name are told apart here too.
+// Provider in model names Off here names each by its name there alone
+// (display_name, catalog.Model's Plain), whatever that magpie's own
+// setting put after it (ARNO on Discord).
 
 // Its video models come the same way (VideomakersHeader), marked "kind":
 // "video", and go on to its videos API (#545).
+
+// Its list also tells what each model costs there (PricesHeader): the
+// price the other magpie counts its usage at — what its user set for the
+// model by hand, else its provider's list price, at that provider's price
+// rate — so its calls cost the same here (Sorghum on Discord). It is this
+// provider's list price for the model: a price set here for it still comes
+// first, as one set for any provider's list price does. A magpie tells it
+// only to its own computer and to one sharing it with a gateway key, and
+// one from before it tells nothing, which leaves the models priced as
+// they were: by models.dev.
+
+// Its decision models are requested with DecidersHeader, marked
+// "kind": "decision", and asked at its System One API, including models
+// whose names aren't Jev's.
 
 // DrawersHeader asks a magpie's model list for its image models as well.
 const DrawersHeader = "X-Magpie-Drawers"
@@ -35,6 +56,14 @@ const DrawersHeader = "X-Magpie-Drawers"
 // well: a magpie that doesn't send it would take grok-imagine-video, whose
 // id says "imagine", for an image model.
 const VideomakersHeader = "X-Magpie-Videomakers"
+
+// PricesHeader asks a magpie's model list for what each model costs
+// there ("magpie_price"): a magpie that doesn't send it is told nothing
+// more than before.
+const PricesHeader = "X-Magpie-Prices"
+
+// DecidersHeader asks a magpie's model list for its decision models too.
+const DecidersHeader = "X-Magpie-Deciders"
 
 // RemoteMagpiePreset is the preset's id.
 const RemoteMagpiePreset = "remote-magpie"
@@ -50,7 +79,7 @@ func (p *Provider) remoteMagpieEndpoints() {
 		return
 	}
 	root := ""
-	for _, u := range []string{p.Chat, p.Responses, p.Anthropic} {
+	for _, u := range []string{p.Chat, p.Responses, p.Anthropic, p.Decide} {
 		if u = strings.TrimRight(strings.TrimSpace(u), "/"); u != "" {
 			root = u
 			break
@@ -59,29 +88,126 @@ func (p *Provider) remoteMagpieEndpoints() {
 	if root == "" {
 		return
 	}
-	if !strings.Contains(root, "://") {
-		root = "http://" + root
-	}
-	for _, suf := range []string{"/v1/messages", "/v1/chat/completions", "/v1/responses", "/v1"} {
+	root = strings.TrimRight(WithScheme(root, "http"), "/")
+	for _, suf := range []string{
+		"/v1/messages/count_tokens", "/v1/messages",
+		"/v1/chat/completions", "/v1/responses", "/v1/systemone",
+		"/v1/embeddings", "/v1/rerank", "/v1/decisions",
+		"/v1/audio/transcriptions", "/v1/audio/translations", "/v1/audio/speech",
+		"/v1/images/generations", "/v1/images/edits",
+		"/v1/videos", "/v1",
+	} {
 		if b, ok := strings.CutSuffix(root, suf); ok {
 			root = b
 			break
 		}
 	}
 	p.Chat, p.Responses, p.Anthropic = root+"/v1", root+"/v1", root
+	p.Decide = p.Chat
 }
 
 // listHeaders are the headers p's model list is asked with: a remote
-// magpie is asked for its image and video models too.
+// magpie is asked for its image, video and decision models too, and its prices.
+// Its key goes as x-api-key whatever the user's headers say (remoteKey).
+// A list is no turn of a conversation: ${sessionId} and ${threadId} in a
+// value are an id of the list's own (conversation.go).
 func (p Provider) listHeaders() map[string]string {
+	h := p.SentHeaders(context.Background())
 	if !p.IsRemoteMagpie() {
-		return p.Headers
+		return h
 	}
-	h := maps.Clone(p.Headers)
+	h = maps.Clone(h)
 	if h == nil {
 		h = map[string]string{}
 	}
+	for k := range h {
+		if strings.EqualFold(k, "x-api-key") {
+			delete(h, k)
+		}
+	}
 	h[DrawersHeader] = "1"
 	h[VideomakersHeader] = "1"
+	h[PricesHeader] = "1"
+	h[DecidersHeader] = "1"
 	return h
+}
+
+// listHeadersAt is listHeaders for a list asked at u: at OpenCode's
+// gateway with a session of the list's own (OpenCodeSession), unless the
+// user set one on the provider.
+func (p Provider) listHeadersAt(u string) map[string]string {
+	h := p.listHeaders()
+	if !OpenCodeURL(u) {
+		return h
+	}
+	for k := range h {
+		if strings.EqualFold(k, "x-opencode-session") {
+			return h
+		}
+	}
+	h = maps.Clone(h)
+	if h == nil {
+		h = map[string]string{}
+	}
+	id := openCodeSession("")
+	h["X-Opencode-Session"], h["X-Opencode-Session-Id"] = id, id
+	// as OpenCode 2 asks its gateway (#3491), unless the user set their own
+	if !slices.ContainsFunc(slices.Collect(maps.Keys(h)), func(k string) bool { return strings.EqualFold(k, "User-Agent") }) {
+		h["User-Agent"] = OpenCodeUserAgent()
+	}
+	if !slices.ContainsFunc(slices.Collect(maps.Keys(h)), func(k string) bool { return strings.EqualFold(k, "x-opencode-client") }) {
+		h["X-Opencode-Client"] = "cli"
+	}
+	return h
+}
+
+// remotePrice is what a remote magpie's list said the model costs there,
+// if it said.
+func (p Provider) remotePrice(model string) (catalog.Price, bool) {
+	if !p.IsRemoteMagpie() {
+		return catalog.Price{}, false
+	}
+	for _, m := range p.liveByID(model) {
+		if m.Price != nil {
+			return *m.Price, true
+		}
+	}
+	return catalog.Price{}, false
+}
+
+// RemotePriced reports whether the model's list price is the one a remote
+// magpie's list gave, for the editor to say whose it is.
+func (p Provider) RemotePriced(model string) bool {
+	_, ok := p.remotePrice(model)
+	return ok
+}
+
+// RemoteVia is the magpies a remote magpie's model passes through to its
+// vendor, as its list said, that magpie last (catalog's magpie_via.go);
+// nil for another provider's, or a list from a magpie from before.
+func (p Provider) RemoteVia(model string) []string {
+	if !p.IsRemoteMagpie() {
+		return nil
+	}
+	for _, m := range p.liveByID(model) {
+		if len(m.Via) > 0 {
+			return m.Via
+		}
+	}
+	return nil
+}
+
+// RemotePrefers is the API a remote magpie's list says it asks the model
+// on best (magpie_prefers, PreferredEndpoint there); "" for another
+// provider's model, or one from a magpie from before it said.
+func (p Provider) RemotePrefers(model string) Protocol {
+	if !p.IsRemoteMagpie() {
+		return ""
+	}
+	for _, m := range p.liveByID(model) {
+		if m.Prefers != "" {
+			return Protocol(m.Prefers)
+		}
+	}
+	return ""
 }

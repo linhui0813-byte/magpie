@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -185,6 +186,10 @@ func TestReadOnceInFresh(t *testing.T) {
 		w.Write([]byte(claudePage("major_outage", "operational", "operational", "")))
 	}))
 	defer srv.Close()
+	// deferred after srv.Close, so it runs first: Close waits for the held
+	// read, which a failed check would leave held (#1808)
+	let := sync.OnceFunc(func() { close(slow) })
+	defer let()
 	for i := range Vendors {
 		if Vendors[i].ID == "anthropic" {
 			Vendors[i].Summary = srv.URL
@@ -192,15 +197,22 @@ func TestReadOnceInFresh(t *testing.T) {
 	}
 	defer func(n func() time.Time) { now = n }(now)
 	now = func() time.Time { return time.Now().Add(Fresh) }
-	start := time.Now()
-	s := Of("anthropic")
-	if took := time.Since(start); took > 100*time.Millisecond {
-		t.Fatalf("Of waited %v for the page", took)
+	// the page is held until let, so Of coming back at all is its not
+	// waiting for it: no wall-clock bound a loaded machine can pass (#1808).
+	// The deadline only turns a wait into a FAIL, and is short of the
+	// read's own 15s, after which a wait would come back too.
+	looked := make(chan []Status, 1)
+	go func() { looked <- Of("anthropic") }()
+	var s []Status
+	select {
+	case s = <-looked:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Of waited for the page")
 	}
 	if s[0].Level != "ok" {
 		t.Fatalf("level %q while the page is read again, want the last one", s[0].Level)
 	}
-	close(slow)
+	let()
 	if s := one(t, "anthropic"); s.Level != "major" {
 		t.Fatalf("level %q once read again, want major", s.Level)
 	}

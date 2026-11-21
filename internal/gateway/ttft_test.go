@@ -4,6 +4,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -13,11 +14,16 @@ import (
 )
 
 // paced is a vendor that streams its events a gap apart, the first at
-// once, or fails with a status after the gap.
+// once, or fails with a status after the gap. With heard, the gap before
+// each event marked after the first one starts only once the agent has
+// been sent the one before it (heard(0) for the first, and so on): a
+// gateway slow to read on a loaded machine otherwise reads two of them at
+// once and times them as one (#2575).
 type paced struct {
 	events []string
 	gap    time.Duration
 	fail   int
+	heard  func(i int)
 }
 
 func (p *paced) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -31,10 +37,17 @@ func (p *paced) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "text/event-stream")
 	f := w.(http.Flusher)
+	marked := 0
 	for i, ev := range p.events {
-		if i > 0 && strings.HasPrefix(ev, "~") { // a gap before it
-			time.Sleep(p.gap)
-			ev = ev[1:]
+		if strings.HasPrefix(ev, "~") { // a gap before it, but the first's
+			if p.heard != nil && marked > 0 {
+				p.heard(marked - 1)
+			}
+			marked++
+			if i > 0 {
+				time.Sleep(p.gap)
+			}
+			ev = ev[1:] // (left on the first, it was no event: #1939)
 		}
 		io.WriteString(w, ev+"\n\n")
 		f.Flush()
@@ -82,10 +95,68 @@ func lastUsage(t *testing.T) usage.Record {
 	return recs[len(recs)-1]
 }
 
+// hearing is an agent that tells when what it has been sent holds each
+// of words.
+type hearing struct {
+	*httptest.ResponseRecorder
+	words []string
+	got   []chan struct{}
+	told  []bool
+	late  time.Duration // how long its first write is held up
+	wrote bool
+}
+
+func newHearing(late time.Duration, words ...string) *hearing {
+	h := &hearing{ResponseRecorder: httptest.NewRecorder(), words: words, told: make([]bool, len(words)), late: late}
+	for range words {
+		h.got = append(h.got, make(chan struct{}))
+	}
+	return h
+}
+
+func (h *hearing) Write(b []byte) (int, error) {
+	if !h.wrote {
+		h.wrote = true
+		time.Sleep(h.late)
+	}
+	n, err := h.ResponseRecorder.Write(b)
+	for i, w := range h.words {
+		if !h.told[i] && strings.Contains(h.Body.String(), w) {
+			h.told[i] = true
+			close(h.got[i])
+		}
+	}
+	return n, err
+}
+
+func (h *hearing) WriteString(s string) (int, error) { return h.Write([]byte(s)) }
+
+// heard waits until the agent has been sent words[i], or gives up after a
+// while, so a stream that never sends it fails the test, not hangs it.
+func (h *hearing) heard(i int) {
+	select {
+	case <-h.got[i]:
+	case <-time.After(10 * time.Second):
+	}
+}
+
 // A streamed reply's first content (reasoning here) and first text are
 // timed from the request, whatever the vendor speaks and the agent asked
-// in, and kept in the usage, the request's route and its try.
+// in, and kept in the usage, the request's route and its try. Each comes
+// a gap after the agent was sent the one before it, so the times hold on
+// a loaded machine too (#2575): "late" holds the gateway's first write up
+// three gaps, as a busy scheduler did, while the vendor's events come in.
 func TestUsageKeepsTimeToFirstToken(t *testing.T) {
+	for _, late := range []time.Duration{0, 3 * pacedGap} {
+		name := "on time"
+		if late > 0 {
+			name = "late"
+		}
+		t.Run(name, func(t *testing.T) { usageKeepsTimeToFirstToken(t, late) })
+	}
+}
+
+func usageKeepsTimeToFirstToken(t *testing.T, late time.Duration) {
 	gap := pacedGap.Milliseconds()
 	for _, c := range []struct {
 		name   string
@@ -104,7 +175,9 @@ func TestUsageKeepsTimeToFirstToken(t *testing.T) {
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			fresh(t)
-			up := httptest.NewServer(&paced{events: c.events, gap: pacedGap})
+			// the reasoning's and the text's words, as every format writes them
+			rec := newHearing(late, "hmm", `"hi"`)
+			up := httptest.NewServer(&paced{events: c.events, gap: pacedGap, heard: rec.heard})
 			t.Cleanup(up.Close)
 			p := provider.Provider{ID: "fake", Name: "Fake", Key: "k", Models: []string{"m1"}}
 			switch c.proto {
@@ -119,7 +192,6 @@ func TestUsageKeepsTimeToFirstToken(t *testing.T) {
 				t.Fatal(err)
 			}
 			s := New()
-			rec := httptest.NewRecorder()
 			s.Handler().ServeHTTP(rec, httptest.NewRequest("POST", c.path, strings.NewReader(c.body)))
 			if rec.Code != 200 || !strings.Contains(rec.Body.String(), "hi") {
 				t.Fatalf("%d %s", rec.Code, rec.Body)
@@ -162,16 +234,21 @@ func TestUsageLeavesTTFTOfAWholeReply(t *testing.T) {
 
 // In a group that fails over, each try keeps its own time to its first
 // token, from when it was sent, and the usage the request's, from when it
-// came: the time the failed try took is in it, as it is in ms.
+// came: the time the failed try took is in it, as it is in ms. The
+// answering try's text comes a gap after the agent was sent its
+// reasoning, so a loaded machine can't read the two at once and time them
+// as one (#5948, as #2575 in TestUsageKeepsTimeToFirstToken).
 func TestGroupFailoverTimesEachTry(t *testing.T) {
 	fresh(t)
+	rec := newHearing(0, "hmm", `"hi"`)
 	serveOn(t, "a", "ka", []string{"m"}, &paced{fail: 429, gap: pacedGap})
-	serveOn(t, "b", "kb", []string{"m"}, &paced{events: pacedChat, gap: pacedGap})
+	serveOn(t, "b", "kb", []string{"m"}, &paced{events: pacedChat, gap: pacedGap, heard: rec.heard})
 	if err := provider.SaveGroup(provider.Group{Name: "Mine", Members: []string{"a/m", "b/m"}, Routing: provider.Ordered}); err != nil {
 		t.Fatal(err)
 	}
 	s := New()
-	code, body := postAs(t, s, "", `{"model":"group/mine","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+	s.Handler().ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"group/mine","stream":true,"messages":[{"role":"user","content":"hi"}]}`)))
+	code, body := rec.Code, rec.Body.String()
 	if code != 200 || !strings.Contains(body, `"hi"`) {
 		t.Fatalf("%d %s", code, body)
 	}
@@ -231,7 +308,8 @@ func TestFirstTokenKinds(t *testing.T) {
 	for i := 0; i < len(stream); i += 7 {
 		f.see([]byte(stream[i:min(i+7, len(stream))]))
 	}
-	if first, text := f.ms(); first < 1000 || text < first || !f.off || f.pend != nil {
+	// read on past its first text, for when the rest came (flowMs)
+	if first, text := f.ms(); first < 1000 || text < first || f.off || f.pend != nil || f.flowFor(0) < 1 {
 		t.Errorf("split: %d %d %+v", first, text, f)
 	}
 	// a JSON reply is not read
@@ -244,18 +322,163 @@ func TestFirstTokenKinds(t *testing.T) {
 
 // Codex's own models, relayed to the ChatGPT backend as they came, are
 // timed too — its stream says no Content-Type.
+// Each event after the first comes a gap after Codex was sent the one
+// before it, so a loaded machine can't read the text and the end at once
+// (#5948).
 func TestCodexBackendTimesFirstToken(t *testing.T) {
 	setup(t, provider.Chat, &fake{t: t})
-	p := &paced{events: pacedResponses, gap: pacedGap}
+	rec := newHearing(0, "hmm", `"hi"`)
+	p := &paced{events: pacedResponses, gap: pacedGap, heard: rec.heard}
 	chatgpt(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header()["Content-Type"] = nil
 		p.ServeHTTP(w, r)
 	})
-	if code, body := codexPost(t, `{"model":"gpt-5.5","stream":true,"input":"hi"}`); code != 200 {
-		t.Fatalf("%d %s", code, body)
+	codexServe(rec, `{"model":"gpt-5.5","stream":true,"input":"hi"}`)
+	if rec.Code != 200 {
+		t.Fatalf("%d %s", rec.Code, rec.Body)
 	}
 	gap := pacedGap.Milliseconds()
 	if u := lastUsage(t); u.TTFT < gap || u.FirstText < 2*gap || u.Millis <= u.FirstText || u.Output != 20 {
 		t.Errorf("usage %+v", u)
+	}
+}
+
+// bursty is a vendor that writes each of its chunks a gap after the last,
+// every event of a chunk in one write: a chunk of many is a reply it held
+// back and let go at once.
+type bursty struct {
+	chunks [][]string
+	gap    time.Duration
+	header bool // no Content-Type, as the ChatGPT backend sends
+}
+
+func (b *bursty) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	io.ReadAll(r.Body)
+	if b.header {
+		w.Header()["Content-Type"] = nil
+	} else {
+		w.Header().Set("Content-Type", "text/event-stream")
+	}
+	f := w.(http.Flusher)
+	for i, c := range b.chunks {
+		if i > 0 {
+			time.Sleep(b.gap)
+		}
+		io.WriteString(w, strings.Join(c, "\n\n")+"\n\n")
+		f.Flush()
+	}
+}
+
+// burstChunks: a reply's first word at once, then its out tokens' worth
+// of words n events in each later chunk, then its end with the usage.
+func burstChunks(proto provider.Protocol, words, per, out int) [][]string {
+	ev := func(word string) string {
+		if proto == provider.Responses {
+			return "event: response.output_text.delta\ndata: " + `{"type":"response.output_text.delta","item_id":"msg_1","output_index":0,"content_index":0,"delta":"` + word + `"}`
+		}
+		return `data: {"id":"c1","model":"m1","choices":[{"index":0,"delta":{"content":"` + word + `"}}]}`
+	}
+	chunks := [][]string{{ev("hi")}}
+	for i := 1; i < words; i += per {
+		var c []string
+		for j := i; j < min(i+per, words); j++ {
+			c = append(c, ev(" word"))
+		}
+		chunks = append(chunks, c)
+	}
+	end := []string{`data: {"id":"c1","model":"m1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":` + strconv.Itoa(out) + `}}`, `data: [DONE]`}
+	if proto == provider.Responses {
+		end = []string{"event: response.completed\ndata: " + `{"type":"response.completed","response":{"id":"r1","status":"completed","output":[],"usage":{"input_tokens":5,"output_tokens":` + strconv.Itoa(out) + `}}}`}
+	}
+	last := &chunks[len(chunks)-1]
+	*last = append(*last, end...)
+	return chunks
+}
+
+// A reply whose first word came at once and the rest only after a wait,
+// all in one burst, wrote nothing over the wait, and tells no speed (John
+// on Discord: a Kimi Code reply to OpenCode read 1,367 tok/s): before,
+// its 5,000 tokens over the 600 ms from its first word to its end read
+// about 8,300 tok/s. The burst is 5,000 tokens so that the time magpie
+// takes to pass it on (138 ms on a busy macOS runner at 8db24fd6) reads
+// faster than any real stream (MaxDecodeSpeed), as a real burst does;
+// 1,000 read 7,246 tok/s. One that streamed steadily keeps its speed, over
+// nearly all of its time from its first word.
+func TestBurstTellsNoSpeed(t *testing.T) {
+	const gap = 600 * time.Millisecond
+	for _, c := range []struct {
+		name  string
+		proto provider.Protocol
+		path  string
+		body  string
+	}{
+		{"chat", provider.Chat, "/v1/chat/completions", `{"model":"fake/m1","stream":true,"messages":[{"role":"user","content":"hi"}]}`},
+		{"responses from chat", provider.Chat, "/v1/responses", `{"model":"fake/m1","stream":true,"input":"hi"}`},
+	} {
+		for _, steady := range []bool{false, true} {
+			name := c.name + " burst"
+			chunks, g := burstChunks(c.proto, 200, 199, 5000), gap
+			if steady {
+				name = c.name + " steady"
+				chunks, g = burstChunks(c.proto, 11, 1, 200), gap/10
+			}
+			t.Run(name, func(t *testing.T) {
+				fresh(t)
+				up := httptest.NewServer(&bursty{chunks: chunks, gap: g})
+				t.Cleanup(up.Close)
+				p := provider.Provider{ID: "fake", Name: "Fake", Key: "k", Models: []string{"m1"}, Chat: up.URL + "/v1"}
+				if err := provider.Save(p); err != nil {
+					t.Fatal(err)
+				}
+				s := New()
+				rec := httptest.NewRecorder()
+				s.Handler().ServeHTTP(rec, httptest.NewRequest("POST", c.path, strings.NewReader(c.body)))
+				if rec.Code != 200 || !strings.Contains(rec.Body.String(), "word") {
+					t.Fatalf("%d %s", rec.Code, rec.Body)
+				}
+				u := lastUsage(t)
+				span := u.Millis - u.TTFT
+				// the upstream's wait starts when it sent the first word,
+				// which magpie reads a moment later: the span is the gap
+				// less that moment (599 ms of 600 on a busy macOS runner)
+				if u.TTFT <= 0 || span < gap.Milliseconds()*9/10 {
+					t.Fatalf("usage ttft %d, ms %d; want the end %v after the first word", u.TTFT, u.Millis, gap)
+				}
+				r := lastRoute(s)
+				if len(r.Tries) != 1 || r.Flow != u.Flow || r.Tries[0].Flow != u.Flow {
+					t.Errorf("flow: usage %d, route %d, tries %+v", u.Flow, r.Flow, r.Tries)
+				}
+				n, w := u.Decode()
+				if !steady {
+					if n != 0 || w != 0 {
+						t.Errorf("burst: %d tokens in %d ms (flow %d, %d ms from the first word) read %d tok/s; want no speed", n, w, u.Flow, span, int64(n)*1000/max(w, 1))
+					}
+					return
+				}
+				if n != 200 || w < span*7/10 || w > span {
+					t.Errorf("steady: %d tokens in %d ms (flow %d); want 200 over most of the %d ms from the first word", n, w, u.Flow, span)
+				}
+			})
+		}
+	}
+}
+
+// Codex's own models, relayed to the ChatGPT backend as they came, tell no
+// speed for a burst either.
+func TestCodexBackendBurstTellsNoSpeed(t *testing.T) {
+	setup(t, provider.Chat, &fake{t: t})
+	b := &bursty{chunks: burstChunks(provider.Responses, 200, 199, 5000), gap: 600 * time.Millisecond, header: true}
+	chatgpt(t, b.ServeHTTP)
+	if code, body := codexPost(t, `{"model":"gpt-5.5","stream":true,"input":"hi"}`); code != 200 {
+		t.Fatalf("%d %s", code, body)
+	}
+	u := lastUsage(t)
+	// the end after the wait, less the moment the first word took to
+	// reach magpie (599 ms of 600 on macOS CI at 58f45d05)
+	if u.Millis-u.TTFT < 540 || u.Output != 5000 {
+		t.Fatalf("usage %+v", u)
+	}
+	if n, w := u.Decode(); n != 0 || w != 0 {
+		t.Errorf("burst: %d tokens in %d ms (flow %d) read a speed; want none", n, w, u.Flow)
 	}
 }

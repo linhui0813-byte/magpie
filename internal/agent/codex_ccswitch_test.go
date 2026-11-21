@@ -112,7 +112,8 @@ func TestCodexKeepsHandPointedCCSwitchTable(t *testing.T) {
 // CC Switch's official OpenAI provider mirror writes model_provider = "custom"
 // and a [model_providers.custom] table with name = "OpenAI", requires_openai_auth = true
 // and no base_url (#504): it is the official provider, so its models are grouped
-// under OpenAI and failover moves Codex onto magpie while another account is on.
+// under OpenAI, and neither it nor a relay's table is pointed at magpie for a
+// Codex not connected while another account is on (TylerBai_loveai on X).
 func TestCodexCCSwitchOfficialOpenAIMirror(t *testing.T) {
 	const ccSwitchOfficialMirror = "model_provider = \"custom\"\nmodel = \"gpt-5.4\"\n\n" +
 		"[model_providers.custom]\nname = \"OpenAI\"\nrequires_openai_auth = true\nsupports_websockets = true\nwire_api = \"responses\"\n"
@@ -182,29 +183,15 @@ func TestCodexCCSwitchOfficialOpenAIMirror(t *testing.T) {
 		os.WriteFile(filepath.Join(filepath.Dir(provider.Path()), "logins.json"), b, 0o600)
 	}
 	logins(true)
-	if err := cxFailover.Sync(); err != nil {
-		t.Fatal(err)
+	for i := 0; i < 2; i++ {
+		if err := cxFailover.Sync(); err != nil {
+			t.Fatal(err)
+		}
+		if got := readFailover(); got != ccSwitchOfficialMirror {
+			t.Fatalf("sync %d with another account on changed CC Switch's mirror:\ngot:\n%s\nwant:\n%s", i, got, ccSwitchOfficialMirror)
+		}
 	}
-	tb, err := edit.GetTOMLTable(pathFailover, "model_providers.custom")
-	if err != nil {
-		t.Fatal(err)
-	}
-	codexURL := here(homeFailover).codexURL()
-	if tb["base_url"] != codexURL {
-		t.Fatalf("mirror table base_url = %q, want %q", tb["base_url"], codexURL)
-	}
-	if strings.Contains(readFailover(), "openai_base_url") {
-		t.Fatalf("mirror failover wrote openai_base_url:\n%s", readFailover())
-	}
-
-	// When failover turns off, base_url is removed and the file is byte-identical to original
-	logins(false)
-	if err := cxFailover.Sync(); err != nil {
-		t.Fatal(err)
-	}
-	if got := readFailover(); got != ccSwitchOfficialMirror {
-		t.Fatalf("failover off left config not byte-identical:\ngot:\n%s\nwant:\n%s", got, ccSwitchOfficialMirror)
-	}
+	_ = pathFailover
 
 	// Real relays with a base_url never get pointed at magpie gateway for failover
 	homeRelayFailover, readRelayFailover := codexHome(t, string(me), ccSwitchCodex)
@@ -222,20 +209,17 @@ func TestCodexCCSwitchOfficialOpenAIMirror(t *testing.T) {
 		t.Fatalf("real relay got openai_base_url:\n%s", readRelayFailover())
 	}
 
-	// Switching to a relay while failover was active on the mirror clears the marker
+	// Switching to a relay while failover from before was on the mirror clears the marker
 	// without deleting the relay's own base_url on Sync or Set.
 	homeSwitch, readSwitch := codexHome(t, string(me), ccSwitchOfficialMirror)
 	cxSwitch := codex(homeSwitch)
 	pathSwitch := filepath.Join(homeSwitch, ".codex", "config.toml")
 	logins(true)
-	if err := cxSwitch.Sync(); err != nil {
+	// mirror failover as a magpie from before left it, marker and all
+	if err := edit.SetTOMLKey(pathSwitch, "model_providers.custom", "base_url", here(homeSwitch).codexURL()); err != nil {
 		t.Fatal(err)
 	}
-	// Verify mirror failover was activated and marker was set
-	tbSwitch, _ := edit.GetTOMLTable(pathSwitch, "model_providers.custom")
-	if tbSwitch["base_url"] != here(homeSwitch).codexURL() {
-		t.Fatalf("mirror base_url = %q, want codexURL", tbSwitch["base_url"])
-	}
+	stash(map[string]string{"codex.mirror_failover": "custom"})
 	// User switches CC Switch to a relay, reusing the custom table
 	if err := os.WriteFile(pathSwitch, []byte(ccSwitchCodex), 0o644); err != nil {
 		t.Fatal(err)
@@ -257,4 +241,73 @@ func TestCodexCCSwitchOfficialOpenAIMirror(t *testing.T) {
 		t.Fatalf("relay base_url after Set(\"\") = %q, want https://relay.example/v1", tbAfterSetEmpty["base_url"])
 	}
 	_ = readSwitch
+}
+
+// CC Switch's OpenAI mirror ("custom": name OpenAI, the ChatGPT sign-in, no
+// base_url) left in config.toml after the user moved Codex onto the
+// built-in provider and a magpie model. Codex's openai_base_url, which
+// takes the built-in provider to magpie, doesn't reach a table of another
+// id, so a thread started on "custom" and reopened went straight to
+// ChatGPT, which refused the magpie model picked in it, and magpie never
+// saw the request (#1796, WardLu). While Codex goes to magpie by the base
+// URL the mirror does too; a profile's mirror is the user's to pick, and
+// stepping off magpie takes the base URL off again.
+func TestCodexTakesCCSwitchMirrorForItsThreads(t *testing.T) {
+	const cfg = "model = \"gpt-5.4\"\n\n" +
+		"[model_providers.custom]\nname = \"OpenAI\"\nrequires_openai_auth = true\nsupports_websockets = true\nwire_api = \"responses\"\n\n" +
+		"[model_providers.cc-switch-3]\nname = \"OpenAI\"\nrequires_openai_auth = true\nwire_api = \"responses\"\n\n" +
+		"[profiles.p]\nmodel_provider = \"cc-switch-3\"\n"
+	home, read := codexHome(t, `{"tokens":{"access_token":"x","id_token":"x.e30.x"}}`, cfg)
+	path := filepath.Join(home, ".codex", "config.toml")
+	cx := codex(home)
+	table := func(id string) map[string]string {
+		tb, err := edit.GetTOMLTable(path, "model_providers."+id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return tb
+	}
+	at := here(home)
+	for round, off := range []string{"gpt-5.4", ""} {
+		if err := cx.Fields[0].Set("fake/m1"); err != nil {
+			t.Fatal(err)
+		}
+		if c := table("custom"); c["base_url"] != at.codexURL() || c["requires_openai_auth"] != "true" || c["name"] != "OpenAI" {
+			t.Fatalf("round %d: the mirror isn't through magpie:\n%s", round, read())
+		}
+		if _, ok := table("cc-switch-3")["base_url"]; ok {
+			t.Fatalf("round %d: the profile's mirror changed:\n%s", round, read())
+		}
+		if d := cx.Check(); d != "" {
+			t.Fatalf("round %d: check: %s\n%s", round, d, read())
+		}
+		if err := cx.Sync(); err != nil {
+			t.Fatal(err)
+		}
+		if table("custom")["base_url"] != at.codexURL() || cx.Check() != "" {
+			t.Fatalf("round %d: sync:\n%s", round, read())
+		}
+		if err := cx.Fields[0].Set(off); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := table("custom")["base_url"]; ok {
+			t.Fatalf("round %d: off magpie (%q), the mirror keeps magpie's URL:\n%s", round, off, read())
+		}
+		if _, ok := stashLoad()[at.key("codex.mirrors")]; ok {
+			t.Errorf("round %d: stash left", round)
+		}
+	}
+	// one the user changed while magpie had it stays as they left it
+	if err := cx.Fields[0].Set("fake/m1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := edit.SetTOMLKey(path, "model_providers.custom", "base_url", "https://mine.example/v1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := cx.Fields[0].Set(""); err != nil {
+		t.Fatal(err)
+	}
+	if table("custom")["base_url"] != "https://mine.example/v1" {
+		t.Fatalf("hand-set base_url lost:\n%s", read())
+	}
 }

@@ -52,6 +52,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await browser.close();
       });
       page.setDefaultTimeout(5000);
+      page.setDefaultNavigationTimeout(60000);
       const errors = [], posts = [];
       let refusing = true;
       page.on("pageerror", (e) => errors.push(e.message));
@@ -65,7 +66,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         hint: zh ? "可选：用「获取模型」从供应商列表中勾选，或直接填写模型 ID；不选则保存后自动获取模型列表。" : "Optional: Fetch models to pick from the vendor's list, or type ids; none picked, magpie asks for the list after saving.",
       };
       await page.locator("#addProvider").click();
-      await page.locator("#addSheet .custom-foot .custom").click();
+      await page.locator("#addSheet .row-head .custom").click();
       const ed = page.locator(".editor.new");
       await ed.locator(".add-models").waitFor();
       const field = ed.locator(".add-models .detect-row input");
@@ -117,7 +118,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       // a chip ticked is in the field; typing ticks a chip
       await still(chips.nth(0), "a chip");
       assert.equal(await field.inputValue(), "gpt-5.5");
-      assert.equal(await chips.nth(0).getAttribute("class"), "mchip on");
+      assert.equal(await chips.nth(0).getAttribute("class"), "mchip pick on");
       await field.fill("gpt-5.5, deepseek-v4, own-model");
       assert.equal(await ed.locator('.add-models-list .mchip.on').count(), 2);
       assert.equal(await ed.locator(".add-models-list .detect-acts .hint").textContent(), L.picked(2, 30));

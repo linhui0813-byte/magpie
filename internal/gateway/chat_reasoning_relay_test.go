@@ -34,32 +34,31 @@ func TestChatReasoningRelayedAsItComes(t *testing.T) {
 	gw := httptest.NewServer(New().Handler())
 	t.Cleanup(gw.Close)
 
-	start := time.Now()
 	res, err := http.Post(gw.URL+"/v1/chat/completions", "application/json",
 		strings.NewReader(`{"model":"wb/deepseek-v4.1-flash","stream":true,"reasoning_effort":"max","messages":[{"role":"user","content":"hi"}]}`))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer res.Body.Close()
-	var firstThought, firstText time.Time
+	var firstThought time.Time
 	rd := bufio.NewReader(res.Body)
 	for {
 		ln, err := rd.ReadString('\n')
 		if firstThought.IsZero() && strings.Contains(ln, `"reasoning_content":"hmm"`) {
 			firstThought = time.Now()
 		}
-		if firstText.IsZero() && strings.Contains(ln, `"content":"done"`) {
-			firstText = time.Now()
-		}
 		if err != nil {
 			break
 		}
 	}
-	if firstThought.IsZero() || firstText.IsZero() {
-		t.Fatal("no reasoning or no text reached the client")
+	if firstThought.IsZero() {
+		t.Fatal("no reasoning reached the client")
 	}
-	// the first thought is sent 200ms in, the text a second after it
-	if firstThought.Sub(start) > 700*time.Millisecond || firstText.Sub(firstThought) < 700*time.Millisecond {
-		t.Fatalf("reasoning held: first thought after %v, %v before the text", firstThought.Sub(start), firstText.Sub(firstThought))
+	<-up.done
+	// by the vendor's own clock, so a slow start under load doesn't count:
+	// the first thought reaches the client before the vendor has even
+	// written the text, a second after it
+	if text := up.sent[6]; !firstThought.Before(text) {
+		t.Fatalf("reasoning held: the first thought reached the client %v after the vendor wrote the text", firstThought.Sub(text))
 	}
 }

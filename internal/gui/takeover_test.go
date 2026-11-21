@@ -61,3 +61,41 @@ func TestGatewayTakenOver(t *testing.T) {
 		}
 	}
 }
+
+// A magpie that holds the gateway's port but doesn't answer in time (the
+// service busy on a small server, or starting) still has it: magpie web
+// beside it doesn't listen a second time, which only failed with "bind:
+// address already in use" (K.Liu on Discord), and leaves the port to it.
+func TestGatewayNotServedBesideASlowOne(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("USERPROFILE", os.Getenv("HOME"))
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("MAGPIE_ADDR", ln.Addr().String())
+	slow := make(chan struct{})
+	other := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-slow
+		w.Write([]byte(`{"name":"magpie"}`))
+	})}
+	go other.Serve(ln)
+	defer other.Close()
+	defer close(slow)
+	gw := serveGateway()
+	t.Cleanup(func() {
+		gatewayMu.Lock()
+		defer gatewayMu.Unlock()
+		if served.Load() != nil && servedRun.stop != nil {
+			servedRun.stop()
+			<-servedRun.done
+		}
+		served.Store(nil)
+		takenSaid.Store(false)
+	})
+	if gw != nil {
+		t.Fatal("listened for the gateway on a port another magpie holds")
+	}
+}

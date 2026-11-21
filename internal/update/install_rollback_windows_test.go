@@ -8,6 +8,7 @@ import (
 	"sync"
 	"syscall"
 	"testing"
+	"time"
 )
 
 func rollbackFiles(t *testing.T) (string, string) {
@@ -20,6 +21,14 @@ func rollbackFiles(t *testing.T) (string, string) {
 		}
 	}
 	return exe, staged
+}
+
+// shortWaits has moveIn and moveAside give up on a file held for good
+// at once.
+func shortWaits(t *testing.T) {
+	was, held := asideWaits, heldFor
+	asideWaits, heldFor = []time.Duration{time.Millisecond}, 0
+	t.Cleanup(func() { asideWaits, heldFor = was, held })
 }
 
 func holdForRollbackTest(t *testing.T, path string) func() {
@@ -50,6 +59,7 @@ func TestInstallBinaryRestoresAfterStagedRenameFails(t *testing.T) {
 			name = "earlier old still held"
 		}
 		t.Run(name, func(t *testing.T) {
+			shortWaits(t)
 			exe, staged := rollbackFiles(t)
 			aside := exe + ".old"
 			if heldOld {
@@ -99,6 +109,7 @@ func TestInstallBinaryRestoresAfterStagedRenameFails(t *testing.T) {
 // If a scanner takes the old file just after it moves aside, restoration
 // can fail too. Report both failures and keep both versions for recovery.
 func TestInstallBinaryReportsFailedRestore(t *testing.T) {
+	shortWaits(t)
 	exe, staged := rollbackFiles(t)
 	holdForRollbackTest(t, staged)
 	rename := renameFile

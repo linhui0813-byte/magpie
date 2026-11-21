@@ -6,12 +6,20 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/yetone/magpie/internal/claudeseal"
 )
 
 const (
 	openaiKey = "sk-proj-abcdEFGH1234ijklMNOP5678qrst"
 	ghToken   = "ghp_0123456789abcdefghijABCDEFGHIJ0123"
 )
+
+// unmarked is s without its placeholders. A placeholder's suffix is a keyed
+// hash, so with a random key it can spell a short value the test checks is
+// gone: "ops" in {{HOSTNAME_mlopsiy3}} turned TestMoreKinds red on macOS
+// CI at 6c099edd.
+func unmarked(s string) string { return placeholderRe.ReplaceAllString(s, "") }
 
 func TestMask(t *testing.T) {
 	cases := []struct {
@@ -45,7 +53,7 @@ func TestMask(t *testing.T) {
 			t.Errorf("%q: %d masked, want %d: %q", c.in, n, c.count, out)
 		}
 		for _, g := range c.gone {
-			if strings.Contains(out, g) {
+			if strings.Contains(unmarked(out), g) {
 				t.Errorf("%q: %q still in %q", c.in, g, out)
 			}
 		}
@@ -164,5 +172,159 @@ func TestWriterWhole(t *testing.T) {
 	if rec.Header().Get("Content-Length") != "" || strings.Contains(rec.Body.String(), "{{") ||
 		!strings.Contains(rec.Body.String(), "got "+ghToken) || !json.Valid(rec.Body.Bytes()) {
 		t.Fatalf("%v %s", rec.Header(), rec.Body.String())
+	}
+}
+
+// What a vendor sealed goes back as the vendor wrote it: the values masked
+// elsewhere in the request as their placeholders, its own words as they
+// are; the same text unsealed is masked as any other.
+func TestMaskJSONSignedGoesBackAsWritten(t *testing.T) {
+	o := Options{Secrets: true, Personal: true}
+	const email, key = "jeremy.zhou@gmail.com", "sk-proj-abcdEFGH1234ijklMNOP5678qrst"
+	pe, _ := Mask(email, o)
+	pk, _ := Mask(key, o)
+	// what the agent has back of what the vendor wrote: the values in it
+	// in other words around them, and the vendor's own number
+	agent := "Order 13800138000 is for " + email + ". Its key is the one ending " + key + "."
+	vendor := "Order 13800138000 is for " + pe + ". Its key is the one ending " + pk + "."
+	user := `{"role":"user","content":"I am ` + email + `, key ` + key + `"}`
+	for _, c := range []struct{ name, body, want string }{
+		{"anthropic", `{"messages":[` + user + `,{"role":"assistant","content":[{"type":"thinking","thinking":"` + agent + `","signature":"Eqk1"}]}]}`, vendor},
+		{"gemini", `{"contents":[{"role":"user","parts":[{"text":"I am ` + email + `, key ` + key + `"}]},{"role":"model","parts":[{"text":"` + agent + `","thought":true,"thoughtSignature":"Cs4B"}]}]}`, vendor},
+		{"gemini call", `{"contents":[{"role":"user","parts":[{"text":"I am ` + email + `, key ` + key + `"}]},{"role":"model","parts":[{"functionCall":{"name":"note","args":{"text":"` + agent + `"}},"thoughtSignature":"Cs4B"}]}]}`, vendor},
+		{"responses", `{"input":[` + user + `,{"type":"reasoning","summary":[{"type":"summary_text","text":"` + agent + `"}],"encrypted_content":"gAAAA"}]}`, vendor},
+	} {
+		out, _ := MaskJSON([]byte(c.body), o)
+		if !strings.Contains(string(out), `"`+c.want+`"`) {
+			t.Errorf("%s: sealed text not as the vendor wrote it:\n%s", c.name, out)
+		}
+		if strings.Contains(string(out), email) || strings.Contains(string(out), key) {
+			t.Errorf("%s: a value went out: %s", c.name, out)
+		}
+	}
+	// no signature, nothing to match: masked by the rules
+	out, _ := MaskJSON([]byte(`{"messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"call 13800138000 now","signature":""}]}]}`), o)
+	if strings.Contains(string(out), "13800138000") {
+		t.Errorf("unsigned thinking left unmasked: %s", out)
+	}
+}
+
+// Claude's block magpie gave a Responses client to carry back
+// (claudeseal) goes back byte for byte: Claude's own text in it, with the
+// placeholders Claude was sent, is what its signature is checked against.
+func TestMaskJSONKeepsClaudeBlocks(t *testing.T) {
+	o := Options{Secrets: true, Personal: true}
+	const email = "jeremy.zhou@gmail.com"
+	pe, _ := Mask(email, o)
+	sealed := claudeseal.Seal([]byte(`{"type":"thinking","thinking":"Write to ` + pe + `, or call 13800138000.","signature":"Eqk1"}`))
+	body := `{"input":[{"role":"user","content":"I am ` + email + `"},{"type":"reasoning","summary":[{"type":"summary_text","text":"Write to ` + email + `"}],"encrypted_content":"` + sealed + `"}]}`
+	out, _ := MaskJSON([]byte(body), o)
+	if !strings.Contains(string(out), `"`+sealed+`"`) || strings.Contains(string(out), email) {
+		t.Errorf("Claude's block not as it was sent, or a value went out:\n%s", out)
+	}
+}
+
+// In a tool call's arguments a field named for a secret holds one,
+// whatever its value looks like (#2946): the rules judge a value by its
+// shape, so {"api_key": "…"} with a value no rule knows went out as it
+// was, and access_key_id's _id kept even an AKIA from the value's own
+// rule. A name that only ends in key is no secret: a sort key, a cache
+// key, a public key stay, and so does a data: value.
+func TestMaskJSONNamedSecrets(t *testing.T) {
+	o := Options{Secrets: true}
+	for _, c := range []struct {
+		key, value string
+		gone       bool
+	}{
+		{"api_key", "Qm27wVb9nLx4tRk8Ps3d", true},
+		{"client_secret", "randomvalue42x", true},
+		{"db_pass", "Hr7jTm2qwXz94", true},
+		{"access_key_id", "AKIAIOSFODNN7EXAMPLE", true},
+		{"Authorization", "Bearer zq83Mw2vNx7kRt5", true},
+		{"Cookie", "sid=Yn41Pc8wLd2mQs6", true},
+		{"apiKey", "plainrandomvalue1", true},
+		{"sort_key", "created_at_2024", false},
+		{"cache_key", "lru_items_01", false},
+		{"prompt_cache_key", "conv_12345678", false},
+		{"public_key", "04a1b2c3d4e5f6a7", false},
+		{"password", "${DB_PASSWORD}", false},
+		{"password", "short", false},
+	} {
+		for wire, body := range map[string]string{
+			"anthropic tool_use":      `{"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"deploy","input":{"` + c.key + `":"` + c.value + `"}}]}]}`,
+			"gemini functionCall":     `{"contents":[{"role":"model","parts":[{"functionCall":{"name":"deploy","args":{"cfg":{"` + c.key + `":"` + c.value + `"}}}}]}]}`,
+			"gemini functionResponse": `{"contents":[{"role":"user","parts":[{"functionResponse":{"name":"env","response":{"` + c.key + `":"` + c.value + `"}}}]}]}`,
+		} {
+			out, n := MaskJSON([]byte(body), o)
+			if !c.gone {
+				if n != 0 || string(out) != body {
+					t.Errorf("%s %s: %d masked: %s", wire, c.key, n, out)
+					continue
+				}
+			} else if strings.Contains(string(out), c.value) || !strings.Contains(string(out), "{{SECRET_") {
+				t.Errorf("%s %s: not masked as a secret: %s", wire, c.key, out)
+				continue
+			}
+			if back := RestoreJSON(out); string(back) != body {
+				t.Errorf("%s %s: restored %s", wire, c.key, back)
+			}
+		}
+	}
+}
+
+// A key the vendor's protocol names is the vendor's to read, whatever it
+// is called: masked by its name, Anthropic's MCP connector would get a
+// placeholder for its server's token, and a top-level field the vendor
+// reads would break the same way. Only a value's shape masks there. And
+// with secret masking off, no name masks anything (#2946).
+func TestMaskJSONSecretNamesOnlyInToolArgs(t *testing.T) {
+	for _, body := range []string{
+		`{"mcp_servers":[{"type":"url","url":"https://mcp.example.com/sse","name":"ex","authorization_token":"opaquevalue42abc"}],"messages":[{"role":"user","content":"hi"}]}`,
+		`{"api_key":"opaquevalue42abc","messages":[{"role":"user","content":"hi"}]}`,
+		`{"metadata":{"session_token":"opaquevalue42abc"}}`,
+	} {
+		if out, n := MaskJSON([]byte(body), Options{Secrets: true}); n != 0 || string(out) != body {
+			t.Errorf("a protocol key was masked by its name: %d %s", n, out)
+		}
+	}
+	body := `{"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"deploy","input":{"api_key":"opaquevalue42abc"}}]}]}`
+	if out, n := MaskJSON([]byte(body), Options{Personal: true}); n != 0 || string(out) != body {
+		t.Errorf("secret masking off, a name masked: %d %s", n, out)
+	}
+}
+
+// An id goes as the vendor gave it, on both sides of what it matches.
+func TestMaskJSONKeepsIDs(t *testing.T) {
+	o := Options{Secrets: true, Personal: true}
+	const id = "call_-6090648166611204696" // 19 digits that pass Luhn
+	for _, k := range []string{"id", "tool_call_id", "tool_use_id", "call_id", "approval_request_id", "toolCallId"} {
+		body := `{"` + k + `":"` + id + `"}`
+		if out, _ := MaskJSON([]byte(body), o); string(out) != body {
+			t.Errorf("%s masked: %s", k, out)
+		}
+	}
+	if out, _ := MaskJSON([]byte(`{"content":"card `+id[6:]+`"}`), o); strings.Contains(string(out), id[6:]) {
+		t.Errorf("the same digits in text should be masked: %s", out)
+	}
+}
+
+// A tool call's arguments are the agent's: a key there named like a
+// signature or an id doesn't keep its value, or its neighbours', from the
+// rules.
+func TestMaskJSONToolArgsMasked(t *testing.T) {
+	o := Options{Secrets: true, Personal: true}
+	for _, c := range []struct{ name, body string }{
+		{"signature key", `{"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"send_email","input":{"signature":"Best, Bob","body":"DB_PASSWORD=hunter2abc1 call 13800138000"}}]}]}`},
+		{"id keys", `{"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"lookup","input":{"user_id":"DB_PASSWORD=hunter2abc1","phone_id":"13800138000"}}]}]}`},
+		{"gemini args", `{"contents":[{"role":"model","parts":[{"functionCall":{"name":"lookup","args":{"thoughtSignature":"x","customer_phone":"13800138000","note":"DB_PASSWORD=hunter2abc1"}}}]}]}`},
+		{"text block", `{"messages":[{"role":"user","content":[{"type":"text","text":"DB_PASSWORD=hunter2abc1 call 13800138000","signature":"x"}]}]}`},
+	} {
+		out, _ := MaskJSON([]byte(c.body), o)
+		if strings.Contains(string(out), "hunter2abc1") || strings.Contains(string(out), "13800138000") {
+			t.Errorf("%s: a value went out: %s", c.name, out)
+		}
+		if !strings.Contains(string(out), `"toolu_1"`) && strings.Contains(c.body, "toolu_1") {
+			t.Errorf("%s: the call's id changed: %s", c.name, out)
+		}
 	}
 }

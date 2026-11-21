@@ -14,13 +14,14 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/yetone/magpie/internal/appdir"
+	"github.com/yetone/magpie/internal/lazyre"
+	"github.com/yetone/magpie/internal/netproxy"
 	"golang.org/x/oauth2/google"
 )
 
@@ -43,11 +44,11 @@ type BillingEstimate struct {
 	LatestUsage time.Time `json:"latestUsage"`
 }
 
-var geminiTableID = regexp.MustCompile(`^[a-z][a-z0-9-]{4,61}[a-z0-9]\.[A-Za-z0-9_]+\.[A-Za-z0-9_]+$`)
-var geminiAccountID = regexp.MustCompile(`^[A-F0-9]{6}-[A-F0-9]{6}-[A-F0-9]{6}$`)
-var geminiServiceID = regexp.MustCompile(`^[A-F0-9]{4}-[A-F0-9]{4}-[A-F0-9]{4}$`)
-var geminiLocation = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9-]{0,63}$`)
-var geminiCurrency = regexp.MustCompile(`^[A-Z]{3}$`)
+var geminiTableID = lazyre.New(`^[a-z][a-z0-9-]{4,61}[a-z0-9]\.[A-Za-z0-9_]+\.[A-Za-z0-9_]+$`)
+var geminiAccountID = lazyre.New(`^[A-F0-9]{6}-[A-F0-9]{6}-[A-F0-9]{6}$`)
+var geminiServiceID = lazyre.New(`^[A-F0-9]{4}-[A-F0-9]{4}-[A-F0-9]{4}$`)
+var geminiLocation = lazyre.New(`^[A-Za-z][A-Za-z0-9-]{0,63}$`)
+var geminiCurrency = lazyre.New(`^[A-Z]{3}$`)
 
 var errGeminiBillingSetup = errors.New("Gemini billing estimate needs setup; configure the BigQuery billing export in this provider's Credit estimate field")
 var errGeminiBillingAuth = errors.New("Gemini billing estimate needs Google Cloud credentials; run gcloud auth application-default login, or configure GOOGLE_APPLICATION_CREDENTIALS")
@@ -55,7 +56,7 @@ var errGeminiBillingAuth = errors.New("Gemini billing estimate needs Google Clou
 // SupportsGeminiBilling includes an imported provider using Google's own
 // endpoint, but never a relay or the separate Vertex AI service.
 func SupportsGeminiBilling(p Provider) bool {
-	for _, base := range []string{p.Chat, p.Responses, p.Anthropic} {
+	for _, base := range []string{p.Chat, p.Responses, p.Anthropic, p.Gemini} {
 		if hostOf(base) == "generativelanguage.googleapis.com" {
 			return p.Account == nil
 		}
@@ -120,6 +121,9 @@ func geminiBillingRead(ctx context.Context, p Provider, force bool) geminiBillin
 	key := string(b)
 	if old, ok := geminiBillingCache[key]; ok && !force && time.Since(old.at) < 15*time.Minute {
 		return old
+	}
+	if err := netproxy.Held(ctx); err != nil {
+		return geminiBillingReading{err: err}
 	}
 	r := queryGeminiBilling(ctx, c)
 	r.at = time.Now()

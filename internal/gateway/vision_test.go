@@ -1,6 +1,8 @@
 package gateway
 
 import (
+	"encoding/base64"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -189,15 +191,16 @@ func TestGroupsTextOnlyMemberIsGivenTheDescription(t *testing.T) {
 func TestDescriberThatCantSeeIsntAskedToDescribe(t *testing.T) {
 	s, u := eyed(t)
 	// the setting names a text-only model: its own request is turned away,
-	// not described by itself again and again
+	// not described by itself again and again, and the next model that
+	// sees describes the image in its place (kelvinjason11 on X)
 	st := settings.Load()
 	st.Vision = "probe/text"
 	if err := settings.Save(st); err != nil {
 		t.Fatal(err)
 	}
 	code, body := postAs(t, s, "", `{"model":"probe/text","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,aGVsbG8="}}]}]}`)
-	if code != 502 || len(u.sent("text")) != 0 {
-		t.Fatalf("%d %s; text model sent %d", code, body, len(u.sent("text")))
+	if got := u.sent("text"); code != 200 || len(got) != 1 || !strings.Contains(got[0], "probe/eye describes it") {
+		t.Fatalf("%d %s; text model sent %v", code, body, got)
 	}
 }
 
@@ -209,5 +212,29 @@ func TestSeerPicksAModelThatSees(t *testing.T) {
 	noVision(t)
 	if _, ok := seer(); ok {
 		t.Fatal("seer with vision off")
+	}
+}
+
+// A long conversation sends every past screenshot again on each turn
+// (fflake33, Discord: hundreds of them). Each is described once, not again
+// on the next turn once there are more than 256.
+func TestManyImagesDescribedOnce(t *testing.T) {
+	s, u := eyed(t)
+	const n = 300
+	var parts []string
+	for i := range n {
+		img := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("screenshot %d", i)))
+		parts = append(parts, `{"type":"input_image","image_url":"data:image/png;base64,`+img+`"}`)
+	}
+	body := `{"model":"probe/text","input":[{"role":"user","content":[{"type":"input_text","text":"read"},` + strings.Join(parts, ",") + `]}]}`
+	for turn := 1; turn <= 2; turn++ {
+		rec := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rec, httptest.NewRequest("POST", "/v1/responses", strings.NewReader(body)))
+		if rec.Code != 200 {
+			t.Fatalf("turn %d: %d %.300s", turn, rec.Code, rec.Body.String())
+		}
+	}
+	if got := len(u.sent("eye")); got != n {
+		t.Fatalf("%d images described %d times over two turns, want each once", n, got)
 	}
 }

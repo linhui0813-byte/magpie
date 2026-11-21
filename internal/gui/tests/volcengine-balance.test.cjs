@@ -27,6 +27,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       t.after(() => browser.close());
       const page = await (await browser.newContext({ viewport: { width, height: 700 }, reducedMotion: "reduce" })).newPage();
       page.setDefaultTimeout(5000);
+      page.setDefaultNavigationTimeout(60000);
       const errors = [], posts = [];
       page.on("pageerror", (e) => errors.push(e.message));
       let credentialsSet = true, setup = false;
@@ -55,7 +56,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       });
       const edit = async () => {
         await page.locator(".row.provider", { hasText: ark.name }).click();
-        const token = page.locator('.editor input[type="password"]').nth(1);
+        const token = page.locator(".editor .balance-token");
         await token.waitFor();
         return token;
       };

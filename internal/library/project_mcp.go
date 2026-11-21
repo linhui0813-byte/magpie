@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -26,19 +27,35 @@ import (
 // mcp-services, "Configuration Files and Default Load Paths") and Pi's
 // .pi/mcp.json (mcpServers, read once the project is trusted; pi.dev/docs/
 // latest/mcp, "Configure servers" — Pi's own MCP, 0.99 on, whatever
-// extension the user's file is written for). Each is written in the shape
-// the agent's user-wide file has.
+// extension the user's file is written for). Qoder's CLI (and Qoder CN's)
+// reads .qoder/settings.json's mcpServers as its project level, beside
+// .mcp.json (docs.qoder.com/cli/mcp-reference; @qoder-ai/qodercli and
+// @qodercn-ai/qoderclicn 1.1.69 name the project folder .qoder alike).
+// CodeBuddy Code reads the first there is of .mcp.json and mcp.json at the
+// project's root (getMcpCandidatePaths for the project scope,
+// @tencent-ai/codebuddy-code 2.164.0), and Droid .factory/mcp.json
+// (docs.factory.com/cli/configuration/mcp). Qoder and CodeBuddy, like
+// Claude Code, ask the user to approve a project's server before using
+// it. Each is written in the shape the agent's user-wide file has.
+// DeepSeek Harness has none: its servers are @deepseek-ai/dsh-mcp-client
+// rows in a profile's patch layers (bundles, the profile's and
+// $DSH_HOME's cordis.patch.yml, --patch overlays; composeProfile in
+// @deepseek-ai/dsh 0.2.1-rc.5's profile-boot), none of them the project's.
 var projectMCPFiles = map[string]struct {
 	rel    string
 	format mcpFormat
 }{
-	"claude":   {".mcp.json", fmtClaude},
-	"codex":    {".codex/config.toml", fmtCodex},
-	"gemini":   {".gemini/settings.json", fmtGemini},
-	"cursor":   {".cursor/mcp.json", fmtCursor},
-	"opencode": {"opencode.json", fmtOpenCode},
-	"zcode":    {".zcode/config.json", fmtZCode},
-	"pi":       {".pi/mcp.json", fmtPiNative},
+	"claude":    {".mcp.json", fmtClaude},
+	"codex":     {".codex/config.toml", fmtCodex},
+	"gemini":    {".gemini/settings.json", fmtGemini},
+	"cursor":    {".cursor/mcp.json", fmtCursor},
+	"opencode":  {"opencode.json", fmtOpenCode},
+	"zcode":     {".zcode/config.json", fmtZCode},
+	"pi":        {".pi/mcp.json", fmtPiNative},
+	"qoder":     {".qoder/settings.json", fmtOmp},
+	"qoder-cn":  {".qoder/settings.json", fmtOmp},
+	"codebuddy": {".mcp.json", fmtClaude},
+	"droid":     {".factory/mcp.json", fmtClaude},
 }
 
 // ProjectMCPFile is the file, in a project, an agent reads the project's
@@ -53,7 +70,8 @@ func ProjectNoSSE(agent string) bool {
 }
 
 // mcpRel is the agent's file in this project: OpenCode's opencode.jsonc
-// when that is the one the project has.
+// when that is the one the project has, and CodeBuddy's mcp.json when the
+// project has that and no .mcp.json, as CodeBuddy reads only the first.
 func (p *Project) mcpRel(agent string) (string, mcpFormat) {
 	f, ok := projectMCPFiles[agent]
 	if !ok {
@@ -62,13 +80,19 @@ func (p *Project) mcpRel(agent string) (string, mcpFormat) {
 	if f.format == fmtOpenCode && !exists(filepath.Join(p.Dir, "opencode.json")) && exists(filepath.Join(p.Dir, "opencode.jsonc")) {
 		return "opencode.jsonc", f.format
 	}
+	if agent == "codebuddy" && !exists(filepath.Join(p.Dir, ".mcp.json")) && exists(filepath.Join(p.Dir, "mcp.json")) {
+		return "mcp.json", f.format
+	}
 	return f.rel, f.format
 }
 
 // formatOfRel is the format of a project's file magpie wrote servers in.
 func formatOfRel(rel string) (mcpFormat, bool) {
-	if rel == "opencode.jsonc" {
+	switch rel {
+	case "opencode.jsonc":
 		return fmtOpenCode, true
+	case "mcp.json":
+		return fmtClaude, true
 	}
 	for _, f := range projectMCPFiles {
 		if f.rel == rel {
@@ -82,7 +106,12 @@ func formatOfRel(rel string) (mcpFormat, bool) {
 // agent's file there, and takes out those magpie wrote that it no longer
 // has; an entry by the same name that magpie didn't write is left as it
 // is, and so is everything else in the file.
-func (l *Library) syncProjectMCP(p *Project, fail func(what string, err error)) {
+//
+// hubs are the router's entries the project gives an agent (projectHubs):
+// a server the router serves goes to that agent through its entry, not as
+// an entry of its own, and Codex's is written in its file here (Claude
+// Code's is in its own record of the project, syncClaudeLocal).
+func (l *Library) syncProjectMCP(p *Project, hubs map[string]*Server, fail func(what string, err error)) {
 	want := map[string][]*Server{} // the file → its servers
 	for _, name := range slices.Sorted(func(yield func(string) bool) {
 		for n := range p.Servers {
@@ -91,13 +120,15 @@ func (l *Library) syncProjectMCP(p *Project, fail func(what string, err error)) 
 			}
 		}
 	}) {
+		// one turned off (ServerOn) is off in every project too, and
+		// keeps the project's agents for when it is on again
 		s := l.server(name)
-		if s == nil {
+		if s == nil || s.Hidden {
 			continue
 		}
 		for _, id := range p.Servers[name] {
 			rel, format := p.mcpRel(id)
-			if rel == "" {
+			if rel == "" || hubs[id] != nil && inHub(s, id) {
 				continue
 			}
 			if err := (&mcpFile{Format: format}).supports(s); err != nil {
@@ -112,6 +143,10 @@ func (l *Library) syncProjectMCP(p *Project, fail func(what string, err error)) 
 			}
 		}
 	}
+	if hs := hubs["codex"]; hs != nil {
+		want[codexOffRel] = append(want[codexOffRel], hs)
+	}
+	l.syncCodexOff(p, fail)
 	files := map[string]bool{}
 	for rel := range want {
 		files[rel] = true
@@ -120,6 +155,7 @@ func (l *Library) syncProjectMCP(p *Project, fail func(what string, err error)) 
 		files[rel] = true
 	}
 	wrote := map[string][]string{}
+	startup := map[string]map[string]float64{}
 	for _, rel := range slices.Sorted(func(yield func(string) bool) {
 		for r := range files {
 			if !yield(r) {
@@ -132,13 +168,22 @@ func (l *Library) syncProjectMCP(p *Project, fail func(what string, err error)) 
 			continue
 		}
 		abs := filepath.Join(p.Dir, filepath.FromSlash(rel))
-		f := &mcpFile{Path: abs, Format: format}
+		f := &mcpFile{Path: abs, Format: format, NoCmdRefs: rel == projectMCPFiles["droid"].rel}
 		had := p.Wrote[rel]
-		entries, err := f.entries()
+		was := p.Startup[rel]
+		now := map[string]float64{}
+		err := p.inside(abs)
+		var entries map[string]map[string]any
+		if err == nil {
+			entries, err = f.entries()
+		}
 		if err != nil {
 			fail("", err)
 			if len(had) > 0 {
 				wrote[rel] = had
+				if was != nil {
+					startup[rel] = was
+				}
 			}
 			continue
 		}
@@ -153,17 +198,20 @@ func (l *Library) syncProjectMCP(p *Project, fail func(what string, err error)) 
 			if err := f.del(name); err != nil {
 				fail("mcp:"+name, err)
 				mine = append(mine, name)
+				now[name] = was[name]
 			}
 		}
 		for _, s := range want[rel] {
+			s := wroteStartup(f.withCmdVars(s), was[s.Name])
 			old := entries[s.Name]
 			if old != nil && !slices.Contains(had, s.Name) {
 				fail("mcp:"+s.Name, fmt.Errorf("%s has a server called %s already that isn't magpie's: it's left as it is", rel, s.Name))
 				continue
 			}
 			if old != nil {
-				if cur, ok := f.decode(s.Name, old); ok && cur.same(s) && !f.behind(s, old) {
+				if cur, ok := f.current(s.Name, old, s); ok && cur.same(s) && !f.behind(s, old) {
 					mine = append(mine, s.Name)
+					now[s.Name] = f.startupWritten(s, old)
 					continue
 				}
 			}
@@ -180,15 +228,24 @@ func (l *Library) syncProjectMCP(p *Project, fail func(what string, err error)) 
 				fail("mcp:"+s.Name, err)
 				if old != nil {
 					mine = append(mine, s.Name)
+					now[s.Name] = was[s.Name]
 				}
 				continue
 			}
 			mine = append(mine, s.Name)
+			now[s.Name] = f.startupWritten(s, old)
 		}
 		sort.Strings(mine)
+		maps.DeleteFunc(now, func(_ string, v float64) bool { return v == 0 })
+		if len(now) > 0 {
+			startup[rel] = now
+		}
 		if len(mine) > 0 {
 			wrote[rel] = mine
 			continue
+		}
+		if rel == codexOffRel && len(p.CodexOff) > 0 {
+			continue // the servers it turns off are in it still
 		}
 		// a file magpie made goes once nothing is left in it; one with
 		// anything of the user's in it is the user's from then on
@@ -202,10 +259,17 @@ func (l *Library) syncProjectMCP(p *Project, fail func(what string, err error)) 
 			p.MadeFiles = slices.Delete(p.MadeFiles, i, i+1)
 		}
 	}
+	if len(p.CodexOff) == 0 && wrote[codexOffRel] == nil {
+		p.dropMadeFile(codexOffRel)
+	}
 	if len(wrote) == 0 {
 		wrote = nil
 	}
 	p.Wrote = wrote
+	if len(startup) == 0 {
+		startup = nil
+	}
+	p.Startup = startup
 	sort.Strings(p.MadeFiles)
 }
 

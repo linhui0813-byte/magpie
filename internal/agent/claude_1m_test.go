@@ -32,7 +32,13 @@ func TestClaude1MMarked(t *testing.T) {
 	path := filepath.Join(home, ".claude", "settings.json")
 	writeFile(t, path, `{}`)
 	a := claude(home)
-	get := func(k string) string { v, _ := edit.GetJSON(path, k); return v }
+	get := func(k string) string {
+		if k == "model" {
+			return writtenModel(path)
+		}
+		v, _ := edit.GetJSON(path, k)
+		return v
+	}
 	set := func(key, v string) {
 		t.Helper()
 		if err := a.Field(key).Set(v); err != nil {
@@ -41,7 +47,9 @@ func TestClaude1MMarked(t *testing.T) {
 	}
 	names := []string{"model", "env.ANTHROPIC_SMALL_FAST_MODEL"}
 	for _, tier := range claudeTiers {
-		names = append(names, "env."+tierEnv(tier))
+		if tier != "fable" { // left unset on a model that is no Fable (#2090)
+			names = append(names, "env."+tierEnv(tier))
+		}
 	}
 
 	for _, v := range []string{"v/big", "v/big[1m]"} {

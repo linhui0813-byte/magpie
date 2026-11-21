@@ -34,14 +34,18 @@ async function serve(route) {
   if (url.pathname === "/api/sessions") return json({ sessions, dirs: ["/test/sessions"] });
   if (url.pathname === "/api/sessions/stats") return json({ from: date, to: date, days: [{ date, usage, active: [] }], agents: { fixture: "Fixture" } });
   if (url.pathname === "/api/sessions/overview") return json({ count: sessions.length, days: [sessions.length], top: { tokens: [], cost: [], active: [] } });
-  if (url.pathname === "/api/update" || url.pathname === "/api/drift") return json({});
+  if (url.pathname === "/api/update" || url.pathname === "/api/update/using" || url.pathname === "/api/drift") return json({});
   if (url.pathname === "/api/agents/cli") return json({ agents: {}, pending: false });
   if (url.pathname === "/api/groups") return json({ groups: [] });
   if (url.pathname === "/api/gateway/trace") return json({ mine: false, now: date, totals: { requests: 0, rerouted: 0, errors: 0 } });
   if (url.pathname === "/api/plugins/updates") return json({ waiting: [] });
-  if (url.pathname === "/api/usage/quotas" || url.pathname === "/api/usage/quotas/history" || url.pathname === "/api/agents/install") return json([]);
-  if (url.pathname === "/api/whatsnew") return json({});
+  if (url.pathname === "/api/usage/quotas" || url.pathname === "/api/usage/quotas/history" || url.pathname === "/api/agents/install" || url.pathname === "/api/plugins/agents") return json([]);
+  if (url.pathname === "/api/whatsnew" || url.pathname === "/api/model-speeds" || url.pathname === "/api/model-loads") return json({});
   if (url.pathname === "/api/upstream") return json({ vendors: [], providers: {} });
+  // the sidebar's plugin pages, and plugin panels in magpie's pages: none
+  if (url.pathname === "/api/plugin-pages" || url.pathname === "/api/plugin-panels") return json([]);
+  // the sidebar's gateway line, when no page has read the providers
+  if (url.pathname === "/api/providers") return json({ providers: [], gateway: { url: "http://127.0.0.1:3425", running: true } });
   assert(!url.pathname.startsWith("/api/"), "Unexpected API: " + url.pathname);
   const file = path.join(assets, url.pathname === "/" ? "index.html" : url.pathname);
   const contentType = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".svg": "image/svg+xml", ".png": "image/png" }[path.extname(file)];
@@ -61,6 +65,9 @@ async function scrolled(page, selector) {
 async function scrollMenu(page, selector, gesture) {
   const box = page.locator(selector);
   assert(await box.evaluate(e => e.scrollHeight > e.clientHeight), "the fixture must overflow");
+  // the menu's opening come to rest first: a click on its scrollbar's track
+  // while it still moved landed nowhere, now and then (both engines)
+  await page.evaluate(() => Promise.all(document.getAnimations().map(a => a.finished.catch(() => {}))));
   const r = await box.boundingBox();
   if (gesture === "wheel") {
     await page.mouse.move(r.x + r.width / 2, r.y + r.height / 2);
@@ -83,6 +90,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
     const context = await browser.newContext({ viewport: { width: 1100, height: 800 }, reducedMotion: "reduce" });
     const page = await context.newPage();
     page.setDefaultTimeout(5000);
+    page.setDefaultNavigationTimeout(60000);
     const errors = [];
     page.on("pageerror", e => errors.push(e.message));
     await page.route("**/*", serve);

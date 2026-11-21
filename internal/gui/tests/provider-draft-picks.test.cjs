@@ -6,8 +6,9 @@
 // as served: it took those served for picks, drew them ticked, and the next
 // Save wrote them as picks. Free only then Cancel or Escape writes nothing
 // and the editor opens as it was; Free only and Save writes the free ones;
-// Select none and Save writes none, and the editor opens with none ticked
-// again. In English and Chinese, Chromium and WebKit.
+// Select none and Save writes none with noModels, and the editor opens with
+// none ticked and none served (#1818: Select none came back as the vendor's
+// first 24 served). In every language, Chromium and WebKit.
 const assert = require("node:assert/strict");
 const fs = require("node:fs/promises");
 const path = require("node:path");
@@ -20,19 +21,20 @@ const ids = Array.from({ length: 30 }, (_, i) => `vendor/model-${i}`);
 const free = new Set(["vendor/model-3", "vendor/model-10", "vendor/model-27"]);
 
 // the provider as magpie answers it for these picks: with none, the first
-// 24 of the vendor's list are on (served), as Exposed has it
-function routerFor(chosen) {
-  const on = new Set(chosen.length ? chosen : ids.slice(0, 24));
+// 24 of the vendor's list are on (served), as Exposed has it; after Select
+// none (noModels), none
+function routerFor(chosen, none) {
+  const on = new Set(chosen.length ? chosen : none ? [] : ids.slice(0, 24));
   return {
     id: "router", name: "Router", icon: "generic", host: "router.example.com", chat: "https://router.example.com/v1", responses: "", anthropic: "", catalog: "",
-    models: ids.map((id) => ({ id, name: id, on: on.has(id), free: free.has(id) })), chosen, fetched, agents: [], fallback: [], headers: {},
+    models: ids.map((id) => ({ id, name: id, on: on.has(id), free: free.has(id) })), chosen, noModels: !!none && !chosen.length, fetched, agents: [], fallback: [], headers: {},
     key: { set: true, masked: "sk-…one" }, keyList: [], balanceToken: { takes: false, set: false }, proxy: "",
   };
 }
 
 function serve(lang, saves) {
-  let chosen = [];
-  const providers = () => ({ providers: [routerFor(chosen)], presets: [], excluded: [], gateway: { running: true, window: true } });
+  let chosen = [], none = false;
+  const providers = () => ({ providers: [routerFor(chosen, none)], presets: [], excluded: [], gateway: { running: true, window: true } });
   return async (route) => {
     const req = route.request(), url = new URL(req.url());
     const json = (data) => route.fulfill({ json: data });
@@ -45,6 +47,7 @@ function serve(lang, saves) {
       const body = req.postDataJSON();
       saves.push(body.models);
       chosen = body.models;
+      if (body.noModels !== undefined) none = body.noModels;
       return json(providers());
     }
     if (url.pathname === "/api/groups") return json({ groups: [] });
@@ -58,10 +61,13 @@ function serve(lang, saves) {
 const words = {
   en: { free: "Free only", none: "Select none", save: "Save", cancel: "Cancel" },
   zh: { free: "只选免费", none: "全不选", save: "保存", cancel: "取消" },
+  "zh-TW": { free: "只選免費", none: "全不選", save: "儲存", cancel: "取消" },
+  ja: { free: "無料のみ", none: "選択をすべて解除", save: "保存", cancel: "キャンセル" },
+  de: { free: "Nur kostenlose", none: "Keine auswählen", save: "Speichern", cancel: "Abbrechen" },
 };
 
 for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium", "webkit"])) {
-  for (const lang of ["en", "zh"]) {
+  for (const lang of Object.keys(words)) {
     const w = words[lang];
     test(`${engine} ${lang}: model picks are written by Save only, and none saved opens as none`, async (t) => {
       const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: "chromium" }));
@@ -74,6 +80,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await browser.close();
       });
       page.setDefaultTimeout(5000);
+      page.setDefaultNavigationTimeout(60000);
       const errors = [];
       page.on("pageerror", (e) => errors.push(e.message));
       const saves = [];
@@ -121,16 +128,17 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       assert.deepEqual(await picked(), [...free]);
       assert.equal(await served(), 0);
 
-      // Select none and Save writes none, and none is what opens again
+      // Select none and Save writes none, and none is what opens again:
+      // none ticked and none served (#1818)
       await button(w.none).click();
       assert.deepEqual(await picked(), []);
-      assert.equal(await served(), 24);
+      assert.equal(await served(), 0, "Select none serves none");
       await button(w.save).click();
       await editor.waitFor({ state: "detached" });
       assert.deepEqual(saves[1], []);
       await open();
       assert.deepEqual(await picked(), [], "Select none saved opens with none ticked");
-      assert.equal(await served(), 24);
+      assert.equal(await served(), 0, "Select none saved opens with none served");
 
       // saved again untouched, it stays none: the served aren't made picks
       await button(w.save).click();

@@ -2,13 +2,13 @@ package provider
 
 import (
 	"context"
-	"os/exec"
 	"path/filepath"
 	"slices"
 	"testing"
 	"time"
 
 	"github.com/yetone/magpie/internal/plugin"
+	"github.com/yetone/magpie/internal/testenv"
 )
 
 // #694: a plugin's subscription removed from magpie was listed among the
@@ -17,10 +17,7 @@ import (
 // ForgetAccount signs its accounts out of plugin-auth.json and logins.json:
 // it leaves the removed list, and a sign-in later starts afresh.
 func TestForgetRemovedPluginAccount(t *testing.T) {
-	bun, err := exec.LookPath("bun")
-	if err != nil {
-		t.Skip("no bun on PATH")
-	}
+	bun := testenv.Bun(t)
 	claudeHome(t)
 	t.Setenv("MAGPIE_BUN", bun)
 	t.Cleanup(plugin.Settle)

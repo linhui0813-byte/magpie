@@ -27,6 +27,7 @@ func TestOmarchyThemeForTheSite(t *testing.T) {
 	call := func(method, from, origin string) *httptest.ResponseRecorder {
 		r := httptest.NewRequest(method, "/v1/magpie/omarchy", nil)
 		r.RemoteAddr = from
+		r.Host = "127.0.0.1:3425"
 		if origin != "" {
 			r.Header.Set("Origin", origin)
 		}

@@ -217,3 +217,47 @@ env_key = "UNSET_DISCOVERY_KEY"
 	write(codex, codexConfig)
 	check("Codex")
 }
+
+// OpenCode's auth.json holds every sign-in OpenCode has, so the Providers
+// page's own look passes it by; the picker the user opens reads it, its
+// keys masked (@hu_xiaomi on X).
+func TestOpenCodeWaitsForThePicker(t *testing.T) {
+	home := sandboxHome(t)
+	data := filepath.Join(home, "data")
+	t.Setenv("XDG_DATA_HOME", data)
+	t.Setenv("CODEX_HOME", filepath.Join(home, ".codex"))
+	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(home, ".claude"))
+	auth := filepath.Join(data, "opencode", "auth.json")
+	body := "{\n  \"opencode-go\": {\n    \"type\": \"api\",\n    \"key\": \"secret-go\"\n  }\n}"
+	if err := os.MkdirAll(filepath.Dir(auth), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(auth, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	importAppsRoutes(mux)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, httptest.NewRequest("GET", "/api/importapps/discovery", nil))
+	if strings.TrimSpace(w.Body.String()) != "[]" {
+		t.Fatalf("discovery read OpenCode: %s", w.Body)
+	}
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, httptest.NewRequest("GET", "/api/importapps", nil))
+	if strings.Contains(w.Body.String(), "secret-go") {
+		t.Fatal("the picker was sent OpenCode's key")
+	}
+	var sources []provider.AppSource
+	if err := json.Unmarshal(w.Body.Bytes(), &sources); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, s := range sources {
+		for _, it := range s.Items {
+			found = found || s.ID == "opencode" && it.Ref == "opencode-go" && it.Skip == "" && it.Provider.Preset == "opencode-go"
+		}
+	}
+	if !found {
+		t.Fatalf("the picker has no OpenCode Go: %s", w.Body)
+	}
+}

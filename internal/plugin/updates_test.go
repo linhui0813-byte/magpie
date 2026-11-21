@@ -5,12 +5,14 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/yetone/magpie/internal/testenv"
 )
 
 // installedAt fakes the package installed at version v.
@@ -50,10 +52,10 @@ func TestCheckUpdates(t *testing.T) {
 	installedAt(t, fresh, "0.2.0")
 	latest := map[string]string{ours: "0.1.4", pinned: "0.1.4", theirs: "1.0.0", off: "0.1.4", fresh: "0.2.0"}
 	var installed []string
-	was, wasInstall := latestOf, installLatest
-	t.Cleanup(func() { latestOf, installLatest = was, wasInstall })
+	was, wasInstall := latestOf, installNewest
+	t.Cleanup(func() { latestOf, installNewest = was, wasInstall })
 	latestOf = func(context.Context, []string) map[string]string { return latest }
-	installLatest = func(_ context.Context, pkg string) error {
+	installNewest = func(_ context.Context, pkg, _ string) error {
 		installed = append(installed, pkg)
 		installedAt(t, pkg, latest[pkg])
 		return nil
@@ -118,7 +120,7 @@ func TestPinned(t *testing.T) {
 func TestRestartFinishesTheReply(t *testing.T) {
 	sandbox(t)
 	release := make(chan struct{})
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := testenv.FakeVendor(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		io.WriteString(w, "data: first\n\n")
 		w.(http.Flusher).Flush()
@@ -128,7 +130,10 @@ func TestRestartFinishesTheReply(t *testing.T) {
 		io.WriteString(w, "data: last\n\n")
 	}))
 	defer srv.Close()
-	t.Setenv("FAKE_BASE", srv.URL+"/v1")
+	// deferred after srv.Close, so it runs first: Close waits for the
+	// slow reply's handler, which a failed check would leave held (#1808)
+	let := sync.OnceFunc(func() { close(release) })
+	defer let()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 	abs, _ := filepath.Abs("testdata/fake/index.js")
@@ -160,7 +165,7 @@ func TestRestartFinishesTheReply(t *testing.T) {
 	if generation.Load() == before || !strings.Contains(string(b), "last") {
 		t.Fatalf("after the restart: a new host %v, %q", generation.Load() != before, b)
 	}
-	close(release)
+	let()
 	b, err = io.ReadAll(res.Body)
 	if err != nil || !strings.Contains(string(b), "data: last") {
 		t.Fatalf("the reply streaming through the restart: %q, %v", b, err)

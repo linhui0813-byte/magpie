@@ -15,8 +15,9 @@ import (
 // without reasoning while magpie showed max. A model a provider serves that
 // its vendor's list leaves out takes the levels the gateway fits an effort
 // to (Provider.Efforts), and a member whose levels nothing knows takes
-// whatever the agent asks rather than taking the others' away. A member
-// known to have none still does.
+// whatever the agent asks rather than taking the others' away. Nor does a
+// member known to have none, which the gateway sends no reasoning ask
+// (#2127).
 func TestGroupLevelsWithUnknownMember(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("USERPROFILE", t.TempDir())
@@ -73,9 +74,9 @@ func TestGroupLevelsWithUnknownMember(t *testing.T) {
 	if e := entry("group/ds"); !slices.Equal(e.Efforts, want) || !e.Reasoning {
 		t.Fatalf("ds: levels %v, reasoning %v", e.Efforts, e.Reasoning)
 	}
-	// a member listed without levels still takes them away, and a group
-	// of models nothing knows offers none
-	if e := entry("group/plain"); len(e.Efforts) != 0 {
+	// a member listed without levels doesn't take them away (#2127), and
+	// a group of models nothing knows offers none
+	if e := entry("group/plain"); !slices.Equal(e.Efforts, want) {
 		t.Fatalf("plain: levels %v", e.Efforts)
 	}
 	if e := entry("group/tp"); len(e.Efforts) != 0 {

@@ -6,7 +6,6 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"os/exec"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -14,6 +13,7 @@ import (
 
 	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/plugin"
+	"github.com/yetone/magpie/internal/testenv"
 )
 
 // Signing in to an account removed from magpie shows it again before the
@@ -62,10 +62,7 @@ func TestSignInDoneOnceTheAccountIsBack(t *testing.T) {
 	}, {
 		agent: "fakeco",
 		setUp: func(t *testing.T) {
-			bun, err := exec.LookPath("bun")
-			if err != nil {
-				t.Skip("no bun on PATH")
-			}
+			bun := testenv.Bun(t)
 			claudeHome(t)
 			t.Setenv("MAGPIE_BUN", bun)
 			t.Cleanup(plugin.Settle)

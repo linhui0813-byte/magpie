@@ -2,12 +2,14 @@ package source
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -232,10 +234,12 @@ func TestDoBodyOutlivesCandidateTimeout(t *testing.T) {
 
 type recordedTransport struct {
 	requests []string
+	auth     []string // each request's Authorization
 }
 
 func (rt *recordedTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	rt.requests = append(rt.requests, req.URL.String())
+	rt.auth = append(rt.auth, req.Header.Get("Authorization"))
 	status := http.StatusBadGateway
 	if strings.HasPrefix(req.URL.String(), "https://gh.example/") {
 		status = http.StatusOK
@@ -249,47 +253,141 @@ func (rt *recordedTransport) RoundTrip(req *http.Request) (*http.Response, error
 	}, nil
 }
 
+// A request to GitHub whose one credential is the user's token reaches a
+// mirror without it (#3923): the official address is asked with it, the
+// mirror never sees it. Any other credential, or a host other than
+// GitHub's, keeps the request official.
 func TestDoKeepsCredentialsOfficial(t *testing.T) {
 	t.Setenv("MAGPIE_MIRRORS", "on")
 	t.Setenv("MAGPIE_GITHUB_MIRROR", "https://gh.example")
-	rt := &recordedTransport{}
-	req, _ := http.NewRequest("GET", "https://api.github.com/repos/o/r", nil)
-	req.Header.Set("Authorization", "Bearer secret")
-	resp, err := Do(&http.Client{Transport: rt}, req)
-	if err != nil {
-		t.Fatal(err)
+	t.Setenv("MAGPIE_NPM_REGISTRY", "https://gh.example/npm")
+	send := func(raw string, h map[string]string, do func(*http.Client, *http.Request) (*http.Response, error)) (*recordedTransport, *http.Response) {
+		t.Helper()
+		rt := &recordedTransport{}
+		req, _ := http.NewRequest("GET", raw, nil)
+		for k, v := range h {
+			req.Header.Set(k, v)
+		}
+		resp, err := do(&http.Client{Transport: rt}, req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if req.Header.Get("Authorization") != h["Authorization"] {
+			t.Fatalf("the caller's request lost its token: %q", req.Header.Get("Authorization"))
+		}
+		return rt, resp
 	}
-	resp.Body.Close()
-	if len(rt.requests) != 1 || rt.requests[0] != "https://api.github.com/repos/o/r" {
+
+	rt, resp := send("https://api.github.com/repos/o/r", map[string]string{"Authorization": "Bearer secret"}, Do)
+	if fmt.Sprint(rt.requests) != "[https://api.github.com/repos/o/r https://gh.example/https://api.github.com/repos/o/r]" {
 		t.Fatalf("requests = %q", rt.requests)
+	}
+	if rt.auth[0] != "Bearer secret" || rt.auth[1] != "" {
+		t.Fatalf("Authorization = %q, want the token official only", rt.auth)
+	}
+	if resp.StatusCode != http.StatusOK || resp.Request.Header.Get("Authorization") != "" {
+		t.Fatalf("answer %d, sent with %q", resp.StatusCode, resp.Request.Header.Get("Authorization"))
+	}
+
+	for _, c := range []struct {
+		raw string
+		h   map[string]string
+	}{
+		{"https://api.github.com/repos/o/r", map[string]string{"Authorization": "Bearer secret", "Cookie": "s=1"}},
+		{"https://api.github.com/repos/o/r?access_token=x", map[string]string{"Authorization": "Bearer secret"}},
+		{"https://registry.npmjs.org/pkg", map[string]string{"Authorization": "Bearer secret"}},
+	} {
+		if rt, _ := send(c.raw, c.h, Do); len(rt.requests) != 1 || rt.requests[0] != c.raw {
+			t.Fatalf("%s %v: requests = %q", c.raw, c.h, rt.requests)
+		}
+	}
+}
+
+// budgetTransport answers the first (official) address only when its
+// candidate context ends, and holds the last (mirror) address until its
+// context ends too, recording how each one ended. Nothing here depends on
+// how long a request takes to be scheduled: the assertions read which
+// context fired and when, not whether a sleep finished in time (#2608).
+type budgetTransport struct {
+	official, mirror string
+	beforeMirror     time.Duration
+
+	mu          sync.Mutex
+	officialErr error
+	mirrorErr   error
+	mirrorAt    time.Time
+	mirrorEnd   time.Time
+	mirrorDL    time.Time
+	mirrorHasDL bool
+}
+
+func (rt *budgetTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	ctx := req.Context()
+	switch req.URL.String() {
+	case rt.official:
+		<-ctx.Done()
+		rt.mu.Lock()
+		rt.officialErr = ctx.Err()
+		rt.mu.Unlock()
+		return nil, ctx.Err()
+	case rt.mirror:
+		if rt.beforeMirror > 0 {
+			time.Sleep(rt.beforeMirror)
+		}
+		at := time.Now()
+		dl, ok := ctx.Deadline()
+		<-ctx.Done()
+		rt.mu.Lock()
+		rt.mirrorAt, rt.mirrorEnd = at, time.Now()
+		rt.mirrorDL, rt.mirrorHasDL = dl, ok
+		rt.mirrorErr = ctx.Err()
+		rt.mu.Unlock()
+		return nil, ctx.Err()
+	}
+	return nil, fmt.Errorf("unexpected request %s", req.URL)
+}
+
+func checkLastSourceBudget(t *testing.T, beforeMirror time.Duration) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	deadline, _ := ctx.Deadline()
+	rt := &budgetTransport{
+		official:     "https://official.example/thing",
+		mirror:       "https://mirror.example/thing",
+		beforeMirror: beforeMirror,
+	}
+	req, _ := http.NewRequestWithContext(ctx, "GET", rt.official, nil)
+	resp, err := do(&http.Client{Transport: rt}, req, []string{rt.official, rt.mirror})
+	if err == nil {
+		resp.Body.Close()
+		t.Fatal("do answered although both candidates failed")
+	}
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	// The first candidate is cut by its share of the budget, a second
+	// before the parent's deadline, not by the deadline itself.
+	if !errors.Is(rt.officialErr, context.Canceled) {
+		t.Fatalf("official request ended with %v, want its candidate budget (context.Canceled)", rt.officialErr)
+	}
+	// The last candidate keeps the parent's deadline: its context carries
+	// that deadline and ends only when the parent's does.
+	if !rt.mirrorHasDL || !rt.mirrorDL.Equal(deadline) {
+		t.Fatalf("mirror deadline = %v (set %v), want the parent's %v", rt.mirrorDL, rt.mirrorHasDL, deadline)
+	}
+	if !errors.Is(rt.mirrorErr, context.DeadlineExceeded) || rt.mirrorEnd.Before(deadline) {
+		t.Fatalf("mirror request ended with %v %v before the parent's deadline (started %v before it); the last source must get the remaining budget",
+			rt.mirrorErr, deadline.Sub(rt.mirrorEnd), deadline.Sub(rt.mirrorAt))
 	}
 }
 
 func TestDoLastSourceUsesRemainingBudget(t *testing.T) {
-	official := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		time.Sleep(1100 * time.Millisecond)
-		http.Error(w, "slow official", http.StatusBadGateway)
-	}))
-	defer official.Close()
-	mirror := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		time.Sleep(700 * time.Millisecond)
-		io.WriteString(w, "slow mirror")
-	}))
-	defer mirror.Close()
+	checkLastSourceBudget(t, 0)
+}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	req, _ := http.NewRequestWithContext(ctx, "GET", official.URL+"/thing", nil)
-	resp, err := do(http.DefaultClient, req, []string{official.URL + "/thing", mirror.URL + "/thing"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(body) != "slow mirror" {
-		t.Fatalf("body = %q", body)
-	}
+// A runner that is slow to send the mirror request (the 350ms pause #2608
+// injected) still sees the mirror keep the parent's remaining deadline.
+func TestDoLastSourceUsesRemainingBudgetWhenLate(t *testing.T) {
+	checkLastSourceBudget(t, 350*time.Millisecond)
 }

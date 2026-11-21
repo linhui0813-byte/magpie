@@ -222,3 +222,23 @@ func TestClaudeSessionTempFilesAreRemoved(t *testing.T) {
 		}
 	}
 }
+
+// An Alma conversation whose tools grew between turns (#2375: 17 tools,
+// then 32 with its browser tools) is told to a new Claude Code, whose
+// agent is told every tool from its start, and the log says that is why:
+// the conversation came back rewritten, so none of its keys was the
+// run's, and the line said no run had ever had it.
+func TestClaudeRewrittenTurnWithMoreToolsSaysWhy(t *testing.T) {
+	h := newReplyHarness(t, almaReply)
+	logs := keepLog(t)
+	h.send("rules", []string{"read"}, user("[Context: 10:00] hi"))
+	more := []string{"read", "browser_open", "browser_click", "browser_type", "browser_read", "browser_back", "browser_close"}
+	h.send("rules", more, user("hi"), assistant("ok"), user("[Context: 10:05] more"))
+	if n := len(h.runs()); n != 2 {
+		t.Fatalf("runs: %d, want a new one told every tool", n)
+	}
+	want := "no run waits for this turn: its run waits under another key: the client offers 6 tool(s) its Claude Code wasn't told of (browser_open, browser_click, browser_type, browser_read, browser_back, 1 more)"
+	if !strings.Contains(logs.String(), want) {
+		t.Fatalf("the log says:\n%s", logs)
+	}
+}

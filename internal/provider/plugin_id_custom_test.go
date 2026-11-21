@@ -2,12 +2,12 @@ package provider
 
 import (
 	"context"
-	"os/exec"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/yetone/magpie/internal/plugin"
+	"github.com/yetone/magpie/internal/testenv"
 )
 
 // #867: a provider of the user's own saved before a plugin with its id was
@@ -15,10 +15,7 @@ import (
 // subscription once signed in — "signed in, but magpie can't list it". The
 // plugin's is id-plugin then, and the user's own keeps its id.
 func TestPluginIDBesideCustomProvider(t *testing.T) {
-	bun, err := exec.LookPath("bun")
-	if err != nil {
-		t.Skip("no bun on PATH")
-	}
+	bun := testenv.Bun(t)
 	claudeHome(t)
 	t.Setenv("MAGPIE_BUN", bun)
 	t.Cleanup(plugin.Settle)

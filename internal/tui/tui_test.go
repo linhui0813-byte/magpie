@@ -1,6 +1,8 @@
 package tui
 
 import (
+	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -9,9 +11,12 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/yetone/magpie/internal/agent"
 	"github.com/yetone/magpie/internal/agentenv"
 	"github.com/yetone/magpie/internal/library"
+	"github.com/yetone/magpie/internal/profile"
 	"github.com/yetone/magpie/internal/provider"
+	"github.com/yetone/magpie/internal/testenv"
 )
 
 // home is a sandbox: a home of its own with Claude Code and Codex in it,
@@ -23,7 +28,6 @@ func home(t *testing.T) string {
 	t.Setenv("USERPROFILE", h)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(h, ".config"))
 	t.Setenv("XDG_CACHE_HOME", filepath.Join(h, ".cache"))
-	t.Setenv("PATH", "")
 	t.Setenv("XDG_DATA_HOME", filepath.Join(h, ".local", "share"))
 	for _, k := range agentenv.Vars {
 		t.Setenv(k, "")
@@ -34,6 +38,15 @@ func home(t *testing.T) string {
 	for _, f := range []string{".claude/settings.json", ".codex/config.toml"} {
 		write(t, filepath.Join(h, f), "")
 	}
+	// their CLIs beside the folders, as on a machine where they are really
+	// installed: the folder alone is an uninstall that left it behind
+	// (#2177), gone for the agents page and no target of the library's
+	bin := filepath.Join(h, "bin")
+	for _, name := range []string{"claude", "codex"} {
+		testenv.Program(t, filepath.Join(bin, name), "#!/bin/sh\n")
+		write(t, filepath.Join(bin, name+".exe"), "")
+	}
+	t.Setenv("PATH", bin)
 	for _, p := range []provider.Provider{
 		{ID: "a", Name: "A", Key: "ka", Models: []string{"m", "claude-opus-5-5"}, Chat: "http://127.0.0.1:1/v1"},
 		{ID: "b", Name: "B", Key: "kb", Models: []string{"gpt-5.5"}, Chat: "http://127.0.0.1:1/v1"},
@@ -67,6 +80,10 @@ func keyMsg(k string) tea.KeyMsg {
 		return tea.KeyMsg{Type: tea.KeyUp}
 	case "ctrl+u":
 		return tea.KeyMsg{Type: tea.KeyCtrlU}
+	case "ctrl+r":
+		return tea.KeyMsg{Type: tea.KeyCtrlR}
+	case "ctrl+e":
+		return tea.KeyMsg{Type: tea.KeyCtrlE}
 	}
 	return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(k)}
 }
@@ -315,6 +332,72 @@ func TestLibraryPage(t *testing.T) {
 	if s := servers(); len(s) != 0 {
 		t.Fatalf("servers %+v", s)
 	}
+
+	// a skill of Claude Code's own: d twice takes it out of the agent
+	// without bringing it in (#1303)
+	old := filepath.Join(h, ".claude/skills/old")
+	write(t, filepath.Join(old, "SKILL.md"), "---\nname: old\ndescription: Not wanted\n---\n")
+	m = press(t, m, "s")
+	m.lrow = row("found-skill", "old")
+	m = press(t, m, "d")
+	if _, err := os.Stat(old); err != nil {
+		t.Fatal("one d removed it")
+	}
+	m = press(t, m, "d")
+	if _, err := os.Stat(old); !os.IsNotExist(err) {
+		t.Fatalf("still there, flash %q", m.flash)
+	}
+	if slices.ContainsFunc(m.lib, func(r libRow) bool { return r.name == "old" }) {
+		t.Fatal("still listed")
+	}
+
+	// an MCP server of Claude Code's own, the same (#1618): the rest of
+	// its .claude.json stays
+	cj := filepath.Join(h, ".claude.json")
+	read := func() string {
+		b, err := os.ReadFile(cj)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(b)
+	}
+	b, err := os.ReadFile(cj)
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	var doc map[string]any
+	if len(b) > 0 {
+		if err := json.Unmarshal(b, &doc); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if doc == nil {
+		doc = map[string]any{}
+	}
+	doc["numStartups"] = 7
+	srvs, _ := doc["mcpServers"].(map[string]any)
+	if srvs == nil {
+		srvs = map[string]any{}
+	}
+	srvs["stale"] = map[string]any{"type": "stdio", "command": "stale-mcp"}
+	doc["mcpServers"] = srvs
+	b, _ = json.Marshal(doc)
+	write(t, cj, string(b))
+	m = press(t, m, "s")
+	m.lrow = row("found-mcp", "stale")
+	m = press(t, m, "d")
+	if !strings.Contains(read(), "stale-mcp") {
+		t.Fatal("one d removed it")
+	}
+	m = press(t, m, "d")
+	after := read()
+	var kept map[string]any
+	if err := json.Unmarshal([]byte(after), &kept); err != nil || strings.Contains(after, "stale") || kept["numStartups"] != float64(7) {
+		t.Fatalf("after two d, flash %q:\n%s", m.flash, after)
+	}
+	if slices.ContainsFunc(m.lib, func(r libRow) bool { return r.name == "stale" }) {
+		t.Fatal("still listed")
+	}
 }
 
 // A first run has no model catalog: Init syncs it, the status line says so
@@ -331,5 +414,99 @@ func TestFirstRunShowsCatalogSync(t *testing.T) {
 	}
 	if _, cmd := m.Update(keyMsg("S")); cmd != nil {
 		t.Fatal("S started a second sync while the first runs")
+	}
+}
+
+// The agents page keeps the row picked in view: a machine with more agents
+// than the terminal has rows can't scroll the highlight off and freeze the
+// page, as the library page did (#2220). What the terminal shows of a view
+// taller than itself is its last h lines — the top scrolls away.
+func TestAgentsViewKeepsTheRowPicked(t *testing.T) {
+	var agents []*agent.Agent
+	for i := 0; i < 30; i++ {
+		agents = append(agents, &agent.Agent{
+			ID:     fmt.Sprintf("agent-%02d", i),
+			Name:   fmt.Sprintf("agent-%02d", i),
+			Path:   fmt.Sprintf("/opt/agent-%02d/bin/agent", i),
+			Fields: []agent.Field{{Key: "model", Label: "model"}},
+		})
+	}
+	m := model{w: 120, agents: agents, hidden: len(agents),
+		values: make([]map[string]string, len(agents)), failover: make([]string, len(agents))}
+	for i := range m.values {
+		m.values[i] = map[string]string{"model": ""}
+	}
+	screen := func(v string, h int) string {
+		lines := strings.Split(v, "\n")
+		if len(lines) > h {
+			lines = lines[len(lines)-h:]
+		}
+		return strings.Join(lines, "\n")
+	}
+	// a plain 80×24 terminal: thirty agents are nine rows past it
+	m.h = 24
+	for _, pick := range []int{0, 4, 8, 15, 22, 29} {
+		m.row = pick
+		v := screen(m.viewList(), m.h)
+		if !strings.Contains(v, "▸ "+agents[pick].Name) {
+			t.Fatalf("row %d (%s) picked, but the screen stops short of it:\n%s", m.row, agents[pick].Name, v)
+		}
+	}
+	// the page starts at its top while it all fits
+	m.h = 60
+	m.row = 29
+	if v := screen(m.viewList(), m.h); !strings.Contains(v, "agent-00") {
+		t.Fatalf("a tall terminal dropped the top of the list:\n%s", v)
+	}
+}
+
+// ctrl+e on the profiles renames the one picked on a line holding its
+// name; what it holds stays, esc renames nothing, and a taken name is
+// refused with both kept (#2721).
+func TestProfileRename(t *testing.T) {
+	home(t)
+	for _, n := range []string{"base", "work"} {
+		if err := profile.Save(n, profile.Profile{Fields: map[string]string{"codex.model": n + "-model"}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	names := func() []string {
+		ps, err := profile.Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return profile.Names(ps)
+	}
+	m := press(t, model{w: 120, h: 40}, "p")
+	if !strings.Contains(m.View(), "ctrl+e rename") {
+		t.Fatalf("the profiles' footer names no rename:\n%s", m.View())
+	}
+	m = press(t, m, "down", "ctrl+e")
+	if m.mode != modeName || m.name.Value() != "work" || !strings.Contains(m.View(), "rename profile") {
+		t.Fatalf("mode %d, line %q:\n%s", m.mode, m.name.Value(), m.View())
+	}
+	m = press(t, m, "esc")
+	if got := names(); !slices.Equal(got, []string{"base", "work"}) {
+		t.Fatalf("esc renamed: %v", got)
+	}
+
+	m = press(t, m, "p", "down", "ctrl+e", "ctrl+u")
+	m = typeIn(m, "desk")
+	m = press(t, m, "enter")
+	wantFlash(t, m, true, "work renamed to desk")
+	ps, _ := profile.Load()
+	if got := names(); !slices.Equal(got, []string{"base", "desk"}) || ps["desk"].Fields["codex.model"] != "work-model" {
+		t.Fatalf("after the rename: %v %+v", got, ps["desk"])
+	}
+
+	m = press(t, m, "p", "down", "ctrl+e", "ctrl+u")
+	m = typeIn(m, "base")
+	m = press(t, m, "enter")
+	if m.mode != modeList {
+		t.Fatalf("mode %d:\n%s", m.mode, m.View())
+	}
+	wantFlash(t, m, false, `a profile named "base" already exists`)
+	if got := names(); !slices.Equal(got, []string{"base", "desk"}) {
+		t.Fatalf("a taken name: %v", got)
 	}
 }

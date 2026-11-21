@@ -9,27 +9,31 @@ package sessions
 // thinking; the model from its assistant messages, as omp names models
 // provider/id) and writes a new omp session from it, the Pi file untouched.
 // The other way doesn't work: Pi opens a file only when its first line is
-// the session header, and omp's first line is its title. Other agents keep
-// their sessions in forms of their own, which would have to be converted.
+// the session header, and omp's first line is its title. Claude Code's and
+// Codex's sessions are converted for each other (carry_convert.go).
 
 import (
 	"os"
-	"os/exec"
 	"runtime"
 	"strings"
+
+	"github.com/yetone/magpie/internal/proc"
 )
 
 // Carry is another agent a session can be carried on in, and the shell
-// line that does it in the session's folder.
+// line that does it in the session's folder. A Convert one has no line
+// yet: the session is converted into a new one of that agent's when the
+// user asks (CarryOver, carry_convert.go), and the line opens that.
 type Carry struct {
 	Agent   string `json:"agent"`
-	Command string `json:"command"`
+	Command string `json:"command,omitempty"`
+	Convert bool   `json:"convert,omitempty"`
 }
 
 // ompThere says whether oh-my-pi is installed: its command, or its folder.
 // A var so tests can say.
 var ompThere = func() bool {
-	if _, err := exec.LookPath("omp"); err == nil {
+	if _, err := proc.Look("omp"); err == nil {
 		return true
 	}
 	_, err := os.Stat(OmpDir())
@@ -47,6 +51,9 @@ func carries(s Session) []Carry {
 			return nil
 		}
 		return []Carry{{Agent: "omp", Command: inFolder(s.Cwd, "omp --fork "+argQuote(s.Path))}}
+	}
+	if to := convertsTo[s.Agent]; to != "" && agentThere(to) {
+		return []Carry{{Agent: to, Convert: true}}
 	}
 	return nil
 }

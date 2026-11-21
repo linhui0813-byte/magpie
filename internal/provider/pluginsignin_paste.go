@@ -9,6 +9,8 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"github.com/yetone/magpie/internal/plugin"
 )
 
 // A plugin's browser sign-in ("auto") that the plugin finishes at a port of
@@ -21,9 +23,10 @@ import (
 
 // pluginPostsCallback are the plugins (by OpenCode's id) whose page posts
 // to their port from script, which leaves the browser no address to paste:
-// Command Code's Studio posts its key. Their sign-in offers the plugin's
-// API key way instead.
-var pluginPostsCallback = map[string]bool{"commandcode-plan": true}
+// Command Code's Studio posts its key. Their sign-in takes a key made on
+// the page given here and pasted, through the plugin's API key way, as the
+// built-in's did (startCommandCodeSignIn's PasteKey, #2468).
+var pluginPostsCallback = map[string]string{"commandcode-plan": cmdKeysURL}
 
 // pastedPluginWait is how long a pasted address is given to finish the
 // sign-in before magpie says it didn't.
@@ -32,21 +35,31 @@ var pastedPluginWait = 30 * time.Second
 // loopbackPorts are the ports on this machine a sign-in page sends the
 // browser back to, as its address names them: a redirect address on
 // localhost (redirect_uri, Trae's auth_callback_url, Command Code's
-// callback) or a bare port (Zed's native_app_port).
+// callback) or a bare port (Zed's native_app_port). A page that is a login
+// first, with the sign-in page as where it goes next (CodeArts'
+// international station puts its authorize address, port and all, in
+// service=), is read through to that page.
 func loopbackPorts(page string) []string {
-	u, err := url.Parse(page)
-	if err != nil {
-		return nil
-	}
 	var ports []string
-	add := func(p string) {
-		if p != "" && !slices.Contains(ports, p) {
+	readPorts(page, 2, func(p string) {
+		if !slices.Contains(ports, p) {
 			ports = append(ports, p)
 		}
+	})
+	return ports
+}
+
+// readPorts gives add each port page names, and reads the web addresses
+// in its query the same way, depth pages deep.
+func readPorts(page string, depth int, add func(string)) {
+	u, err := url.Parse(page)
+	if err != nil {
+		return
 	}
 	for k, vs := range u.Query() {
 		for _, v := range vs {
-			if r, err := url.Parse(v); err == nil && r.Scheme == "http" && isLoopback(r.Hostname()) {
+			r, err := url.Parse(v)
+			if err == nil && r.Scheme == "http" && isLoopback(r.Hostname()) {
 				p := r.Port()
 				if p == "" {
 					p = "80"
@@ -56,10 +69,13 @@ func loopbackPorts(page string) []string {
 			}
 			if strings.Contains(strings.ToLower(k), "port") && isPort(v) {
 				add(v)
+				continue
+			}
+			if err == nil && depth > 1 && (r.Scheme == "https" || r.Scheme == "http") && r.Host != "" {
+				readPorts(v, depth-1, add)
 			}
 		}
 	}
-	return ports
 }
 
 func isPort(v string) bool {
@@ -169,5 +185,65 @@ func PastePluginCallback(ctx context.Context, page, raw string) (next string, er
 // PluginPastesCallback says whether a plugin's sign-in that opened page
 // can be finished from the address its browser ends on.
 func PluginPastesCallback(id, page string) bool {
-	return !pluginPostsCallback[id] && len(loopbackPorts(page)) > 0
+	return pluginPostsCallback[id] == "" && len(loopbackPorts(page)) > 0
+}
+
+type pluginKeyWay struct {
+	id     string
+	method int
+}
+
+// pluginKeyMethod is id's "api" method, for a plugin whose page posts its
+// callback, and the page its keys are made on; ok is false for another.
+func pluginKeyMethod(id string) (method int, keys string, ok bool) {
+	keys = pluginPostsCallback[id]
+	if keys == "" {
+		return 0, "", false
+	}
+	for _, pp := range plugin.Cached() {
+		if pp.ID != id {
+			continue
+		}
+		for i, m := range pp.Methods {
+			if m.Type == "api" {
+				return i, keys, true
+			}
+		}
+	}
+	return 0, "", false
+}
+
+// pastedPluginKey finishes a plugin's browser sign-in with a key pasted
+// instead, through the plugin's own API key way: the page's post couldn't
+// reach a magpie on a server or in Docker.
+func (s *signInFlow) pastedPluginKey(raw string) error {
+	key := strings.TrimSpace(raw)
+	switch {
+	case key == "":
+		return errors.New("paste an API key from the keys page")
+	case strings.Contains(key, "://"):
+		return errors.New("that's an address: this page sends its key in the background, so make a key on the keys page and paste that")
+	case strings.ContainsAny(key, " \t\r\n"):
+		return errors.New("that doesn't look like an API key")
+	}
+	if !s.claim() {
+		return errors.New("this sign-in is over or already finishing; start it again if it doesn't end")
+	}
+	ctx, cancel := context.WithTimeout(s.via(context.Background()), time.Minute)
+	defer cancel()
+	saved, err := plugin.APIKey(ctx, s.pluginKey.id, s.pluginKey.method, nil, key, plugin.NewAccount)
+	if err != nil {
+		s.mu.Lock()
+		s.claimed = false // the browser's own may still come, or a right key
+		s.mu.Unlock()
+		return err
+	}
+	s.mu.Lock()
+	stop := s.stop
+	s.mu.Unlock()
+	s.pluginDone(saved, nil)
+	if stop != nil {
+		stop() // the page's own post is waited for no more
+	}
+	return nil
 }

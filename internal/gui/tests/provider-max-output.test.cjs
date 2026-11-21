@@ -41,6 +41,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       t.after(() => browser.close());
       const page = await (await browser.newContext({ viewport: { width: 900, height: 720 }, reducedMotion: "reduce" })).newPage();
       page.setDefaultTimeout(5000);
+      page.setDefaultNavigationTimeout(60000);
       const errors = [], posts = [];
       page.on("pageerror", (e) => errors.push(e.message));
       await page.route("**/*", serve(lang, posts));
@@ -63,5 +64,37 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       assert.deepEqual(posts[0].body.outputs, { "*": 32000, "model-1": 128000 });
       assert.deepEqual(errors, []);
     });
+  }
+
+  // the hint says the size is also what a turn naming none is sent on
+  // Anthropic's API as max_tokens (#1792, tensornull: Codex's turns were
+  // sent a flat 16384), in every language, and fits a narrow window
+  for (const lang of ["en", "zh", "zh-TW", "ja", "de"]) {
+    for (const width of [900, 420]) {
+      test(`${engine} ${lang} ${width}px: the max output hint names max_tokens on Anthropic's API`, async (t) => {
+        const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: process.env.PLAYWRIGHT_CHANNEL || "chromium" }));
+        t.after(() => browser.close());
+        const page = await (await browser.newContext({ viewport: { width, height: 720 }, reducedMotion: "reduce" })).newPage();
+        page.setDefaultTimeout(5000);
+        page.setDefaultNavigationTimeout(60000);
+        const errors = [];
+        page.on("pageerror", (e) => errors.push(e.message));
+        await page.route("**/*", serve(lang, []));
+        await page.goto("http://magpie.test/?view=providers");
+        await page.locator(".row.provider").click();
+        const box = page.locator("input.outputs");
+        await box.waitFor();
+        const hint = await box.evaluate((b) => document.getElementById(b.getAttribute("aria-describedby").split(" ").pop()).textContent);
+        assert.match(hint, /max_tokens/, hint);
+        assert.match(hint, /Anthropic/, hint);
+        if (lang !== "en") assert.doesNotMatch(hint, /sent as max_tokens/, "translated: " + hint);
+        const over = await box.evaluate((b) => {
+          const h = document.getElementById(b.getAttribute("aria-describedby").split(" ").pop());
+          return h.scrollWidth - h.clientWidth + Math.max(0, document.documentElement.scrollWidth - document.documentElement.clientWidth);
+        });
+        assert.equal(over, 0, "the hint wraps inside the window");
+        assert.deepEqual(errors, []);
+      });
+    }
   }
 }

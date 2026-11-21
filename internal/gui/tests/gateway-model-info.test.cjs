@@ -2,13 +2,14 @@
 // The Gateway page's model list (ARNO on Discord): a search box finds models
 // by id, name, provider and a group's models, and each row ends with what
 // agents are told of the model — its reasoning levels, whether it takes
-// images, its context, its reply limit — the full detail in the chips' tooltip; a routing
+// images, video or audio, its context, its reply limit — the full detail in the chips' tooltip; a routing
 // group's levels are what its models all have, its images any one's and its context the largest, its tooltip naming them.
 const assert = require("node:assert/strict");
 const fs = require("node:fs/promises");
 const path = require("node:path");
 const { test } = require("node:test");
 const { chromium, webkit } = require("playwright");
+const { reach } = require("./reader.cjs");
 
 const assets = path.resolve(__dirname, "../assets");
 const providers = {
@@ -20,13 +21,13 @@ const providers = {
       { id: "hidden", name: "Hidden", on: false, efforts: ["low"] },
     ] },
     { id: "zeta", name: "Zeta Cloud", icon: "generic", agents: [], models: [
-      { id: "glm-5", name: "GLM-5", on: true, efforts: ["high"], images: false, context: 1000000 },
-      { id: "kimi-k3", name: "Kimi K3", on: true, given: true, efforts: ["low", "high"], images: true },
+      { id: "glm-5", name: "GLM-5", on: true, efforts: ["high"], images: false, inputs: ["audio"], context: 1000000 },
+      { id: "kimi-k3", name: "Kimi K3", on: true, given: true, efforts: ["low", "high"], images: true, inputs: ["video", "audio"] },
     ] },
   ],
   gateway: { running: true, window: true, mine: true, url: "http://127.0.0.1:3999", models: 6, calls: [], groups: [
     { id: "group/smart", name: "Smart", icons: ["generic", "generic"], providers: ["Acme", "Zeta Cloud"],
-      efforts: ["low", "medium", "high"], images: true, context: 272000, output: 64000, members: ["acme/gpt-5.5-mini", "zeta/kimi-k3"] },
+      efforts: ["low", "medium", "high"], images: true, inputs: ["video"], context: 272000, output: 64000, members: ["acme/gpt-5.5-mini", "zeta/kimi-k3"] },
   ] },
 };
 const state = { agents: [], profiles: [], settings: { lang: "en", theme: "light" } };
@@ -59,6 +60,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
     const context = await browser.newContext({ viewport: { width: 900, height: 700 }, reducedMotion: "reduce" });
     const page = await context.newPage();
     page.setDefaultTimeout(5000);
+    page.setDefaultNavigationTimeout(60000);
     const errors = [];
     page.on("pageerror", (e) => errors.push(e.message));
     await page.route("**/*", serve);
@@ -81,7 +83,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
     // the info at each row's end, and its tooltip
     const info = async (id) => {
       const box = rowOf(page, id).locator(".minfo");
-      return { chips: (await box.locator(".badge").allTextContents()).map((s) => s.trim()), img: await box.locator(".mi-img").count(), tip: await box.getAttribute("title") };
+      return { chips: (await box.locator(".badge").allTextContents()).map((s) => s.trim()), img: await box.locator(".mi-img").count(), media: await box.locator(".mi-media").evaluateAll((cs) => cs.map((c) => c.classList[2])), tip: await box.getAttribute("title") };
     };
     let i = await info("acme/gpt-5.5");
     assert.deepEqual(i.chips, ["low–xhigh", "", "400K"]);
@@ -95,14 +97,21 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
     assert.deepEqual(i.chips, ["128K"]);
     assert.equal(i.img, 0);
     assert.equal(i.tip, "Reasoning levels: none known\nText only\nContext: 128,000 tokens");
+    assert.deepEqual(i.media, [], "no video or audio listed, none said");
+    // video and audio, when its list says so (pingqipai3 on X)
     i = await info("zeta/glm-5");
-    assert.deepEqual(i.chips, ["high", "1M"]);
+    assert.deepEqual(i.chips, ["high", "", "1M"]);
+    assert.deepEqual(i.media, ["mi-audio"]);
+    assert.equal(i.tip, "Reasoning: high\nText only\nAccepts audio\nContext: 1,000,000 tokens");
     i = await info("zeta/kimi-k3");
-    assert.deepEqual(i.chips, [""], "levels it can be given but wasn't aren't said");
+    assert.deepEqual(i.chips, ["", "", ""], "levels it can be given but wasn't aren't said");
     assert.equal(i.img, 1);
+    assert.deepEqual(i.media, ["mi-video", "mi-audio"]);
+    assert.equal(i.tip, "Reasoning levels: none known\nAccepts images\nAccepts video\nAccepts audio");
     i = await info("group/smart");
-    assert.deepEqual(i.chips, ["low–high", "", "272K"]);
-    assert.equal(i.tip, "Reasoning: low, medium, high (the levels every model in it has)\nAccepts images (one of its models does)\nContext: 272,000 tokens (the largest of its models')\nOutput: up to 64,000 tokens\nModels: acme/gpt-5.5-mini, zeta/kimi-k3");
+    assert.deepEqual(i.chips, ["low–high", "", "", "272K"]);
+    assert.deepEqual(i.media, ["mi-video"]);
+    assert.equal(i.tip, "Reasoning: low, medium, high (the levels every model in it has)\nAccepts images (one of its models does)\nAccepts video (one of its models does)\nContext: 272,000 tokens (the largest of its models')\nOutput: up to 64,000 tokens\nModels: acme/gpt-5.5-mini, zeta/kimi-k3");
     // the chips sit at the row's end, before its copy button
     const [infoBox, copyBox, whoBox] = await Promise.all([".minfo", ".copy", ".who"].map((s) => rowOf(page, "acme/gpt-5.5").locator(s).boundingBox()));
     assert(infoBox.x > whoBox.x && infoBox.x + infoBox.width <= copyBox.x + 1, "info between the name and the copy button");
@@ -126,6 +135,9 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
 
     // a click on the chips picks the model as a click on its row does, and
     // the row stays where it was
+    // the line on where gateway keys come from (unshared) puts the row
+    // past the window's foot: the reader wheels down to it
+    await reach(page, rowOf(page, "acme/gpt-5.5").locator(".minfo"));
     const scroll = async () => (await rowOf(page, "acme/gpt-5.5").boundingBox()).y;
     const was = await scroll();
     await rowOf(page, "acme/gpt-5.5").locator(".minfo").click();

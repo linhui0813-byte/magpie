@@ -25,19 +25,30 @@ func fakeReach(t *testing.T, answers map[string]bool) *sync.Mutex {
 	reach.m = nil
 	reach.Unlock()
 	t.Cleanup(func() {
+		reachForget()
 		reachProbe, reachAge = was, age
-		reach.Lock()
-		reach.m = nil
-		reach.Unlock()
 	})
 	return &mu
 }
 
-// reachForget drops every answer, so the next Drift asks again.
+// reachForget drops every answer, so the next Drift asks again. A probe
+// still out (one the last Drift started, for an address it was just set
+// at) is waited for first: its answer would be written into no map.
 func reachForget() {
-	reach.Lock()
-	reach.m = nil
-	reach.Unlock()
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(5 * time.Millisecond) {
+		reach.Lock()
+		busy := false
+		for _, r := range reach.m {
+			busy = busy || r.busy
+		}
+		if !busy {
+			reach.m = nil
+			reach.Unlock()
+			return
+		}
+		reach.Unlock()
+	}
+	panic("a reach probe never answered")
 }
 
 // driftSettled is the agent's drift once the probes it starts have
@@ -133,11 +144,19 @@ func TestKeptAddressProbeNeverWaitedFor(t *testing.T) {
 	release := make(chan struct{})
 	slow := reachProbe
 	reachProbe = func(base string) bool { <-release; return slow(base) }
-	start := time.Now()
-	if d := codex(home).Drift(); d != nil {
-		t.Fatalf("drift before any answer: %+v", d)
-	}
-	if time.Since(start) > time.Second {
+	// the probe can't answer before release is closed, below: a Drift that
+	// waited for it would never return, so how long Drift takes on a busy
+	// machine (its files) is no measure of it
+	done := make(chan *Drift, 1)
+	go func() { done <- codex(home).Drift() }()
+	select {
+	case d := <-done:
+		if d != nil {
+			t.Fatalf("drift before any answer: %+v", d)
+		}
+	case <-time.After(30 * time.Second):
+		close(release)
+		<-done
 		t.Fatal("Drift waited for the probe")
 	}
 	close(release)

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -140,7 +141,7 @@ func TestQwenPlanCardAndRefresh(t *testing.T) {
 	var session atomic.Value
 	session.Store("test-console-session")
 	var response atomic.Value
-	response.Store(qwenMonthlyReply)
+	response.Store(strings.ReplaceAll(qwenMonthlyReply, "1793000000000", strconv.FormatInt(time.Now().Add(24*time.Hour).UnixMilli(), 10)))
 	transport := qwenTestTransport(func(r *http.Request) (*http.Response, error) {
 		calls.Add(1)
 		if r.Method != "POST" || r.URL.Host != "bailian-cs.console.aliyun.com" || r.URL.Path != "/cli/api.json" || r.Header.Get("Authorization") != "Bearer "+session.Load().(string) || r.URL.Query().Get("api") != qwenUsageAPI {
@@ -216,6 +217,33 @@ func TestQwenPlanCardAndRefresh(t *testing.T) {
 	}
 	if calls.Load() != 4 {
 		t.Error("card refresh did not bypass the cache")
+	}
+}
+
+// A provider's own sign-in takes precedence over the shared CLI profile.
+func TestQwenConsoleDoesNotReplaceProviderSignIn(t *testing.T) {
+	qianwenHome(t)
+	cliDir := t.TempDir()
+	t.Setenv("BAILIAN_CONFIG_DIR", cliDir)
+	if err := os.WriteFile(filepath.Join(cliDir, "config.json"), []byte(`{"access_token":"shared-cli-session"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f := newFakeQianwen(t)
+	f.mints["native-session"] = "native-console-token"
+	f.usage["native-console-token"] = qianwenUsageReply(0.25)
+	p, err := FromPreset("qwen-token-plan")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.Key = "test-model-key"
+	if _, err := Add(p); err != nil {
+		t.Fatal(err)
+	}
+	saveQianwenSession(t, p.ID, qianwenSession{Access: "native-session", Email: "native@example.com"})
+
+	cards := qianwenPlanQuotas(context.Background())
+	if len(cards) != 1 || cards[0].User != "native@example.com" || cards[0].Error != "" || len(cards[0].Windows) != 1 || cards[0].Windows[0].Used != 25 {
+		t.Fatalf("expected the provider sign-in's quota: %+v", cards)
 	}
 }
 

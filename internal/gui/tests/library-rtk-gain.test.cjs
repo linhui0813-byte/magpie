@@ -81,6 +81,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await ctx.addInitScript(() => { try { localStorage.setItem("magpie.libTab", "rtk"); } catch {} });
         const page = await ctx.newPage();
         page.setDefaultTimeout(5000);
+        page.setDefaultNavigationTimeout(60000);
         page.on("pageerror", (e) => errors.push(e.message));
         await page.route("**/*", server(lang, state));
         await page.goto("http://magpie.test/");
@@ -92,8 +93,8 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         assert.equal(await v.locator(".lib-rtk-sandbox").textContent(), w.sandbox);
 
         // the RTK tab opened again: read again, the count it has now
-        await v.locator(".lib-tabs button", { hasText: w.skills }).click();
-        await v.locator(".lib-tabs button", { hasText: "RTK" }).click();
+        await v.page().locator(":is(.lib-tabs button, .nav-s):visible", { hasText: w.skills }).click();
+        await v.page().locator(":is(.lib-tabs button, .nav-s):visible", { hasText: "RTK" }).click();
         await page.waitForFunction((want) => document.querySelector("#view-library .lib-rtk-gain")?.textContent.startsWith(want), w.saved).catch(() => {});
         assert.equal(await gain.textContent(), w.saved + " " + w.scope);
         assert.equal(await v.locator(".lib-rtk-sandbox").count(), 0);

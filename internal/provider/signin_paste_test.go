@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -128,6 +129,10 @@ func TestPastedAddressAndCallbackFinishOnce(t *testing.T) {
 	claudeHome(t)
 	hold := make(chan struct{})
 	trades := fakeCodexTokens(t, hold)
+	// registered after the fake, so it runs before the fake's Close, which
+	// waits for the held trade: a failed check doesn't leave it held (#1808)
+	let := sync.OnceFunc(func() { close(hold) })
+	t.Cleanup(let)
 
 	st, err := StartSignIn("codex")
 	if err != nil {
@@ -147,7 +152,7 @@ func TestPastedAddressAndCallbackFinishOnce(t *testing.T) {
 	browser := http.Client{Timeout: 3 * time.Second}
 	resp, err := browser.Get(strings.Replace(good, "localhost", "127.0.0.1", 1))
 	if err != nil {
-		close(hold)
+		let()
 		t.Fatalf("the browser's callback traded the code again: %v", err)
 	}
 	page, _ := io.ReadAll(resp.Body)
@@ -155,7 +160,7 @@ func TestPastedAddressAndCallbackFinishOnce(t *testing.T) {
 	if !strings.Contains(string(page), "already finishing") {
 		t.Fatalf("second callback's page: %s", page)
 	}
-	close(hold)
+	let()
 	if err := <-pasted; err != nil {
 		t.Fatal(err)
 	}
@@ -169,11 +174,13 @@ func TestPastedAddressAndCallbackFinishOnce(t *testing.T) {
 
 // Every built-in sign-in that comes back to a port here takes the address
 // pasted instead; one that doesn't come back through the browser's address
-// bar doesn't offer it. Claude's is Claude Code's own (signin_claude_test.go).
+// bar doesn't offer it. Claude's is Claude Code's own (signin_claude_test.go);
+// Command Code's, whose key is posted, is its plugin's (TestLoopbackPorts).
 func TestLoopbackSignInsTakePastedAddress(t *testing.T) {
+	t.Cleanup(AntigravityBuiltinForTest()) // the retired built-in route
 	claudeHome(t)
 	fakeCodexTokens(t, nil)
-	for _, agent := range []string{"codex", "gemini", "antigravity", "kiro", "zed"} {
+	for _, agent := range []string{"codex", "gemini", "antigravity"} {
 		st, err := StartSignIn(agent)
 		if err != nil {
 			t.Fatalf("%s: %v", agent, err)
@@ -182,13 +189,5 @@ func TestLoopbackSignInsTakePastedAddress(t *testing.T) {
 		if !st.PasteCallback {
 			t.Errorf("%s: no pasted address", agent)
 		}
-	}
-	st, err := StartSignIn(CommandCodePlanID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	CancelSignIn(st.ID)
-	if st.PasteCallback {
-		t.Error("Command Code's key is posted, never in an address to paste")
 	}
 }

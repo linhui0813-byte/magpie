@@ -95,43 +95,25 @@ func readQwenConsole() (qwenConsole, error) {
 	return c, nil
 }
 
-func qwenTokenPlan(p Provider) bool {
-	for _, base := range []string{p.Chat, p.Anthropic, p.Responses} {
-		if hostOf(base) == "token-plan.maas.qianwenaiapi.com" {
-			return true
-		}
-	}
-	return false
-}
+const bailianConsoleUser = "Bailian console"
 
-// qwenPlanQuotas shows the console's shared personal allowance once, on
-// the first enabled Token Plan provider. It does not assign that account's
-// windows to individual API keys or use them to stop gateway routing.
-func qwenPlanQuotas(ctx context.Context) []SubscriptionQuota {
-	for _, p := range All() {
-		if p.Hidden || p.Off || p.Account != nil || p.Key == "" || !qwenTokenPlan(p) {
-			continue
-		}
-		const user = "Bailian console"
-		if !wantsCard(ctx, p.ID, user) {
-			return nil
-		}
-		q := SubscriptionQuota{Provider: p.ID, Name: p.Name, Icon: p.Icon, Plan: "Token Plan", User: user, Windows: []QuotaWindow{}}
-		c, err := readQwenConsole()
-		if err == nil {
-			c, q.Windows, err = qwenConsoleAllowance(p.Via(ctx), c)
-		}
-		if err != nil {
-			q.Error = err.Error()
-		}
-		// A profile or session changed must never inherit another account's
-		// last reading. Neither the token nor its payload goes on the card.
-		if c.Token != "" {
-			q = keepReading(ctx, q, keyTag("qwen-console", c.Token+"/"+c.Profile+fmt.Sprint(c.SwitchAgent)))
-		}
-		return []SubscriptionQuota{q}
+// qwenConsoleQuota reads an existing CLI profile without assigning its
+// windows to model keys. Only the provider's own sign-in informs routing.
+func qwenConsoleQuota(ctx context.Context, p Provider, c qwenConsole, err error) SubscriptionQuota {
+	q := SubscriptionQuota{Provider: p.ID, Name: p.Name, Icon: p.Icon, Plan: aliPlanName, User: bailianConsoleUser, Windows: []QuotaWindow{}}
+	if err == nil {
+		c, q.Windows, err = qwenConsoleAllowance(p.Via(ctx), c)
 	}
-	return nil
+	if err != nil {
+		q.Error = err.Error()
+	}
+	q = readNow(q)
+	// A profile or session changed must never inherit another account's
+	// last reading. Neither the token nor its payload goes on the card.
+	if c.Token != "" {
+		q = keepReading(ctx, q, keyTag("qwen-console", c.Token+"/"+c.Profile+fmt.Sprint(c.SwitchAgent)))
+	}
+	return q
 }
 
 // qwenConsoleWindows sends the same gateway request as modelstudioai/cli's

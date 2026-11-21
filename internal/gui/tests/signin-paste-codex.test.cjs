@@ -67,9 +67,14 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await browser.close();
       });
       page.setDefaultTimeout(5000);
+      page.setDefaultNavigationTimeout(60000);
       const errors = [], posted = [];
       page.on("pageerror", (e) => errors.push(e.message));
       await page.route("**/*", server(lang, posted));
+      // the vendor's sign-in page, opened in a new window, gets an empty page:
+      // the real one is a page the test can't control (ChatGPT's Cloudflare
+      // challenge hung clicks on this page in Chromium, #1307)
+      await page.context().route((url) => url.hostname !== "magpie.test", (route) => route.fulfill({ contentType: "text/html", body: "" }));
       await page.goto("http://magpie.test/?view=providers");
       await page.locator("#addProvider").click();
       const sheet = page.locator("#addSheet");

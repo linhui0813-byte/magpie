@@ -90,6 +90,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
           await browser.close();
         });
         page.setDefaultTimeout(5000);
+        page.setDefaultNavigationTimeout(60000);
         const errors = [];
         page.on("pageerror", (e) => errors.push(e.message));
         await page.route("**/*", serve(lang, [], theme));
@@ -97,9 +98,13 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await page.locator("#nav").getByRole("button", { name: nav[lang], exact: true }).click();
         const view = page.locator("#view-sessions");
         await view.locator('.row.sm-sess[data-id="a-login"]').waitFor();
-        // read after a frame: the page's reduced-motion transitions still take one
+        await view.locator(".sm-select").click();
+        // read once the box's own transitions end: reduced motion makes every
+        // transition .01ms, not none, and Chromium under load can still show
+        // one at its start two frames after the click
         const look = (l) => l.evaluate(async (e) => {
-          for (let i = 0; i < 2; i++) await new Promise((r) => requestAnimationFrame(r));
+          await new Promise((r) => requestAnimationFrame(r));
+          await Promise.all(e.getAnimations().map((a) => a.finished));
           const s = getComputedStyle(e), card = getComputedStyle(document.documentElement).getPropertyValue("--card").trim();
           const accent = getComputedStyle(document.documentElement).getPropertyValue("--accent").trim();
           const probe = document.createElement("i");

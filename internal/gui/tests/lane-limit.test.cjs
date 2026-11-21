@@ -4,7 +4,7 @@
 // routing group and agent. Its row has a pill: what runs and waits under
 // it while requests are out (the gateway's lanes, read again every two
 // seconds and written into the pill in place), else its limit; a row with
-// none says so on hover only. A click opens the app's own menu (no native
+// none says so under the account's ⋯ only. A click opens the app's own menu (no native
 // select): the provider's, no limit, a number, or Other… typed in place,
 // each posted to provider/accountconcurrency. The editor has the queue's
 // length and wait under Concurrency, saved with it and refused when not a
@@ -72,13 +72,13 @@ function serve(lang, posts, lanes) {
 
 const words = {
   en: {
-    busy: "1/1 running · 2 queued", one: "1 at once", two: "2 at once", three: "3 at once", four: "4 at once", seven: "7 at once", none: "No limit at once",
-    menu: "Requests at once", def: "Provider's", other: "Other…", save: "Save", queue: "Queue size", wait: "Queue wait",
+    busy: "1/1 running · 2 queued", running: "3 running", one: "1 at once", two: "2 at once", three: "3 at once", four: "4 at once", five: "5 at once", seven: "7 at once", none: "No limit at once",
+    menu: "Requests at once", def: "Provider's", other: "Other…", save: "Save", cancel: "Cancel", close: "Close", queue: "Queue size", wait: "Queue wait",
     badQueue: "Queue size: a whole number from 0 to 10000",
   },
   zh: {
-    busy: "1/1 运行中 · 2 排队", one: "并发 1", two: "并发 2", three: "并发 3", four: "并发 4", seven: "并发 7", none: "并发不限",
-    menu: "同时请求数", def: "沿用提供商", other: "其他…", save: "保存", queue: "排队上限", wait: "排队等待",
+    busy: "1/1 运行中 · 2 排队", running: "3 运行中", one: "并发 1", two: "并发 2", three: "并发 3", four: "并发 4", five: "并发 5", seven: "并发 7", none: "并发不限",
+    menu: "同时请求数", def: "沿用提供商", other: "其他…", save: "保存", cancel: "取消", close: "关闭", queue: "排队上限", wait: "排队等待",
     badQueue: "排队上限：0 到 10000 的整数",
   },
 };
@@ -97,13 +97,14 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       });
       const page = await (await browser.newContext({ viewport: { width: 900, height: 760 }, reducedMotion: "reduce" })).newPage();
       page.setDefaultTimeout(5000);
+      page.setDefaultNavigationTimeout(60000);
       const errors = [];
       page.on("pageerror", (e) => errors.push(e.message));
       const posts = [];
       await page.route("**/*", serve(lang, posts, lanes));
       await page.goto("http://magpie.test/?view=providers");
       await page.locator(".row.provider", { hasText: name }).first().click();
-      await page.locator(".editor .accts .acc .alane").first().waitFor();
+      await page.locator(".editor .accts .acc .alane").first().waitFor({ state: "attached" });
       await page.waitForTimeout(300);
       return { page, errors, posts };
     };
@@ -128,6 +129,8 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       return posts.at(-1);
     };
     const opacity = (l) => l.evaluate((e) => getComputedStyle(e).opacity);
+    // an account's unset settings wait under its ⋯
+    const more = async (page, id) => { await row(page, id).hover(); await row(page, id).locator(".acc-more").click(); };
 
     test(`${engine} ${lang}: a key's limit on requests at once shows what runs and waits, and is set from the app's menu`, async (t) => {
       const lanes = { now: { "relay#k1": { busy: 1, waiting: 2, limit: 1 } }, reads: 0 };
@@ -189,7 +192,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       assert.deepEqual(errors, []);
     });
 
-    test(`${engine} ${lang}: an account's own limit is shown, and one with none only on hover`, async (t) => {
+    test(`${engine} ${lang}: an account's own limit is shown, and one with none only under ⋯`, async (t) => {
       const lanes = { now: {}, reads: 0 };
       const { page, errors, posts } = await open(t, "Codex", lanes);
       assert.equal(await pill(page, "Spare@Example.com").textContent(), w.four);
@@ -197,15 +200,95 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await page.mouse.move(0, 0);
       await page.waitForTimeout(250);
       assert.equal(await opacity(pill(page, "Spare@Example.com")), "1");
-      assert.equal(await opacity(pill(page, "me@example.com")), "0", "none set: on hover only");
-      await row(page, "me@example.com").hover();
+      assert.equal(await pill(page, "me@example.com").isVisible(), false, "none set: under ⋯ only");
+      await more(page, "me@example.com");
       await page.waitForTimeout(250);
       assert.equal(await opacity(pill(page, "me@example.com")), "1");
+      assert.equal(await pill(page, "me@example.com").isVisible(), true);
       await still(page, "me@example.com", pill(page, "me@example.com"));
       const n = posts.length;
       await item(page, "2").click();
       const p = await posted(posts, n);
       assert.deepEqual(p.body, { id: "codex", account: "me@example.com", limit: 2 });
+      await page.waitForTimeout(250);
+      assert.equal(await page.locator(".editor > .bar .ed-cancel").textContent(), w.close, "a signed-in provider's editor says Close too");
+      assert.deepEqual(errors, []);
+    });
+
+    test(`${engine} ${lang}: with no limit, what runs is shown, and none running says no limit again`, async (t) => {
+      // chentuoyan on Discord: an account with no limit said only "no
+      // limit", never how many of its requests were out
+      const lanes = { now: { "codex@me@example.com": { busy: 3, waiting: 0, limit: 0 } }, reads: 0 };
+      const { page, errors } = await open(t, "Codex", lanes);
+      const me = pill(page, "me@example.com");
+      for (let i = 0; i < 80 && (await me.textContent()) !== w.running; i++) await page.waitForTimeout(50);
+      assert.equal(await me.textContent(), w.running);
+      await page.mouse.move(0, 0);
+      await page.waitForTimeout(250);
+      assert.equal(await me.isVisible(), true, "running: shown on its line, ⋯ closed");
+      assert.equal(await me.evaluate((e) => e.parentElement.classList.contains("acc-line")), true);
+      // the rest of the row's pill look, no colour of a full lane
+      assert.equal(await me.evaluate((e) => e.classList.contains("busy-lane") || e.classList.contains("queued")), false);
+      const el = await me.elementHandle();
+      lanes.now = {};
+      for (let i = 0; i < 80 && (await me.textContent()) !== w.none; i++) await page.waitForTimeout(50);
+      assert.equal(await me.textContent(), w.none);
+      assert.equal(await el.evaluate((e) => e.isConnected), true, "the same pill, rewritten in place");
+      await page.waitForTimeout(250);
+      assert.equal(await me.isVisible(), false, "idle with no limit: under ⋯ again");
+      assert.equal(await pill(page, "Spare@Example.com").textContent(), w.four);
+      assert.deepEqual(errors, []);
+    });
+
+    test(`${engine} ${lang}: a key on the provider's limit shows the Concurrency typed before Save`, async (t) => {
+      // the pill read the saved limit while the editor said another
+      const lanes = { now: {}, reads: 0 };
+      const { page, errors, posts } = await open(t, "Relay", lanes);
+      const box = page.locator(".editor input.concurrency");
+      assert.equal(await pill(page, "k2").textContent(), w.two);
+      await box.fill("5");
+      assert.equal(await pill(page, "k2").textContent(), w.five, "the provider's limit as typed");
+      assert.equal(await pill(page, "k1").textContent(), w.one, "its own limit stays");
+      // brought into sight first: a scroll that lands after the click closes the menu
+      await pill(page, "k2").scrollIntoViewIfNeeded();
+      await page.waitForTimeout(250);
+      await pill(page, "k2").click();
+      await menu(page).waitFor();
+      assert.match(await item(page, w.def).textContent(), new RegExp(w.five), "the menu's provider's limit as typed");
+      await page.keyboard.press("Escape");
+      await box.fill("");
+      assert.equal(await pill(page, "k2").textContent(), w.none, "empty is no limit");
+      await box.fill("2000");
+      assert.equal(await pill(page, "k2").textContent(), w.two, "typed wrong: the saved one");
+      assert.equal(posts.length, 0, "nothing saved");
+      assert.deepEqual(errors, []);
+    });
+
+    test(`${engine} ${lang}: the editor says Close while nothing waits for Save, and Cancel once something does`, async (t) => {
+      // a key's pill acts at once, so after it there is nothing to cancel
+      const lanes = { now: {}, reads: 0 };
+      const { page, errors, posts } = await open(t, "Relay", lanes);
+      const bar = page.locator(".editor > .bar");
+      const says = () => bar.locator(".ed-cancel").textContent();
+      assert.equal(await says(), w.close);
+      await pill(page, "k2").click();
+      await menu(page).waitFor();
+      const n = posts.length;
+      await item(page, "3").click();
+      await posted(posts, n);
+      await page.waitForTimeout(250);
+      assert.equal(await says(), w.close, "a pill that acts at once leaves nothing to cancel");
+      const box = page.locator(".editor input.concurrency");
+      await box.fill("5");
+      await page.waitForTimeout(50);
+      assert.equal(await says(), w.cancel, "a typed Concurrency waits for Save");
+      await box.fill("2");
+      await page.waitForTimeout(50);
+      assert.equal(await says(), w.close, "typed back as saved");
+      await bar.getByRole("button", { name: w.close, exact: true }).click();
+      await page.locator(".editor").waitFor({ state: "detached" });
+      assert.equal(await page.locator(".action-confirm").count(), 0, "nothing to discard, nothing asked");
+      assert.deepEqual(await page.evaluate(() => ["zh", "zh-TW", "ja", "de"].filter((l) => !I18N[l].Close)), []);
       assert.deepEqual(errors, []);
     });
 
@@ -247,7 +330,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         "How many requests may wait for each key or account; one more is turned away at once. 0 or empty is no bound",
         "Seconds a request waits for a free slot before it is turned away. 0 or empty waits as long as it takes",
         "Queue size: a whole number from 0 to 10000", "Queue wait: a whole number of seconds from 0 to 3600",
-        "{n}/{max} running · {q} queued", "{n}/{max} running", "{n} at once", "No limit at once", "its own", "the provider's",
+        "{n}/{max} running · {q} queued", "{n}/{max} running", "{n} running", "{n} at once", "No limit at once", "its own", "the provider's",
         "At most {n} requests out at once on this one, {whose}; more wait in a queue and go in order. Counted across every model, routing group and agent",
         "No limit on requests at once on this one, {whose}", "{n} running, {q} queued now", "Click to change",
         "{who} takes the provider's limit", "{who}: at most {n} requests at once", "{who}: no limit on requests at once",

@@ -56,6 +56,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         for (const script of init || []) await context.addInitScript(script);
         const page = await context.newPage();
         page.setDefaultTimeout(5000);
+        page.setDefaultNavigationTimeout(60000);
         page.on("pageerror", (e) => errors.push(e.message));
         await page.route("**/*", serve(lang, empty, ready));
         await page.goto(url);
@@ -82,7 +83,9 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       const panel = await open("http://magpie.test/?mode=panel", { width: 440, height: 640 });
       await panel.waitForFunction(() => document.querySelectorAll("#panelQuota .pq-card").length >= 4);
       await panel.waitForFunction(() => window.__runtimeReady === true); // native ExecJS can now drain
-      assert.equal(await panel.locator("header.top").evaluate((e) => getComputedStyle(e).getPropertyValue("--wails-draggable").trim()), "no-drag", "the runtime must not make the panel draggable");
+      // dragged by its header on Linux alone (panel-drag-linux.test.cjs, #1430)
+      const linux = await panel.evaluate(() => /^Linux/.test(navigator.platform));
+      assert.equal(await panel.locator("header.top").evaluate((e) => getComputedStyle(e).getPropertyValue("--wails-draggable").trim()), linux ? "drag" : "no-drag", "the runtime must not make the panel draggable off Linux");
       assert.equal(await panel.evaluate(() => typeof panelQuotaFocus), "function", "panelQuotaFocus is Go's to call by name");
       assert.equal(await panel.evaluate(() => document.body.dataset.ptab), "agents", "the panel starts on its agents");
       await panel.evaluate(() => panelQuotaFocus("codex|x@y.z"));
@@ -104,7 +107,10 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         window.__beforeFocusRefresh.getAnimations().find((a) => a.animationName === "flash").currentTime = 600;
         window.dispatchEvent(new Event("focus"));
       });
-      await panel.waitForFunction(() => document.querySelector('#panelQuota [data-card="codex|x@y.z"]') !== window.__beforeFocusRefresh);
+      // the refresh read the same allowances, so the card is kept as drawn
+      // (#3192); one drawn again would have to keep the highlight too
+      await panel.waitForFunction(() => !loadBack.flight && !quotasLoading);
+      await panel.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
       assert(await panel.locator('#panelQuota [data-card="codex|x@y.z"]').evaluate((e) => e.classList.contains("flash")), "first-open focus refresh must preserve the highlight");
 
       assert(await panel.locator('#panelQuota [data-card="codex|x@y.z"]').evaluate((e) => e.getAnimations().find((a) => a.animationName === "flash")?.currentTime >= 600), "refresh must continue the animation rather than restart it");

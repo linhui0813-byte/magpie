@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"path/filepath"
 	"time"
 
 	"github.com/yetone/magpie/internal/proc"
@@ -14,7 +13,7 @@ func aside(home string) *Agent { return asideIn(here(home)) }
 
 func asideIn(at place) *Agent {
 	c := newAsideConnection(at)
-	a := &Agent{ID: "aside", Name: "Aside", Icon: "aside", Bin: "aside", Path: c.path, Spelled: prefixed, Dir: filepath.Join(at.home, ".aside"), Sync: c.sync}
+	a := &Agent{ID: "aside", Name: "Aside", Icon: "aside", Bin: "aside", Path: c.path, Spelled: prefixed, Dir: at.join(".aside"), Sync: c.sync}
 	a.Native = &NativeConnection{Read: c.state, Connect: c.connect, Apply: c.apply, Stage: c.stage, Disconnect: c.plan, Execute: c.execute, ExecuteOffline: c.executeOffline}
 	a.Check = func() string {
 		status, detail := c.provider()
@@ -55,20 +54,32 @@ func asideIn(at place) *Agent {
 				}
 				return opts
 			}
-			return append(asideOwnOptions(c.models, cur[key]), viaMagpie("aside", "magpie/")...)
+			return withVia(asideOwnOptions(c.models, cur[key]), "aside", "magpie/")
 		}
 		a.Fields = append(a.Fields, f)
 	}
+	// which of Aside's accounts magpie configures: empty follows the one
+	// Aside has active (#1499)
+	a.Fields = append(a.Fields, Field{Key: "account", Label: "account", Quiet: true,
+		Get: func() string {
+			if id, ok := asidePicked(); ok {
+				return asideAccountName(id)
+			}
+			return ""
+		},
+		Set:     c.pickAccount,
+		Options: func(cur map[string]string) []Option { return asideAccountOptions(at, cur["account"]) },
+	})
 	return a
 }
 
 var asideRoles = []string{"fast", "standard", "deep", "visual"}
 
 const asideImageKey = "imageGenerationModel"
-const asideAccount = 0
 
-func asideAccountID() string   { return "u0" }
-func asideDir(at place) string { return filepath.Join(at.home, ".aside", "u", "0") }
+// asideDir is the folder of the Aside account magpie configures
+// (asideChoice).
+func asideDir(at place) string { return asideAccountDir(at, asideChoice(at)) }
 
 var asideTimeout = 10 * time.Second
 

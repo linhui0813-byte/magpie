@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/yetone/magpie/internal/appdir"
 	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/edit"
 	"github.com/yetone/magpie/internal/provider"
@@ -26,6 +27,7 @@ func effortHome(t *testing.T) string {
 	t.Setenv("LOCALAPPDATA", filepath.Join(home, "AppData", "Local"))
 	t.Setenv("HERMES_HOME", "")
 	t.Setenv("MIMOCODE_HOME", "")
+	t.Setenv("DEVECO_CONFIG_DIR", "")
 	t.Setenv("HANA_HOME", "")
 	t.Setenv("DSH_HOME", "")
 	if err := provider.Save(provider.Provider{ID: "deepseek", Name: "DeepSeek", Chat: "https://api.deepseek.com/v1", Key: "k", Models: []string{"pro", "flash"}}); err != nil {
@@ -80,7 +82,7 @@ func TestEffortFields(t *testing.T) {
 	// env (TestClaudeEffortMax)
 	setEffort(t, c, "max", `"theme"`)
 
-	writeFile(t, filepath.Join(home, ".hermes", "config.yaml"), "model:\n  default: x\nagent:\n  max_turns: 9\n")
+	writeFile(t, filepath.Join(appdir.HermesHomeIn(home), "config.yaml"), "model:\n  default: x\nagent:\n  max_turns: 9\n")
 	h := hermes(home)
 	setEffort(t, h, "none", "max_turns: 9")
 	if v, _ := edit.GetYAML(h.Path, "model.default"); v != "x" {
@@ -98,7 +100,7 @@ func TestEffortFields(t *testing.T) {
 	}
 
 	writeFile(t, filepath.Join(home, ".copilot", "settings.json"), `{"model":"gpt-5.5","contextTier":"long"}`)
-	setEffort(t, copilot(home), "xhigh", `"contextTier"`)
+	setEffort(t, copilot(home, filepath.Join(home, ".config")), "xhigh", `"contextTier"`)
 
 	cr := crush(home, cfg)
 	os.MkdirAll(filepath.Dir(cr.Path), 0o755)

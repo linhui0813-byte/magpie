@@ -22,17 +22,19 @@ const estimate = { exportedAt: "2026-10-14T05:00:00Z", latestUsage: "2026-10-13T
 const words = {
   en: { on: "Estimate Gemini credits from billing data", save: "Save", check: "Check estimate", estimated: "Estimated balance", setup: "Setup required: configure this provider's Credit estimate", latest: "Latest exported usage:" },
   zh: { on: "根据账单数据估算 Gemini 余额", save: "保存", check: "检查估算", estimated: "估算余额", setup: "需要设置：请配置此供应商的余额估算", latest: "最新导出的用量：" },
+  "zh-TW": { on: "根據帳單資料估算 Gemini 餘額", save: "儲存", check: "檢查估算", estimated: "預估餘額", setup: "需要設定：請設定此供應商的餘額估算", latest: "最新匯出的用量：" },
   ja: { on: "請求データから Gemini の残高を推定", save: "保存", check: "推定を確認", estimated: "推定残高", setup: "設定が必要です。このプロバイダーの残高の推定を設定してください", latest: "エクスポート済みの最新利用：" },
   de: { on: "Gemini-Guthaben aus Abrechnungsdaten schätzen", save: "Speichern", check: "Schätzung prüfen", estimated: "Geschätztes Guthaben", setup: "Einrichtung erforderlich: Guthabenschätzung dieses Anbieters konfigurieren", latest: "Neueste exportierte Nutzung:" },
 };
 
 for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium", "webkit"])) {
-  for (const lang of ["en", "zh", "ja", "de"]) for (const width of [1000, 440]) {
+  for (const lang of ["en", "zh", "zh-TW", "ja", "de"]) for (const width of [1000, 440]) {
     test(`${engine} ${lang} ${width}: Gemini billing estimate setup, save and Usage`, async (t) => {
       const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: "chromium" }));
       t.after(() => browser.close());
       const page = await (await browser.newContext({ viewport: { width, height: 800 }, reducedMotion: "reduce" })).newPage();
       page.setDefaultTimeout(5000);
+      page.setDefaultNavigationTimeout(60000);
       const errors = [], posts = [];
       page.on("pageerror", e => errors.push(e.message));
       let saved = null;

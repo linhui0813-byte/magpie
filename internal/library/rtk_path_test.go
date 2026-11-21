@@ -23,6 +23,9 @@ func TestRTKOffPath(t *testing.T) {
 	testenv.Program(t, filepath.Join(local, "rtk"), fakeRTK)
 	tools := filepath.Join(h, "tools")
 	testenv.Program(t, filepath.Join(tools, "curl"), "#!/bin/sh\n")
+	// Claude Code's CLI on this PATH too: its folder alone is gone (#2254)
+	testenv.Program(t, filepath.Join(tools, "claude"), "#!/bin/sh\n")
+	write(t, filepath.Join(tools, "claude.exe"), "")
 	t.Setenv("PATH", tools)
 
 	v := ReadRTK()

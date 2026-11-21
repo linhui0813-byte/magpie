@@ -161,8 +161,10 @@ func sub2apiServer(t *testing.T, body func() ([]byte, int)) (*httptest.Server, *
 	return srv, &asked
 }
 
-func sub2apiKey(srv *httptest.Server) Provider {
-	return Provider{ID: "sub2api", Name: "Sub2API", Chat: srv.URL + "/v1", Responses: srv.URL + "/v1",
+// sub2apiKey is a key at srv, under an id of the test's own: a renewal a
+// reading behind another test tells, after it ended, is not this one's.
+func sub2apiKey(t *testing.T, srv *httptest.Server) Provider {
+	return Provider{ID: "sub2api-" + Slug(t.Name()), Name: "Sub2API", Chat: srv.URL + "/v1", Responses: srv.URL + "/v1",
 		Key: "sk-limited", BalanceURL: srv.URL + "/v1/usage"}
 }
 
@@ -175,14 +177,14 @@ func TestSub2APIKeyLimitsOnItsCard(t *testing.T) {
 	b := sub2apiUsage(t, true)
 	body.Store(&b)
 	srv, _ := sub2apiServer(t, func() ([]byte, int) { return *body.Load(), 200 })
-	p := sub2apiKey(srv)
+	p := sub2apiKey(t, srv)
 	if err := Save(p); err != nil {
 		t.Fatal(err)
 	}
 	card := func() SubscriptionQuota {
 		ForgetBalances()
 		for _, q := range KeyBalances(context.Background()) {
-			if q.Provider == "sub2api" {
+			if q.Provider == p.ID {
 				return q
 			}
 		}
@@ -247,26 +249,39 @@ func TestKeyAllowanceNeverWaits(t *testing.T) {
 		<-release
 		return weekUsed(t, "720", week), 200
 	})
-	p := sub2apiKey(srv)
+	p := sub2apiKey(t, srv)
 	if err := Save(p); err != nil {
 		t.Fatal(err)
 	}
-	var wg sync.WaitGroup
+	var releaseOnce sync.Once
+	let := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(let)
+	// sub2api is held until release, so the looks coming back at all is
+	// their not waiting for it (#1617). The deadline only turns a wait into
+	// a FAIL, and is short of the read's own 30s.
+	type look struct {
+		a  Allowance
+		ok bool
+	}
+	looked := make(chan look, 10)
 	for range 10 {
-		wg.Add(1)
 		go func() {
-			defer wg.Done()
-			start := time.Now()
-			if a, ok := KeyAllowance(p); ok || a != nil {
-				t.Errorf("known before it was read: %+v", a)
-			}
-			if d := time.Since(start); d > time.Second {
-				t.Errorf("waited %v", d)
-			}
+			a, ok := KeyAllowance(p)
+			looked <- look{a, ok}
 		}()
 	}
-	wg.Wait()
-	close(release)
+	hang := time.After(10 * time.Second)
+	for range 10 {
+		select {
+		case l := <-looked:
+			if l.ok || l.a != nil {
+				t.Fatalf("known before it was read: %+v", l.a)
+			}
+		case <-hang:
+			t.Fatal("a look waited for the held read")
+		}
+	}
+	let()
 	a := waitAllowance(t, p, func(Allowance) bool { return true })
 	if used, _ := a.For("gpt-6-astra", time.Now()); used != 90 {
 		t.Fatalf("used = %v of %+v", used, a)
@@ -294,7 +309,7 @@ func TestKeyAllowanceFailedReadKeepsLast(t *testing.T) {
 		}
 		return weekUsed(t, "720", week), 200
 	})
-	p := sub2apiKey(srv)
+	p := sub2apiKey(t, srv)
 	if err := Save(p); err != nil {
 		t.Fatal(err)
 	}
@@ -335,7 +350,7 @@ func TestKeyAllowanceForgottenMidRead(t *testing.T) {
 	})
 	var once sync.Once
 	t.Cleanup(func() { once.Do(func() { close(release) }) })
-	p := sub2apiKey(srv)
+	p := sub2apiKey(t, srv)
 	KeyAllowance(p)
 	for asked.Load() < 1 {
 		time.Sleep(5 * time.Millisecond)
@@ -366,7 +381,22 @@ func TestKeyAllowanceStaleMidRead(t *testing.T) {
 	})
 	var once sync.Once
 	t.Cleanup(func() { once.Do(func() { close(release) }) })
-	p := sub2apiKey(srv)
+	p := sub2apiKey(t, srv)
+	renewedHooks.Lock()
+	hooks := renewedHooks.fs
+	renewedHooks.Unlock()
+	t.Cleanup(func() {
+		renewedHooks.Lock()
+		renewedHooks.fs = hooks
+		renewedHooks.Unlock()
+	})
+	renewed := make(chan struct{})
+	var told sync.Once
+	OnRenewed(func(agent, user string) {
+		if agent == "" && user == KeyAllowanceID(p) {
+			told.Do(func() { close(renewed) })
+		}
+	})
 	KeyAllowance(p)
 	for asked.Load() < 1 {
 		time.Sleep(5 * time.Millisecond)
@@ -376,6 +406,14 @@ func TestKeyAllowanceStaleMidRead(t *testing.T) {
 	waitAllowance(t, p, func(a Allowance) bool { u, _ := a.For("gpt-6-astra", time.Now()); return u > 0 && u < 100 })
 	if n := asked.Load(); n != 2 {
 		t.Fatalf("asked %d times", n)
+	}
+	// the reading after tells the week renewed only after it is kept, so
+	// waitAllowance can return first: waited for here, or a later test's
+	// hook is told it
+	select {
+	case <-renewed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the week renewed was never told")
 	}
 }
 
@@ -392,7 +430,7 @@ func TestKeyAllowanceSeededFromItsCard(t *testing.T) {
 		}
 		return weekUsed(t, "720", week), 200
 	})
-	p := sub2apiKey(srv)
+	p := sub2apiKey(t, srv)
 	if err := Save(p); err != nil {
 		t.Fatal(err)
 	}
@@ -442,7 +480,7 @@ func TestKeyAllowanceOnlyForSub2APIKeys(t *testing.T) {
 func TestKeyAllowancePerKeyAndForgotten(t *testing.T) {
 	keyLimitsHome(t)
 	srv, asked := sub2apiServer(t, func() ([]byte, int) { return sub2apiUsage(t, true), 200 })
-	p := sub2apiKey(srv)
+	p := sub2apiKey(t, srv)
 	now := time.Now()
 	week := now.Add(72 * time.Hour)
 	noteKeyAllowance(p, []QuotaWindow{{Name: "7 days", Span: 7 * 24 * time.Hour, Used: 95, ResetsAt: &week}}, now)
@@ -499,7 +537,7 @@ func TestKeyAllowanceRenewed(t *testing.T) {
 		}
 		return []byte(`{"error":{"type":"api_error","message":"internal error"}}`), 502
 	})
-	p := sub2apiKey(srv)
+	p := sub2apiKey(t, srv)
 	if err := Save(p); err != nil {
 		t.Fatal(err)
 	}
@@ -511,17 +549,21 @@ func TestKeyAllowanceRenewed(t *testing.T) {
 		renewedHooks.fs = hooks
 		renewedHooks.Unlock()
 	})
-	var mu sync.Mutex
-	var told []string
-	OnRenewed(func(agent, user string) {
-		mu.Lock()
-		told = append(told, agent+"/"+user)
-		mu.Unlock()
-	})
 	id := KeyAllowanceID(p)
 	if id != keyAllowanceID(p) {
 		t.Fatalf("KeyAllowanceID = %q", id)
 	}
+	var mu sync.Mutex
+	var told []string
+	// only its own key's: another test's reading may still tell its own
+	OnRenewed(func(agent, user string) {
+		if user != id {
+			return
+		}
+		mu.Lock()
+		told = append(told, agent+"/"+user)
+		mu.Unlock()
+	})
 	reply := func(b []byte) { body.Store(&b) }
 	// read is a reading as routing's, done here rather than behind it
 	read := func(b []byte) {
@@ -561,4 +603,116 @@ func TestKeyAllowanceRenewed(t *testing.T) {
 	ForgetBalances()
 	KeyBalances(context.Background())
 	tellsSo("its usage reset, read on its card", 2)
+}
+
+// A sub2api login JWT added for the account's balance, then removed
+// (lx_78654 on Discord): the editor's "Use …/api/v1/user/profile" left
+// that URL behind, which the key alone can never ask, so the card said
+// "Allowance unavailable" for good. Without the token, the panel's query
+// for the key is asked with the key, as a key with no JWT is; the account
+// query is asked again once a token is pasted again. new-api's
+// /api/user/self, which its editor offers beside it, falls back to
+// /api/usage/token the same way.
+func TestAccountQueryWithoutTokenAsksTheKey(t *testing.T) {
+	keyLimitsHome(t)
+	const jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2ln"
+	var withKey atomic.Int32 // the account queries asked with the key
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		switch strings.TrimRight(r.URL.Path, "/") {
+		case "/api/v1/user/profile":
+			if auth != "Bearer "+jwt {
+				withKey.Add(1)
+				w.WriteHeader(http.StatusUnauthorized)
+				w.Write([]byte(`{"code":"UNAUTHORIZED","message":"Invalid token"}`))
+				return
+			}
+			w.Write([]byte(`{"code":0,"message":"success","data":{"id":1,"balance":12.5}}`))
+		case "/v1/usage":
+			if auth != "Bearer sk-one" {
+				w.WriteHeader(http.StatusUnauthorized)
+				w.Write([]byte(`{"error":{"type":"authentication_error","message":"Invalid API key"}}`))
+				return
+			}
+			w.Write([]byte(`{"mode":"unrestricted","isValid":true,"planName":"钱包余额","remaining":7.25,"unit":"USD","balance":7.25}`))
+		case "/api/user/self":
+			withKey.Add(1)
+			w.WriteHeader(http.StatusUnauthorized)
+			w.Write([]byte(`{"success":false,"message":"无权进行此操作，未登录且未提供 access token"}`))
+		case "/api/usage/token":
+			if auth != "Bearer sk-one" {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			w.Write([]byte(`{"code":true,"message":"ok","data":{"object":"token_usage","total_granted":2000000,"total_used":500000,"total_available":1500000,"unlimited_quota":false}}`))
+		default:
+			t.Errorf("asked %s", r.URL.Path)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	card := func(id string) SubscriptionQuota {
+		t.Helper()
+		ForgetBalances()
+		for _, q := range KeyBalances(context.Background()) {
+			if q.Provider == id {
+				return q
+			}
+		}
+		t.Fatalf("no card for %s", id)
+		return SubscriptionQuota{}
+	}
+	// as the editor saves it: the URL and field its "Use" button set
+	p := Provider{ID: "sub2", Name: "Sub2API", Chat: srv.URL + "/v1", Key: "sk-one",
+		BalanceURL: srv.URL + "/api/v1/user/profile", BalancePath: "$data.balance", BalanceToken: jwt}
+	if err := Save(p); err != nil {
+		t.Fatal(err)
+	}
+	if q := card(p.ID); q.Error != "" || q.Balance != "$12.50" {
+		t.Fatalf("with the JWT: %+v", q)
+	}
+	// Remove, and save
+	p.BalanceToken = ""
+	if err := Save(p); err != nil {
+		t.Fatal(err)
+	}
+	if q := card(p.ID); q.Error != "" || q.Balance != "$7.25" {
+		t.Fatalf("the JWT removed: %+v", q)
+	}
+	if u, field := BalanceQuery(p); u != srv.URL+"/v1/usage" || field != "" {
+		t.Fatalf("asked at %q %q", u, field)
+	}
+	saved, err := Find(p.ID)
+	if err != nil || saved.BalanceURL != srv.URL+"/api/v1/user/profile" || saved.BalancePath != "$data.balance" {
+		t.Fatalf("the saved URL changed: %+v %v", saved, err)
+	}
+	// a token pasted again asks the account again
+	p.BalanceToken = jwt
+	if err := Save(p); err != nil {
+		t.Fatal(err)
+	}
+	if q := card(p.ID); q.Balance != "$12.50" {
+		t.Fatalf("the JWT again: %+v", q)
+	}
+
+	// new-api's account query, its token removed
+	n := Provider{ID: "newapi", Name: "Relay", Chat: srv.URL + "/v1", Key: "sk-one",
+		Headers: map[string]string{"New-Api-User": "42"}, BalanceURL: srv.URL + "/api/user/self/", BalancePath: newAPIQuotaPath}
+	if got, ok, err := Balance(context.Background(), n); err != nil || !ok || got != "$3.00" {
+		t.Fatalf("new-api without its token: %q %v %v", got, ok, err)
+	}
+	// a field of the user's own is theirs
+	n.BalancePath = "$data.total_used / 500000"
+	if got, _, err := Balance(context.Background(), n); err != nil || got != "$1.00" {
+		t.Fatalf("own field: %q %v", got, err)
+	}
+	if withKey.Load() != 0 {
+		t.Fatalf("an account query was asked with the key %d times", withKey.Load())
+	}
+	// one that authenticates the account query by a header of its own
+	// still asks it as set
+	n.BalancePath = ""
+	n.Headers = map[string]string{"Authorization": "tok"}
+	if _, _, err := Balance(context.Background(), n); err == nil || withKey.Load() != 1 {
+		t.Fatalf("own Authorization: %v, asked %d", err, withKey.Load())
+	}
 }

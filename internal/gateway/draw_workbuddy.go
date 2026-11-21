@@ -43,14 +43,7 @@ const (
 // drawsWorkBuddy is whether p is a WorkBuddy plan, the China build's or
 // WorkBuddy AI's: the built-in's, or the WorkBuddy plugin's.
 func drawsWorkBuddy(p provider.Provider) bool {
-	if p.Account == nil || p.Base(provider.Chat) == "" {
-		return false
-	}
-	id := p.PluginProvider()
-	if id == "" {
-		id = p.Account.Agent
-	}
-	return id == "workbuddy" || id == provider.WorkBuddyAIID
+	return isWorkBuddy(p) && p.Base(provider.Chat) != ""
 }
 
 // wbImageModel is an image model a WorkBuddy config lists.
@@ -190,7 +183,7 @@ func wbFetchImageModels(ctx context.Context, client *http.Client, p provider.Pro
 	defer res.Body.Close()
 	b, _ := io.ReadAll(io.LimitReader(res.Body, 8<<20))
 	if res.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("%s's config: %d%s", p.Name, res.StatusCode, vendorSaid(vendorMessage(b)))
+		return nil, fmt.Errorf("%s's config: %d%s", p.Name, res.StatusCode, errorSaid(b))
 	}
 	var env struct {
 		Code json.RawMessage `json:"code"`

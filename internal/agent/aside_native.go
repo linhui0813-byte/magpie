@@ -12,6 +12,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/edit"
 	"github.com/yetone/magpie/internal/filememo"
 	"github.com/yetone/magpie/internal/gateway"
@@ -19,13 +20,13 @@ import (
 	"github.com/yetone/magpie/internal/provider"
 )
 
-var asideRead = func() (map[string]json.RawMessage, error) {
+var asideRead = func(account string) (map[string]json.RawMessage, error) {
 	if testing.Testing() {
 		return nil, fmt.Errorf("Aside runtime is isolated in tests")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), asideTimeout)
 	defer cancel()
-	out, err := proc.CommandContext(ctx, "aside", "repl", "--account", asideAccountID(), "--host", "local",
+	out, err := proc.CommandContext(ctx, "aside", "repl", "--account", account, "--host", "local",
 		"console.log('MAGPIE_ASIDE_STATE '+JSON.stringify({defaultModel:aside.settings.get('defaultModel'),modelCategories:aside.settings.get('modelCategories'),imageGenerationModel:aside.settings.get('imageGenerationModel')}))").Output()
 	if err != nil {
 		return nil, fmt.Errorf("Aside settings could not be read: %w", err)
@@ -54,6 +55,7 @@ type asideRecord struct {
 
 type asideConnection struct {
 	at                   place
+	account              int // the Aside account, ~/.aside/u/<account>
 	path, models, record string
 	snapshot             map[string]json.RawMessage
 	readErr              error
@@ -61,8 +63,21 @@ type asideConnection struct {
 }
 
 func newAsideConnection(at place) *asideConnection {
-	dir := asideDir(at)
-	return &asideConnection{at: at, path: filepath.Join(dir, "settings.json"), models: filepath.Join(dir, "models.json"), record: filepath.Join(filepath.Dir(stashPath()), "aside-state.json")}
+	id := asideChoice(at)
+	dir := asideAccountDir(at, id)
+	// what magpie remembers of an account's settings is that account's:
+	// u0's keeps the name it had before there was a choice
+	record := "aside-state.json"
+	if id != 0 {
+		record = "aside-state-" + asideAccountName(id) + ".json"
+	}
+	return &asideConnection{at: at, account: id, path: filepath.Join(dir, "settings.json"), models: filepath.Join(dir, "models.json"), record: filepath.Join(filepath.Dir(stashPath()), record)}
+}
+
+func (c *asideConnection) accountID() string { return asideAccountName(c.account) }
+
+func (c *asideConnection) runtime() (map[string]json.RawMessage, error) {
+	return asideRead(c.accountID())
 }
 
 func (c *asideConnection) settings() map[string]json.RawMessage {
@@ -79,7 +94,7 @@ func (c *asideConnection) settings() map[string]json.RawMessage {
 }
 
 func (c *asideConnection) liveSettings() map[string]json.RawMessage {
-	snapshot, err := asideRead()
+	snapshot, err := c.runtime()
 	return c.reconcileSettings(snapshot, err)
 }
 
@@ -226,7 +241,7 @@ func (c *asideConnection) load() (asideRecord, error) {
 	if r.Fields == nil {
 		r.Fields = map[string]asideOwned{}
 	}
-	if len(b) > 0 {
+	if len(b) > 0 || c.account != 0 {
 		return r, nil
 	}
 	// Legacy stash entries exist only for selections explicitly replaced by
@@ -298,7 +313,7 @@ func (c *asideConnection) provider() (string, string) {
 	if p.Key == "" || p.URL == "" {
 		return "foreign", "Aside's magpie provider has no ownership credential; it will not be overwritten"
 	}
-	if p.Key != gateway.TokenFor("aside") {
+	if p.Key != gateway.TokenFor("aside") && p.Key != agentKeyAt("aside", c.at.gw()) {
 		return "foreign", "Aside's magpie provider belongs to another configuration; it will not be overwritten"
 	}
 	if !sameGateway(p.URL, c.at.v1()) {
@@ -312,7 +327,7 @@ func (c *asideConnection) provider() (string, string) {
 
 func (c *asideConnection) block() any {
 	p := magpieProviderJSONAt("pi", "aside", c.at.gw()).(map[string]any)
-	p["apiKey"] = gateway.TokenFor("aside")
+	p["apiKey"] = agentKeyAt("aside", c.at.gw())
 	return p
 }
 
@@ -328,9 +343,9 @@ func (c *asideConnection) connectLocked() error {
 		return fmt.Errorf("%s", detail)
 	}
 	if status == "connected" {
-		return syncJSON(c.models, "providers.magpie", c.block)
+		return syncJSON(c.models, "providers.magpie", c.kept())
 	}
-	return edit.SetJSON(c.models, edit.KV{Path: "providers.magpie", Value: c.block()})
+	return edit.SetJSON(c.models, edit.KV{Path: "providers.magpie", Value: c.kept()()})
 }
 
 func (c *asideConnection) sync() error {
@@ -340,7 +355,13 @@ func (c *asideConnection) sync() error {
 	if status != "connected" {
 		return nil
 	}
-	return syncJSON(c.models, "providers.magpie", c.block)
+	return syncJSON(c.models, "providers.magpie", c.kept())
+}
+
+// kept is the block with what else Aside's providers.magpie holds kept
+// (theirsKept).
+func (c *asideConnection) kept() func() any {
+	return piBlockKept(c.models, c.block)
 }
 
 func (c *asideConnection) state() NativeState {
@@ -392,13 +413,17 @@ func (c *asideConnection) state() NativeState {
 	return s
 }
 
-func asideImageOptions() []Option {
+// asideImageOptions are the image models Aside is offered: those unticked
+// in their provider's editor left out (provider.HiddenDrawers).
+func asideImageOptions() []Option { return asideImages(gateway.OfferedDrawers) }
+
+func asideImages(drawers func(provider.Provider) []catalog.Model) []Option {
 	var out []Option
 	for _, p := range provider.All() {
 		if !p.On() {
 			continue
 		}
-		for _, m := range gateway.Drawers(p) {
+		for _, m := range drawers(p) {
 			ref := p.ID + "/" + m.ID
 			out = append(out, Option{Value: "magpie/" + ref, Ref: ref, Label: m.Name, Group: p.Name, Icon: p.Icon, Note: "image generation · via magpie"})
 		}
@@ -407,7 +432,13 @@ func asideImageOptions() []Option {
 }
 
 func asideImageOffered(value string) bool {
-	for _, o := range asideImageOptions() {
+	// a ChatGPT account's gpt-image-2.5, offered before #1865, is its one
+	// GPT Image, which draws the same
+	if ref, ok := strings.CutPrefix(value, "magpie/"); ok {
+		value = "magpie/" + gateway.ListedDrawer(ref)
+	}
+	// one unticked in its editor still draws: Aside set to it keeps it
+	for _, o := range asideImages(gateway.Drawers) {
 		if o.Value == value {
 			return true
 		}
@@ -440,6 +471,9 @@ func (c *asideConnection) validateSelection(key, value string) (string, error) {
 }
 
 func (c *asideConnection) apply(key, value string) error {
+	if key == "account" {
+		return c.pickAccount(value)
+	}
 	asideMu.Lock()
 	defer asideMu.Unlock()
 	value, err := c.validateSelection(key, value)
@@ -450,7 +484,7 @@ func (c *asideConnection) apply(key, value string) error {
 		return err
 	}
 	c.read = false
-	snapshot, err := asideRead()
+	snapshot, err := c.runtime()
 	if err != nil {
 		action := OfflineAction("")
 		if key != "effort" && value != "" {
@@ -575,7 +609,7 @@ func (c *asideConnection) setSetting(key string, raw json.RawMessage) error {
 	} else {
 		expr = "aside.settings.set(" + jsString(key) + "," + string(raw) + ");"
 	}
-	return asideSet(asideAccountID(), expr+"console.log('"+asideOK+"')")
+	return asideSet(c.accountID(), expr+"console.log('"+asideOK+"')")
 }
 
 func (c *asideConnection) plan() (*DisconnectPlan, error) {
@@ -644,7 +678,7 @@ func (c *asideConnection) planLocked() (*DisconnectPlan, error) {
 	empty, _ := json.MarshalIndent(asideRecord{Fields: map[string]asideOwned{}}, "", "  ")
 	plan.Files = append(plan.Files, PlannedFile{Path: c.record, Before: record, After: append(empty, '\n')})
 	// Legacy restore points come from the stash only while no record exists.
-	if len(record) == 0 {
+	if len(record) == 0 && c.account == 0 {
 		legacy, err := edit.Read(stashPath())
 		if err != nil {
 			return nil, err
@@ -662,7 +696,7 @@ func (c *asideConnection) execute(plan *DisconnectPlan) error {
 		return err
 	}
 	if len(plan.Settings) > 0 {
-		snapshot, err := asideRead()
+		snapshot, err := c.runtime()
 		if err != nil {
 			return &RuntimeUnavailableError{Agent: "aside", Operation: "disconnect", Offline: OfflineDisconnect, Cause: err}
 		}

@@ -8,8 +8,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"time"
 
 	"github.com/yetone/magpie/internal/provider"
+	"github.com/yetone/magpie/internal/settings"
+	"github.com/yetone/magpie/internal/usage"
 )
 
 // A Kimi Code plan searches the web with its own key, as kimi-cli's
@@ -45,7 +48,19 @@ type searchCallKey struct{}
 // search: one of p's own (a Kimi Code plan, a Google sign-in), or
 // canSearch.
 func canSearchFor(p provider.Provider) bool {
-	return provider.KimiCodeSearch(p) != "" || googleAccount(p) && searcherModel(p) != "" || canSearch()
+	return searchesOwn(p) || canSearch()
+}
+
+// searchesOwn is whether p searches for its own models: by its Kimi Code
+// plan's, GLM Coding Plan's (glmSearches) or WorkBuddy plan's search
+// service (#1798), or a Google sign-in's
+// or an AI Studio key's own Gemini (geminiKeySearches). Never with provider search Off in Settings (#1483), which
+// leaves the search APIs alone, nor with plugins/search off.
+func searchesOwn(p provider.Provider) bool {
+	if !searchServed() || settings.Shared().Searcher == "off" {
+		return false
+	}
+	return provider.KimiCodeSearch(p) != "" || glmSearches(p) || wbSearches(p) || (googleAccount(p) || geminiKeySearches(p)) && searcherModel(p) != ""
 }
 
 // searchingOn is ctx for the searches made for a model of p.
@@ -60,34 +75,69 @@ func searchingOn(ctx context.Context, p provider.Provider) context.Context {
 // on its own, and not to another subscription's allowance (#757).
 func ownSearcher(ctx context.Context) (provider.Provider, bool) {
 	p, ok := ctx.Value(searchOnKey{}).(provider.Provider)
-	return p, ok && (provider.KimiCodeSearch(p) != "" || googleAccount(p) && searcherModel(p) != "")
+	return p, ok && searchesOwn(p)
 }
 
 // ownSearch searches with the conversation's own provider (ownSearcher).
 func (s *Server) ownSearch(ctx context.Context, p provider.Provider, query string) (string, []Hit, error) {
 	if provider.KimiCodeSearch(p) != "" {
-		return s.kimiSearch(ctx, p, query)
+		return s.askOwnSearch(ctx, p, provider.KimiCodeSearch(p), query, s.kimiSearch)
+	}
+	if glmSearches(p) {
+		return s.glmSearch(ctx, p, query)
+	}
+	if wbSearches(p) {
+		return s.askOwnSearch(ctx, p, p.Origin(ctx), query, s.wbSearch)
 	}
 	ctx, cancel := context.WithTimeout(context.WithValue(ctx, searchingKey{}, true), searchTimeout)
 	defer cancel()
-	return s.searchWith(ctx, p, searcherModel(p), query)
+	return s.searchWith(ctx, p, searcherModel(p), query, "")
 }
 
 // searchBy searches with one searcher: a Kimi Code plan by its search
-// service, any other by its model.
-func (s *Server) searchBy(ctx context.Context, p provider.Provider, model, query string) (string, []Hit, error) {
+// service, a ChatGPT account named with codexSearchModel by the backend's
+// search, any other by its model.
+func (s *Server) searchBy(ctx context.Context, p provider.Provider, model, query, effort string) (string, []Hit, error) {
+	// a Kimi Code plan picked to search for another's model is its
+	// search service's ask, logged as one for its own model is
 	if provider.KimiCodeSearch(p) != "" {
-		return s.kimiSearch(ctx, p, query)
+		return s.askOwnSearch(ctx, p, provider.KimiCodeSearch(p), query, s.kimiSearch)
 	}
-	return s.searchWith(ctx, p, model, query)
+	if model == codexSearchModel && codexSearches(p) {
+		return s.codexSearchBy(ctx, p, query)
+	}
+	return s.searchWith(ctx, p, model, query, effort)
+}
+
+// logOwnSearch writes the request log's row of a search a plan's own
+// search service (Kimi Code's, WorkBuddy's) ran, at where (#3528): the
+// plan's provider by name, and how it ended.
+func (s *Server) logOwnSearch(ctx context.Context, p provider.Provider, where, query string, start time.Time, found int, err error) {
+	s.logSearch(ctx, usage.Record{Provider: p.ID, Requested: p.Name, Host: provider.HostOf(where)}, query, start, found, err)
+}
+
+// askOwnSearch asks p's plan's search service at where with ask, and
+// logs it (logOwnSearch), its exchange kept as ask sends it (tapSearch).
+func (s *Server) askOwnSearch(ctx context.Context, p provider.Provider, where, query string,
+	ask func(context.Context, provider.Provider, string) (string, []Hit, error)) (string, []Hit, error) {
+	ctx, _ = withSearchWire(ctx, p.Key)
+	start := time.Now()
+	said, hits, err := ask(ctx, p, query)
+	s.logOwnSearch(ctx, p, where, query, start, len(hits), err)
+	return said, hits, err
 }
 
 // kimiSearch asks a Kimi Code plan's search service.
 func (s *Server) kimiSearch(ctx context.Context, p provider.Provider, query string) (string, []Hit, error) {
 	// the service gives itself 30 s, as kimi-cli asks
-	ctx, cancel := context.WithTimeout(ctx, searchTimeout/2)
+	// through the plan's own proxy, if it has one (#237, #1522)
+	ctx, cancel := context.WithTimeout(s.metered(p.Via(ctx), p, ""), searchTimeout/2)
 	defer cancel()
-	body, _ := json.Marshal(map[string]any{"text_query": query, "limit": searchHits, "enable_page_crawling": false, "timeout_seconds": 30})
+	q, err := maskedQuery(ctx, query, &p)
+	if err != nil {
+		return "", nil, err
+	}
+	body, _ := json.Marshal(map[string]any{"text_query": q, "limit": searchCount(ctx), "enable_page_crawling": false, "timeout_seconds": 30})
 	r, err := http.NewRequestWithContext(ctx, http.MethodPost, provider.KimiCodeSearch(p), bytes.NewReader(body))
 	if err != nil {
 		return "", nil, err
@@ -100,6 +150,7 @@ func (s *Server) kimiSearch(ctx context.Context, p provider.Provider, query stri
 		r.Header.Set("X-Msh-Tool-Call-Id", id)
 	}
 	res, err := s.client.Do(r)
+	res = tapSearch(ctx, r, body, res)
 	if err != nil {
 		if ctx.Err() != nil {
 			return "", nil, fmt.Errorf("%s: no answer in time", p.Name)
@@ -137,12 +188,12 @@ func (s *Server) kimiSearch(ctx context.Context, p provider.Provider, query stri
 			text = x.Snippet
 		}
 		pages = append(pages, foundPage{Title: title, URL: x.URL, Text: clipText(searchPlain(text), pageText), Age: x.Date})
-		if len(pages) == searchHits {
+		if len(pages) == searchCount(ctx) {
 			break
 		}
 	}
 	if len(pages) == 0 {
-		return "", nil, fmt.Errorf("%s found nothing", p.Name)
+		return "", nil, fmt.Errorf("%s %w", p.Name, errFoundNothing)
 	}
 	said, hits := pagesSaid(pages)
 	return said, hits, nil

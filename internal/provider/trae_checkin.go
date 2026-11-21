@@ -15,8 +15,21 @@ package provider
 // got none is tried again later. Trae counts a check-in by device as well
 // as by account (9095: this device is in for today); that is an answer
 // for the day, and magpie doesn't send another device id to get round it.
+// Nor does a claim answered 9074 (当前参与用户太多，请稍后再试) get another
+// try that day: no retry ever got past it (#808, ~5 days), and claim
+// after claim may read as abuse. Why Trae refuses isn't known for certain.
+// It isn't that Trae pays only its own app: Buddy Switch checks in
+// accounts that aren't its (#1920). What #808 found is that on one
+// account Trae CN's own client's claim went through while the plugin's,
+// on a device id the plugin had made up, didn't. So since plugin 0.2.14
+// the account this machine's Trae CN client is signed in as checks in on
+// the client's own device id (read, never written); every other account
+// keeps its own, and magpie never makes up or rotates one (#1705). An
+// account refused 9074 is told that Trae CN refused it, and to check in
+// in the Trae CN app.
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -33,6 +46,11 @@ import (
 	"github.com/yetone/magpie/internal/settings"
 )
 
+// TraeRefusedWords is what an account Trae CN refused a claim 9074 is
+// told, in the TUI and CLI (the GUI says it in each language): what Trae
+// did, and where the check-in can still be done.
+const TraeRefusedWords = "Trae CN refused this check-in (9074: too many taking part); check in in the Trae CN app"
+
 // TraeCNID is the Trae CN plugin's provider.
 const TraeCNID = "trae-cn"
 
@@ -42,7 +60,7 @@ var traeCheckinURL = "https://api.trae.cn/trae/api/v2/ug/checkin_credits"
 // Trae CN's check-in answers, the codes it refuses with.
 const (
 	traeSignedOut     = 1001 // the token isn't taken
-	traeRateLimited   = 9074 // asked too often; tried again later
+	traeOwnAppOnly    = 9074 // a claim refused (当前参与用户太多); final for the day
 	traeDeviceChecked = 9095 // this device is in for today
 )
 
@@ -80,7 +98,7 @@ func newTraeCheckiner(accounts func() []traeAccount) checkiner {
 	return checkiner{path: traeCheckinPath(), now: time.Now, mu: &traeCheckinMu, by: "trae", label: "trae", accounts: func() []checkinAcct {
 		var out []checkinAcct
 		for _, a := range accounts() {
-			out = append(out, checkinAcct{User: a.User, On: a.On, key: traeCheckinKey(a), do: func(ctx context.Context) WorkBuddyCheckin { return traeCheckin(ctx, a) }})
+			out = append(out, checkinAcct{User: a.User, On: a.On, key: traeCheckinKey(a), provider: cmp.Or(a.card, TraeCNID), do: func(ctx context.Context) WorkBuddyCheckin { return traeCheckin(ctx, a) }})
 		}
 		return out
 	}}
@@ -106,6 +124,12 @@ func traeCheckin(ctx context.Context, a traeAccount) WorkBuddyCheckin {
 	if err := traeCall(ctx, a, "/claim", &got); err != nil {
 		return wbCheckinFailed(err)
 	}
+	if got.Code == traeOwnAppOnly {
+		// status said on and not in, so the claim itself is refused, and
+		// asking again that day never changed it (#808); the account is
+		// told to check in in Trae CN's app
+		return WorkBuddyCheckin{Outcome: CheckinOwnApp, Msg: orStr(got.Message, "Trae CN refused the check-in (9074)")}
+	}
 	if got.Code != 0 {
 		return traeRefused(got.Code, got.Message)
 	}
@@ -124,7 +148,8 @@ func traeRefused(code int, msg string) WorkBuddyCheckin {
 		return WorkBuddyCheckin{Outcome: CheckinIneligible, Msg: orStr(msg, "this device has checked in today")}
 	case traeSignedOut:
 		return WorkBuddyCheckin{Outcome: CheckinFailed, Msg: "Trae CN's sign-in has expired — sign in again"}
-	case traeRateLimited:
+	case traeOwnAppOnly:
+		// on /status, before any claim: tried again later as before
 		return WorkBuddyCheckin{Outcome: CheckinFailed, Msg: orStr(msg, "asked too often")}
 	}
 	return WorkBuddyCheckin{Outcome: CheckinFailed, Msg: fmt.Sprintf("code %d: %s", code, msg)}
@@ -176,7 +201,7 @@ func CheckInTrae(ctx context.Context) []WorkBuddyCheckin {
 // TraeCheckins is each Trae CN account's last check-in, as kept, by its
 // name now; asks nothing.
 func TraeCheckins() []WorkBuddyCheckin {
-	st := readCheckins(traeCheckinPath())
+	st := shownCheckins(traeCheckinPath())
 	var out []WorkBuddyCheckin
 	listed := map[string]bool{}
 	for _, a := range traeCheckinAccounts() {
@@ -236,5 +261,5 @@ func traeCheckinAccounts() []traeAccount {
 // KeepTraeCheckedIn checks the Trae CN accounts in each day while settings
 // say to, as KeepWorkBuddyCheckedIn does WorkBuddy's.
 func KeepTraeCheckedIn(ctx context.Context) {
-	keepCheckedIn(ctx, "trae", newTraeCheckiner(traeCheckinAccounts), func() bool { return settings.Load().TraeCheckin })
+	keepCheckedIn(ctx, "trae", newTraeCheckiner(traeCheckinAccounts), func() bool { return settings.Shared().TraeCheckin })
 }

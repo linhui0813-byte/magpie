@@ -14,43 +14,29 @@ import (
 	"fmt"
 	"slices"
 	"strings"
-	"sync"
 	"time"
+
+	"github.com/yetone/magpie/internal/filelock"
 )
 
 // savedTokenMu keeps two requests from refreshing one saved account at
-// once: the second would spend a refresh token the first just rotated.
-var savedTokenMu sync.Mutex
+// once: the second would spend a refresh token the first just rotated. It
+// holds across magpies too (#1674): the gateway's refresh and one by a
+// magpie run from a terminal would each spend the same refresh token.
+var savedTokenMu = filelock.Mutex{Path: func() string { return loginsPath() + ".renew.lock" }}
 
 // SetLoginOn puts a saved account in use beside the agent's own, or takes
 // it out. The account the agent is signed in to is always in use.
 func SetLoginOn(agent, user string, on bool) error {
+	if discoveryOff() {
+		return errAccountDiscoveryOff
+	}
 	if pp, ok := pluginOfAgent(agent); ok {
 		return setPluginLoginOn(pp, user, on)
 	}
 	switch agent {
-	case "grok":
-		return setGrokLoginOn(user, on)
 	case "copilot":
 		return setCopilotLoginOn(user, on)
-	case "zcode":
-		return setZCodeLoginOn(user, on)
-	case "kiro":
-		return setKiroLoginOn(user, on)
-	case "devin":
-		return setDevinLoginOn(user, on)
-	case "workbuddy", WorkBuddyAIID:
-		return setWorkBuddyLoginOn(wbSiteOf(agent), user, on)
-	case CommandCodePlanID:
-		return setCommandCodeLoginOn(user, on)
-	case "qoder", QoderCNID:
-		return setSideLoginOn(agent, user, on, qoderLoginsOf(agent))
-	case "zed":
-		return setZedLoginOn(user, on)
-	case "factory":
-		return setFactoryLoginOn(user, on)
-	case MiMoID:
-		return setMiMoLoginOn(user, on)
 	case ChatGPTAPIID:
 		return setSIWCLoginOn(user, on)
 	case "gemini", "antigravity":
@@ -115,54 +101,44 @@ func pausedOwn(ls []savedLogin, agent, user string) bool {
 
 // OwnPaused says the provider is the account a Claude Code or Codex agent
 // is signed in to, paused while another of its accounts is on (#263): the
-// gateway passes over it, the agent staying signed in to it.
+// gateway passes over it, the agent staying signed in to it. A request's
+// plan asks it of every account provider, each ask its own read of
+// logins.json under its lock: listed once a request, as Logins is (#5104),
+// and a write lists it anew.
 func (p Provider) OwnPaused() bool {
 	if p.Account == nil || p.Account.token != nil && !p.Account.standIn || !slices.Contains(loginAgents, p.Account.Agent) {
 		return false
 	}
-	loginsMu.Lock()
-	defer loginsMu.Unlock()
-	return pausedOwn(readLogins(), p.Account.Agent, p.Account.User)
+	return heldOf("ownPaused\x00"+p.Account.Agent+"\x00"+p.Account.User, func() bool {
+		loginsMu.Lock()
+		defer loginsMu.Unlock()
+		return pausedOwn(readLogins(), p.Account.Agent, p.Account.User)
+	})
 }
 
 // AlsoOn is a signed-in agent's other accounts that are on, each as a
-// provider of its own, in the order they were saved.
+// provider of its own, in the order they were saved. Each keeps what the
+// user set on the provider, as p has it from All: its queue, limits,
+// routing and models (withPicks). A Claude or Codex account is p with
+// another sign-in, and had them always; one a sign-in of its own makes
+// afresh had none, and a second WorkBuddy AI account queued 62s with the
+// wait set to 1s (#1899).
 func (p Provider) AlsoOn() []Provider {
+	out := p.alsoOn()
+	for i, q := range out {
+		out[i] = withPicks(q, p)
+	}
+	return out
+}
+
+// alsoOn is AlsoOn as each sign-in makes its accounts, without the
+// provider's settings.
+func (p Provider) alsoOn() []Provider {
 	if p.IsPlugin() {
 		return pluginAlsoOn(*p.Account.plugin)
 	}
-	if p.Account != nil && p.Account.Agent == "grok" && p.Account.token == nil {
-		return grokAlsoOn(p)
-	}
 	if p.Account != nil && p.Account.Agent == "copilot" {
 		return copilotAlsoOn()
-	}
-	if p.Account != nil && p.Account.Agent == "zcode" {
-		return zcodeAlsoOn()
-	}
-	if p.Account != nil && p.Account.Agent == "kiro" {
-		return kiroAlsoOn(p)
-	}
-	if p.Account != nil && p.Account.Agent == "devin" {
-		return devinAlsoOn()
-	}
-	if p.Account != nil && wbSiteOf(p.Account.Agent) != nil {
-		return workBuddyAlsoOn(wbSiteOf(p.Account.Agent))
-	}
-	if p.Account != nil && p.Account.Agent == CommandCodePlanID {
-		return commandCodeAlsoOn()
-	}
-	if p.Account != nil && (p.Account.Agent == "qoder" || p.Account.Agent == QoderCNID) {
-		return qoderAlsoOn(p.Account.Agent)
-	}
-	if p.Account != nil && p.Account.Agent == "zed" {
-		return zedAlsoOn()
-	}
-	if p.Account != nil && p.Account.Agent == "factory" {
-		return factoryAlsoOn()
-	}
-	if p.Account != nil && p.Account.Agent == MiMoID {
-		return mimoAlsoOn()
 	}
 	if p.Account != nil && p.Account.Agent == ChatGPTAPIID {
 		return siwcAlsoOn()
@@ -192,6 +168,9 @@ func (p Provider) AlsoOn() []Provider {
 		}
 		if agent == "codex" {
 			a.sign = codexSign(func(ctx context.Context) (string, string, error) { return savedLoginToken(ctx, agent, user) })
+			a.renew = func(ctx context.Context, stale string) (string, string, error) {
+				return renewSavedLoginFrom(ctx, agent, user, stale)
+			}
 		}
 		q := p
 		q.Account = &a
@@ -232,6 +211,18 @@ func savedLoginToken(ctx context.Context, agent, user string) (tok, accountID st
 // refuses is kept on the account as lapsed, until one goes through or it is
 // signed in again.
 func renewSavedLogin(ctx context.Context, agent, user string, force bool) (tok, accountID string, err error) {
+	return renewSaved(ctx, agent, user, force, "")
+}
+
+// renewSavedLoginFrom refreshes the saved sign-in whose access token stale
+// the backend just called expired while it had time left (#2973), unless
+// it was renewed since: the token saved by now is returned then, its
+// refresh token being the one spent already.
+func renewSavedLoginFrom(ctx context.Context, agent, user, stale string) (tok, accountID string, err error) {
+	return renewSaved(ctx, agent, user, false, stale)
+}
+
+func renewSaved(ctx context.Context, agent, user string, force bool, stale string) (tok, accountID string, err error) {
 	ctx = ViaLogin(ctx, agent, user) // refreshed through the account's own proxy
 	savedTokenMu.Lock()
 	defer savedTokenMu.Unlock()
@@ -247,6 +238,38 @@ func renewSavedLogin(ctx context.Context, agent, user string, force bool) (tok, 
 	if l == nil {
 		return "", "", fmt.Errorf("no saved %s account %q", agent, user)
 	}
+	if agent == "codex" && heldByCodex(*l) {
+		// the account Codex is signed in to now (switched to since this
+		// was asked for, or the copy kept of it as it was): one sign-in in
+		// two places, whose refresh token a refresh here would spend under
+		// Codex. Codex's own auth.json then holds a dead one, and the app
+		// of an edu or business workspace, which reads its workspace's
+		// settings with it at start, stays paused on "无法加载组织设置"
+		// (万贤凯 on Discord). So it is renewed where Codex keeps it, as
+		// Codex's own (codexTokenRenewing), and the copy is left as it is:
+		// a switch away saves it afresh from Codex's.
+		tok, accountID, err := codexTokenRenewing(ctx, codexHome(), stale)
+		return tok, codexOwnWorkspace(*l, accountID), err
+	}
+	if home := codexHeldIn(*l); home != "" {
+		// the same for an account Codex is signed in to in another of
+		// its folders (CODEX_HOME=~/.codex-work): Codex there refreshes
+		// it too, so magpie renews it in that folder, never in a copy
+		// whose refresh token would sign that Codex out
+		tok, accountID, err := codexTokenRenewing(ctx, home, stale)
+		if err != nil {
+			// said with no command to run (charliepu on Discord, Windows:
+			// "run CODEX_HOME=… codex login"): a refusal marks the account
+			// signed out on its row (codexSignInRead), whose Sign in again
+			// runs magpie's own sign-in and writes it back to home (addLogin)
+			err = fmt.Errorf("%s, signed in to Codex in %s: %w", user, home, err)
+			if errors.As(err, new(refreshRefused)) {
+				err = codexHeldRefusal{err}
+			}
+			return "", "", err
+		}
+		return tok, codexOwnWorkspace(*l, accountID), nil
+	}
 	var auth []byte
 	switch agent {
 	case "codex":
@@ -259,10 +282,24 @@ func renewSavedLogin(ctx context.Context, agent, user string, force bool) (tok, 
 		if accountID == "" {
 			accountID = claimString(jwtClaims(a.Tokens.IDToken), "https://api.openai.com/auth", "chatgpt_account_id")
 		}
-		if exp, _ := jwtClaims(a.Tokens.AccessToken)["exp"].(float64); !force && (exp == 0 || time.Until(time.Unix(int64(exp), 0)) > 5*time.Minute) {
+		if l.AccessOnly {
+			// never refreshed: that would sign out where it came from
+			return accessOnlyToken(user, l.Lapsed, a, accountID, force, stale)
+		}
+		if stale != "" {
+			if a.Tokens.AccessToken != stale {
+				return a.Tokens.AccessToken, accountID, nil
+			}
+		} else if exp, _ := jwtClaims(a.Tokens.AccessToken)["exp"].(float64); !force && (exp == 0 || time.Until(time.Unix(int64(exp), 0)) > 5*time.Minute) {
 			return a.Tokens.AccessToken, accountID, nil
 		}
-		if tok, err = codexRefresh(ctx, raw); err != nil {
+		reason := codexRefreshExpiry
+		if stale != "" {
+			reason = codexRefreshRecovery
+		} else if force {
+			reason = forcedReason(ctx)
+		}
+		if tok, err = codexRefresh(ctx, raw, reason); err != nil {
 			return "", "", savedRefreshFailed(agent, user, err)
 		}
 		if auth, err = json.MarshalIndent(raw, "", "  "); err != nil {
@@ -283,6 +320,44 @@ func renewSavedLogin(ctx context.Context, agent, user string, force bool) (tok, 
 	}
 	return tok, accountID, writeLogins(ls)
 }
+
+// heldByCodex says the saved ChatGPT account l is the one Codex is signed
+// in to: the same login, or the same refresh token. Asked under
+// savedTokenMu, which a switch holds too, so it can't change before the
+// refresh it decides is done.
+func heldByCodex(l savedLogin) bool {
+	live, ok := liveLogin("codex")
+	if !ok {
+		return false
+	}
+	if sameLogin(live, l) {
+		return true
+	}
+	return sameRefresh(live.Auth, l.Auth)
+}
+
+// codexOwnWorkspace is the workspace the saved ChatGPT account l is, for
+// a token read where Codex holds its sign-in (heldByCodex, codexHeldIn),
+// whose own workspace is held: one sign-in reaches every workspace of its
+// login, one refresh token for all, and the Codex app's workspace switch
+// rewrites only which one auth.json routes to. Taken as it was, the
+// account not in use read the one in use's plan, allowance and resets,
+// and spent them (JdAZzzzzz on X: a Team seat read as the personal
+// Prolite). held when l doesn't say.
+func codexOwnWorkspace(l savedLogin, held string) string {
+	if _, ws := codexWho(l.Auth); ws != "" {
+		return ws
+	}
+	return held
+}
+
+// codexHeldRefusal is a refresh OpenAI refused for an account Codex is
+// signed in to in another of its folders (codexHeldIn). savedRefreshFailed
+// doesn't mark it, magpie's copy not being the sign-in, so codexSignInRead
+// marks it signed out as it does Codex's own.
+type codexHeldRefusal struct{ error }
+
+func (e codexHeldRefusal) Unwrap() error { return e.error }
 
 // savedRefreshFailed words a saved account's failed refresh. One the vendor
 // refused is marked lapsed on the account: that sign-in is gone and has to be

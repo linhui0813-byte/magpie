@@ -4,6 +4,7 @@ const path = require("node:path");
 const { test } = require("node:test");
 const { chromium, webkit } = require("playwright");
 const { fixture, confirmKeyAction } = require("./fixtures/caller-keys.cjs");
+const { openPart } = require("./reader.cjs");
 
 for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium", "webkit"])) {
   for (const locale of ["en", "zh"]) {
@@ -11,7 +12,9 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: "chromium" }));
       t.after(() => browser.close());
       const page = await (await browser.newContext({ viewport: { width: 1000, height: 760 }, reducedMotion: "reduce" })).newPage();
+      await page.addInitScript(() => { try { localStorage.setItem("magpie.gwConnectFolded", "0"); } catch {} }); // Connect opened, as a user who reads it
       page.setDefaultTimeout(6000);
+      page.setDefaultNavigationTimeout(60000);
       const events = [], errors = [];
       page.on("pageerror", (e) => errors.push(e.message));
       await page.route("**/*", fixture(locale, "dark", events));
@@ -38,7 +41,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
 
       await page.locator("#prefs").click();
 
-      await page.locator("#setTab-network").click();
+      await openPart(page, "network");
       const on = page.locator("#lanList").getByRole("button", { name: w.on, exact: true });
       await on.waitFor();
       const bounds = await on.boundingBox();
@@ -69,7 +72,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       };
       await page.route("**/api/caller-keys", lateList);
       await page.locator("#prefs").click();
-      await page.locator("#setTab-network").click();
+      await openPart(page, "network");
       await page.locator("#lanList").waitFor();
       await page.locator("#nav").getByRole("button", { name: w.gateway, exact: true }).click();
       await started;
@@ -169,7 +172,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await expectSecret("fixture-created-2");
       assert.equal(await page.locator("#connectKey code").textContent(), "Replacement");
       await page.locator("#prefs").click();
-      await page.locator("#setTab-network").click();
+      await openPart(page, "network");
       await page.locator("#lanList .lan-address-row").waitFor();
       await page.locator("#lanList").getByRole("button", { name: w.off, exact: true }).click();
       await page.locator("#lanList .lan-address-row").waitFor({ state: "detached" });

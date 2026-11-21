@@ -8,8 +8,10 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -21,14 +23,12 @@ import (
 // saved accounts spares (acct-2, …) on beside it in magpie.
 func codexSignedIn(t *testing.T, spares ...string) {
 	t.Helper()
+	fresh(t)
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home) // Windows finds the home there
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
 	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
-	restingUntil.Lock()
-	restingUntil.m = map[string]time.Time{}
-	restingUntil.Unlock()
 	claims := func(m map[string]any) string {
 		b, _ := json.Marshal(m)
 		return "h." + base64.RawURLEncoding.EncodeToString(b) + ".s"
@@ -161,6 +161,10 @@ func TestCodexPausedOwnAccountPassedOver(t *testing.T) {
 	if code != 200 || strings.Join(tried, ",") != "acct-2" {
 		t.Fatalf("%d %s tried %v", code, body, tried)
 	}
+	// the account a model's note names as first (#1957) is the one tried
+	if got := provider.FirstLogin("codex"); got != "spare@example.com" {
+		t.Fatalf("first %q", got)
+	}
 	// the other off: the paused one is all there is, and is used
 	if err := provider.SetLoginOn("codex", "spare@example.com", false); err != nil {
 		t.Fatal(err)
@@ -187,6 +191,76 @@ func TestCodexPausedOwnAccountPassedOver(t *testing.T) {
 	codexPost(t, `{"model":"gpt-5.5","stream":true,"input":"ping"}`)
 	if len(tried) == 0 || tried[0] != "acct-1" {
 		t.Fatalf("resumed, tried %v", tried)
+	}
+}
+
+// Native compaction of one of Codex's own models, with the account Codex
+// is signed in to paused in magpie while another is on (#263, the free
+// ChatGPT account kept for Codex's remote control and Computer Use):
+// it goes to the account that is on, signed as that account, not relayed
+// on the paused one's sign-in as it came. With nothing else on, or not
+// paused, it relays on the sign-in as before.
+func TestCodexPausedOwnAccountNotCompactedOn(t *testing.T) {
+	codexSignedIn(t, "spare@example.com")
+	var tried, auths, paths []string
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tried = append(tried, r.Header.Get("chatgpt-account-id"))
+		auths = append(auths, r.Header.Get("Authorization"))
+		paths = append(paths, r.URL.Path)
+		io.WriteString(w, `{"output":[{"type":"compaction","encrypted_content":"gAAAAAx"}]}`)
+	}))
+	t.Cleanup(up.Close)
+	was := provider.CodexBase
+	provider.CodexBase = up.URL + "/backend-api/codex"
+	t.Cleanup(func() { provider.CodexBase = was })
+	compact := func() int {
+		t.Helper()
+		tried, auths, paths = nil, nil, nil
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("POST", CodexPath+"/responses/compact", strings.NewReader(`{"model":"gpt-5.5","input":[{"type":"message","role":"user","content":"ping"}]}`))
+		req.Header.Set("Authorization", "Bearer chatgpt-token")
+		req.Header.Set("chatgpt-account-id", "acct-1")
+		New().Handler().ServeHTTP(rec, req)
+		return rec.Code
+	}
+
+	if code := compact(); code != 200 || strings.Join(tried, ",") != "acct-1" || auths[0] != "Bearer chatgpt-token" {
+		t.Fatalf("in use: %d tried %v auth %v", code, tried, auths)
+	}
+	if err := provider.SetLoginOn("codex", "me@example.com", false); err != nil {
+		t.Fatal(err)
+	}
+	if code := compact(); code != 200 || strings.Join(tried, ",") != "acct-2" || auths[0] == "Bearer chatgpt-token" || paths[0] != "/backend-api/codex/responses/compact" {
+		t.Fatalf("paused: %d tried %v auth %v path %v", code, tried, auths, paths)
+	}
+	// a key held to some accounts (#905) is asked of the account it goes
+	// to: held to the paused sign-in alone, refused with nothing asked;
+	// held to the one on, compacted there
+	keys, secrets := newCaller(t, "Held")
+	keyed := func(as string) int {
+		t.Helper()
+		if _, err := access.Update("accounts-key", access.Change{Key: keys[0].ID, Accounts: []string{as}}); err != nil {
+			t.Fatal(err)
+		}
+		tried = nil
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("POST", CodexPath+"/responses/compact", strings.NewReader(`{"model":"gpt-5.5","input":[]}`))
+		req.Header.Set("Authorization", "Bearer "+secrets[0])
+		New().Handler().ServeHTTP(rec, req)
+		return rec.Code
+	}
+	if code := keyed("codex/me@example.com"); code != 403 || len(tried) != 0 {
+		t.Fatalf("held to the paused sign-in: %d tried %v", code, tried)
+	}
+	if code := keyed("codex/spare@example.com"); code != 200 || strings.Join(tried, ",") != "acct-2" {
+		t.Fatalf("held to the one on: %d tried %v", code, tried)
+	}
+	// the other off: the paused one is all there is, and is used
+	if err := provider.SetLoginOn("codex", "spare@example.com", false); err != nil {
+		t.Fatal(err)
+	}
+	if code := compact(); code != 200 || strings.Join(tried, ",") != "acct-1" || auths[0] != "Bearer chatgpt-token" {
+		t.Fatalf("with the other off: %d tried %v auth %v", code, tried, auths)
 	}
 }
 
@@ -595,6 +669,94 @@ func TestCodexPoolForwardsCodexHeaders(t *testing.T) {
 	}
 }
 
+// The turn state a pool account's reply says goes back to that account
+// with the turn's later requests, as Codex's own client sends it; Codex
+// never hears it through the pool, so magpie keeps it by the turn. Without
+// it each tool call of a turn was a new turn there, admitted again
+// (legeling567 on X: 529s on Astra through magpie, none with Codex's own
+// sign-in). Another account, another turn, and a state no reply said get
+// the request without it.
+func TestCodexPoolTurnStateStaysWithItsAccount(t *testing.T) {
+	codexSignedIn(t, "spare@example.com")
+	var mu sync.Mutex
+	var heads []http.Header
+	refuse1 := false
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.ReadAll(r.Body)
+		acct := r.Header.Get("chatgpt-account-id")
+		mu.Lock()
+		heads = append(heads, r.Header.Clone())
+		n, no := len(heads), refuse1 && acct == "acct-1"
+		mu.Unlock()
+		if no {
+			w.WriteHeader(429)
+			io.WriteString(w, `{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","resets_in_seconds":7200}}`)
+			return
+		}
+		w.Header().Set("X-Codex-Turn-State", "state-"+acct+"-"+strconv.Itoa(n))
+		io.WriteString(w, sse(
+			`data: {"type":"response.created","response":{"id":"r1","model":"gpt-5.5"}}`,
+			`data: {"type":"response.output_text.delta","delta":"pong"}`,
+			`data: {"type":"response.completed","response":{"id":"r1","usage":{"input_tokens":7,"output_tokens":1}}}`))
+	}))
+	t.Cleanup(up.Close)
+	was := provider.CodexBase
+	provider.CodexBase = up.URL + "/backend-api/codex"
+	t.Cleanup(func() { provider.CodexBase = was })
+
+	s := New()
+	ask := func(state, turn string) []http.Header {
+		t.Helper()
+		mu.Lock()
+		n := len(heads)
+		mu.Unlock()
+		body := `{"model":"gpt-5.5","stream":true,"input":"ping"`
+		if turn != "" {
+			body += `,"client_metadata":{"thread_id":"th-1","turn_id":"` + turn + `"}`
+		}
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("POST", CodexPath+"/responses", strings.NewReader(body+"}"))
+		req.Header.Set("Authorization", "Bearer chatgpt-token")
+		req.Header.Set("chatgpt-account-id", "acct-1")
+		req.Header.Set("User-Agent", "codex_cli_rs/0.165.0")
+		if state != "" {
+			req.Header.Set("x-codex-turn-state", state)
+		}
+		s.Handler().ServeHTTP(rec, req)
+		if rec.Code != 200 || !strings.Contains(rec.Body.String(), "pong") {
+			t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		return slices.Clone(heads[n:])
+	}
+	one := func(what string, got []http.Header, acct, state string) {
+		t.Helper()
+		if len(got) != 1 || got[0].Get("chatgpt-account-id") != acct || got[0].Get("x-codex-turn-state") != state {
+			t.Fatalf("%s: %v", what, got)
+		}
+	}
+	// the turn's first request: acct-1 serves it and says its state
+	one("first", ask("", "t1"), "acct-1", "")
+	// the turn's next request goes to acct-1 with it, Codex having sent none
+	one("same turn", ask("", "t1"), "acct-1", "state-acct-1-1")
+	// one Codex sends itself goes on when acct-1's reply said it
+	one("sent", ask("state-acct-1-2", ""), "acct-1", "state-acct-1-2")
+	one("made up", ask("made-up", ""), "acct-1", "")
+	one("another turn", ask("", "t2"), "acct-1", "")
+	// acct-1 out: acct-2 gets the turn without acct-1's state
+	mu.Lock()
+	refuse1 = true
+	mu.Unlock()
+	got := ask("", "t1")
+	if len(got) != 2 || got[0].Get("chatgpt-account-id") != "acct-1" || got[1].Get("chatgpt-account-id") != "acct-2" {
+		t.Fatalf("moved: %v", got)
+	}
+	if got[0].Get("x-codex-turn-state") == "" || got[1].Get("x-codex-turn-state") != "" {
+		t.Errorf("state on the wrong account: %v", got)
+	}
+}
+
 func TestCallKind(t *testing.T) {
 	for want, h := range map[string]map[string]string{
 		"":             {},
@@ -612,7 +774,7 @@ func TestCallKind(t *testing.T) {
 		}
 	}
 	for k, want := range map[string]bool{
-		"x-openai-subagent": true, "X-Codex-Turn-Metadata": true, "X-Codex-Turn-State": false, "x-openai-codex-luna-reserve": false, "session_id": true, "Session_id": true,
+		"x-openai-subagent": true, "X-Codex-Turn-Metadata": true, "X-Codex-Turn-State": false, "x-openai-codex-luna-reserve": false, "session_id": true, "Session_id": true, "session-id": true, "Thread-Id": true,
 		"Authorization": false, "chatgpt-account-id": false, "x-oai-attestation": false,
 		"x-openai-actor-authorization": false, "User-Agent": false, "Cookie": false,
 	} {
@@ -627,7 +789,7 @@ func TestCallKind(t *testing.T) {
 // one that sent it, in the User-Agent and the version header alike, so a
 // model Codex CLI reaches on its own isn't refused through magpie
 // (Discord: "The 'gpt-6.1-sol' model is not supported when using Codex
-// with a ChatGPT account"). 0.161.0 is newer than any installed here or
+// with a ChatGPT account"). 0.199.0 is newer than any installed here or
 // magpie's own fallback, so only the client's own version can pass.
 func TestCodexPoolSaysTheClientsVersion(t *testing.T) {
 	codexSignedIn(t, "spare@example.com")
@@ -637,7 +799,7 @@ func TestCodexPoolSaysTheClientsVersion(t *testing.T) {
 		ua := r.Header.Get("User-Agent")
 		uas, vers = append(uas, ua), append(vers, r.Header.Get("version"))
 		v, _, _ := strings.Cut(strings.TrimPrefix(ua, "codex_cli_rs/"), " ")
-		if modelOf(b) == "gpt-6.1-sol" && (!strings.HasPrefix(ua, "codex_cli_rs/") || older(v, "0.161.0")) {
+		if modelOf(b) == "gpt-6.1-sol" && (!strings.HasPrefix(ua, "codex_cli_rs/") || older(v, "0.199.0")) {
 			w.WriteHeader(400)
 			io.WriteString(w, `{"detail":"The 'gpt-6.1-sol' model is not supported when using Codex with a ChatGPT account."}`)
 			return
@@ -658,14 +820,14 @@ func TestCodexPoolSaysTheClientsVersion(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer chatgpt-token")
 	req.Header.Set("chatgpt-account-id", "acct-1")
 	req.Header.Set("originator", "codex_cli_rs")
-	req.Header.Set("User-Agent", "codex_cli_rs/0.161.0 (Mac OS 26.6.0; arm64) ghostty/1.2.0")
-	req.Header.Set("version", "0.161.0")
+	req.Header.Set("User-Agent", "codex_cli_rs/0.199.0 (Mac OS 26.6.0; arm64) ghostty/1.2.0")
+	req.Header.Set("version", "0.199.0")
 	s.Handler().ServeHTTP(rec, req)
 	if rec.Code != 200 || !strings.Contains(rec.Body.String(), "pong") {
 		t.Fatalf("status %d: %s (User-Agent %q, version %q)", rec.Code, rec.Body.String(), uas, vers)
 	}
 	for i := range uas {
-		if !strings.HasPrefix(uas[i], "codex_cli_rs/0.161.0 (") || vers[i] != "0.161.0" {
+		if !strings.HasPrefix(uas[i], "codex_cli_rs/0.199.0 (") || vers[i] != "0.199.0" {
 			t.Errorf("request %d: User-Agent %q, version %q", i, uas[i], vers[i])
 		}
 	}
@@ -687,4 +849,93 @@ func older(a, b string) bool {
 		}
 	}
 	return false
+}
+
+// Codex's Ultrafast (service_tier "ultrafast", offered on a Pro plan's
+// models) reaches the ChatGPT backend when the pool of Codex's accounts
+// serves the turn, as it does on Codex's own sign-in, and Fast's
+// "priority" still does (yxinyu715 on X: two Pro accounts, Ultrafast
+// does nothing through magpie and works without it).
+func TestCodexPoolKeepsUltrafast(t *testing.T) {
+	codexSignedIn(t, "spare@example.com")
+	var tiers []any
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		var m map[string]any
+		json.Unmarshal(b, &m)
+		tiers = append(tiers, m["service_tier"])
+		io.WriteString(w, sse(
+			`data: {"type":"response.created","response":{"id":"r1","model":"gpt-5.5"}}`,
+			`data: {"type":"response.output_text.delta","delta":"pong"}`,
+			`data: {"type":"response.completed","response":{"id":"r1","usage":{"input_tokens":7,"output_tokens":1}}}`))
+	}))
+	t.Cleanup(up.Close)
+	was := provider.CodexBase
+	provider.CodexBase = up.URL + "/backend-api/codex"
+	t.Cleanup(func() { provider.CodexBase = was })
+
+	s := New()
+	for _, tier := range []string{"ultrafast", "priority", "flex"} {
+		tiers = nil
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("POST", CodexPath+"/responses", strings.NewReader(`{"model":"gpt-5.5","stream":true,"input":"ping","service_tier":"`+tier+`"}`))
+		req.Header.Set("Authorization", "Bearer chatgpt-token")
+		req.Header.Set("chatgpt-account-id", "acct-1")
+		req.Header.Set("User-Agent", "codex_cli_rs/0.160.1")
+		s.Handler().ServeHTTP(rec, req)
+		if rec.Code != 200 || len(tiers) != 1 {
+			t.Fatalf("%s: status %d, %d requests: %s", tier, rec.Code, len(tiers), rec.Body.String())
+		}
+		want := any(tier)
+		if tier == "flex" {
+			want = nil
+		}
+		if tiers[0] != want {
+			t.Errorf("%s: backend asked for %v", tier, tiers[0])
+		}
+	}
+}
+
+// Codex's auto-review of an approval (x-openai-subagent: guardian, on
+// codex-auto-review) while its own model calls go through magpie's
+// account failover: the account Codex is signed in to paused, the other
+// on with a list of models of its own, picked from the provider's, which
+// never shows codex-auto-review. The review is served by that account
+// as the model it asked for, not refused as "every account barred"
+// (#1959, parkavenue9639); the list still holds Codex's other models.
+func TestCodexReviewPassesAnAccountsModelList(t *testing.T) {
+	codexSignedIn(t, "spare@example.com")
+	var tried, models []string
+	usedUp(t, &tried, &models)
+	if err := provider.SetLoginOn("codex", "me@example.com", false); err != nil {
+		t.Fatal(err)
+	}
+	if err := provider.SetAccountModels("codex", "spare@example.com", []string{"gpt-6.1-sol", "gpt-5.6-luna"}); err != nil {
+		t.Fatal(err)
+	}
+	post := func(model, kind string) (int, string) {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("POST", CodexPath+"/responses", strings.NewReader(`{"model":"`+model+`","stream":true,"input":"ping"}`))
+		req.Header.Set("Authorization", "Bearer chatgpt-token")
+		req.Header.Set("chatgpt-account-id", "acct-1")
+		if kind != "" {
+			req.Header.Set("x-openai-subagent", kind)
+		}
+		New().Handler().ServeHTTP(rec, req)
+		return rec.Code, rec.Body.String()
+	}
+	code, body := post("codex-auto-review", "guardian")
+	if code != 200 || strings.Join(tried, ",") != "acct-2" || strings.Join(models, ",") != "codex-auto-review" {
+		t.Fatalf("review: %d %s tried %v models %v", code, body, tried, models)
+	}
+	// a model the list leaves out is still refused, not sent to it
+	tried, models = nil, nil
+	if code, body := post("gpt-5.5", ""); code != 403 || len(tried) != 0 {
+		t.Fatalf("a model the list leaves out: %d %s tried %v", code, body, tried)
+	}
+	// one it names is served by it
+	tried, models = nil, nil
+	if code, body := post("gpt-5.6-luna", ""); code != 200 || strings.Join(tried, ",") != "acct-2" {
+		t.Fatalf("a model the list names: %d %s tried %v", code, body, tried)
+	}
 }

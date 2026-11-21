@@ -4,7 +4,11 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
+
+	"github.com/yetone/magpie/internal/agent"
+	"github.com/yetone/magpie/internal/appdir"
 )
 
 // Every agent on the Agents page that reads skills has a place for them in
@@ -13,17 +17,29 @@ import (
 // the shared ~/.agents/skills.
 func TestAgentsSkillsFolders(t *testing.T) {
 	h := sandbox(t)
+	// Hermes's own folder: ~/.hermes, but %LOCALAPPDATA%\hermes on Windows
+	// (#2275: the test wrote ~/.hermes there, where no Hermes is)
+	hermes, err := filepath.Rel(h, appdir.HermesHome())
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, f := range []string{".kimi/config.toml", ".commandcode/settings.json", ".factory/settings.json", ".cline/data/globalState.json",
-		".hermes/config.yaml", ".grok/config.toml", ".qoder/settings.json", ".workbuddy/models.json", ".fx/settings.json", ".config/devin/config.json"} {
+		filepath.Join(hermes, "config.yaml"), ".grok/config.toml", ".qoder/settings.json", ".workbuddy/models.json", ".fx/settings.json", ".config/devin/config.json"} {
 		write(t, filepath.Join(h, f), "")
 	}
+	// hermes and Cline installed: the CLI beside the folder (the folder
+	// alone is gone, #2177, and no target — TestTargetsLeaveGoneAgentsOut)
+	holdCLI(t, h, "hermes")
+	holdCLI(t, h, "cline")
+	// and WorkBuddy's app, which is how a Mac has it
+	holdApp(t, h, "WorkBuddy.app", "com.tencent.workbuddy.mac")
 	want := map[string]string{
 		"kimi":        ".agents/skills",
 		"goose":       ".agents/skills",
 		"commandcode": ".commandcode/skills",
 		"droid":       ".factory/skills",
 		"cline":       ".cline/skills",
-		"hermes":      ".hermes/skills",
+		"hermes":      filepath.Join(hermes, "skills"),
 		"grok":        ".grok/skills",
 		"qoder":       ".qoder/skills",
 		"workbuddy":   ".workbuddy/skills",
@@ -130,7 +146,11 @@ func TestSharedSkillsWrittenOnce(t *testing.T) {
 // a word of its "own skill by that name".
 func TestImportSharedSkillForKimi(t *testing.T) {
 	h := sandbox(t)
+	// goose off: its folder and, since the sandbox puts the agents' CLIs
+	// beside them (#2177), its CLI too
 	os.RemoveAll(filepath.Join(h, ".config/goose"))
+	os.Remove(filepath.Join(h, "bin/goose"))
+	os.Remove(filepath.Join(h, "bin/goose.exe"))
 	write(t, filepath.Join(h, ".kimi/config.toml"), "")
 	shared := filepath.Join(h, ".agents/skills/orca")
 	skill(t, shared, "orca", "Orca")
@@ -167,5 +187,313 @@ func TestDroidGrokInstructions(t *testing.T) {
 		if s := read(t, f); s != "# Mine\n\n"+blockBegin+"\nUse tabs.\n"+blockEnd+"\n" {
 			t.Errorf("%s's AGENTS.md:\n%s", id, s)
 		}
+	}
+}
+
+// Devin CLI reads its global rules from AGENTS.md in its config folder
+// (~/.config/devin, %APPDATA%\devin on Windows), else the singular AGENT.md
+// there (#3151): the library's instructions reach it, after what the user
+// wrote, which stays, and Devin is offered them rather than listed as having
+// no user-wide file.
+func TestDevinInstructions(t *testing.T) {
+	h := sandbox(t)
+	write(t, filepath.Join(h, ".config/devin/config.json"), "{}")
+	tg := targetByID("devin")
+	if tg == nil {
+		t.Fatal("Devin isn't a target")
+	}
+	f := filepath.Join(tg.Agent.Dir, "AGENTS.md")
+	if tg.Instructions != f {
+		t.Fatalf("Devin's instructions: %q, want %q before the file is there", tg.Instructions, f)
+	}
+	write(t, f, "# Mine\n")
+	shared := "Use tabs."
+	ok(t)(SaveInstructions(InstructionsChange{Shared: &shared, Agents: []string{"devin"}}))
+	if s := read(t, f); s != "# Mine\n\n"+blockBegin+"\nUse tabs.\n"+blockEnd+"\n" {
+		t.Fatalf("Devin's AGENTS.md:\n%s", s)
+	}
+
+	// a user who keeps theirs as AGENT.md has it written there instead
+	h = sandbox(t)
+	write(t, filepath.Join(h, ".config/devin/config.json"), "{}")
+	dir := targetByID("devin").Agent.Dir
+	write(t, filepath.Join(dir, "AGENT.md"), "# Mine\n")
+	if tg := targetByID("devin"); tg.Instructions != filepath.Join(dir, "AGENT.md") {
+		t.Fatalf("Devin with AGENT.md: %q", tg.Instructions)
+	}
+}
+
+// Qwen Code reads QWEN.md in its folder ($QWEN_HOME, else ~/.qwen) before
+// every conversation (wongxy on Discord): the library's instructions reach
+// it there, after what the user wrote, which stays; its settings'
+// context.fileName, a JSONC list whose first non-empty name Qwen Code
+// writes itself, names another file.
+func TestQwenInstructions(t *testing.T) {
+	h := sandbox(t)
+	dir := filepath.Join(h, ".qwen")
+	write(t, filepath.Join(dir, "settings.json"), "{\n  \"model\": {\"name\": \"qwen3.8-max\"}\n}\n")
+	inst := filepath.Join(dir, "QWEN.md")
+	write(t, inst, "# Mine\n")
+	if tg := targetByID("qwen"); tg == nil || tg.Instructions != inst {
+		t.Fatalf("Qwen Code's instructions: %+v", tg)
+	}
+	if id, err := Takes("qwen-code", "instructions"); err != nil || id != "qwen" {
+		t.Fatalf("Takes(qwen-code): %q %v", id, err)
+	}
+	shared := "Use tabs."
+	ok(t)(SaveInstructions(InstructionsChange{Shared: &shared, Agents: []string{"qwen"}}))
+	if s := read(t, inst); s != "# Mine\n\n"+blockBegin+"\nUse tabs.\n"+blockEnd+"\n" {
+		t.Fatalf("QWEN.md:\n%s", s)
+	}
+	if cfg := read(t, filepath.Join(dir, "settings.json")); !strings.Contains(cfg, "qwen3.8-max") {
+		t.Fatalf("instructions rewrote the settings:\n%s", cfg)
+	}
+
+	// $QWEN_HOME moves the folder, and context.fileName renames the file
+	q := filepath.Join(h, "qwen-home")
+	t.Setenv("QWEN_HOME", q)
+	write(t, filepath.Join(q, "settings.json"), "{\n  // mine\n  \"context\": {\"fileName\": [\"  \", \" AGENTS.md \", \"QWEN.md\"]},\n}\n")
+	if tg := targetByID("qwen"); tg == nil || tg.Instructions != filepath.Join(q, "AGENTS.md") {
+		t.Fatalf("Qwen Code under QWEN_HOME with context.fileName: %+v", tg)
+	}
+	write(t, filepath.Join(q, "settings.json"), "{\"context\": {\"fileName\": \"MY.md\"}}")
+	if tg := targetByID("qwen"); tg == nil || tg.Instructions != filepath.Join(q, "MY.md") {
+		t.Fatalf("context.fileName as one name: %+v", tg)
+	}
+}
+
+// Kimi Code 2.x, fx, Prime Agent, StepCode and jcode each read one
+// user-wide instructions file of their own, which the library writes into
+// with the user's own text kept; Prime Agent and StepCode read only the
+// first of their names there is, and StepCode its AGENTS.override.md
+// instead of any.
+func TestSiblingInstructions(t *testing.T) {
+	h := sandbox(t)
+	write(t, filepath.Join(h, ".kimi-code", "config.toml"), "default_model = \"k3\"\n")
+	write(t, filepath.Join(h, ".fx", "settings.json"), "{}")
+	write(t, filepath.Join(h, ".prime", "agent", "settings.json"), "{}")
+	write(t, filepath.Join(h, ".stepcode", "config.toml"), "defaultModel = \"step-3\"\n")
+	write(t, filepath.Join(h, ".jcode", "config.toml"), "")
+	// a user's own CLAUDE.md is the one Prime Agent reads, not a new AGENTS.md
+	write(t, filepath.Join(h, ".prime", "agent", "CLAUDE.md"), "# Mine\n")
+	want := map[string]string{
+		"kimi":        filepath.Join(h, ".kimi-code", "AGENTS.md"),
+		"fx":          filepath.Join(h, ".fx", "AGENTS.md"),
+		"prime-agent": filepath.Join(h, ".prime", "agent", "CLAUDE.md"),
+		"stepcode":    filepath.Join(h, ".stepcode", "agent", "AGENTS.md"),
+		"jcode":       filepath.Join(h, ".jcode", "prompt-overlay.md"),
+	}
+	for id, inst := range want {
+		if tg := targetByID(id); tg == nil || tg.Instructions != inst {
+			t.Fatalf("%s's instructions: %+v, want %s", id, tg, inst)
+		}
+		if got, err := Takes(id, "instructions"); err != nil || got != id {
+			t.Fatalf("Takes(%s): %q %v", id, got, err)
+		}
+	}
+	if tg := targetByID("stepcode"); tg.Override != filepath.Join(h, ".stepcode", "agent", "AGENTS.override.md") {
+		t.Fatalf("StepCode's override: %q", tg.Override)
+	}
+	shared := "Use tabs."
+	ok(t)(SaveInstructions(InstructionsChange{Shared: &shared, Agents: []string{"kimi", "fx", "prime-agent", "stepcode", "jcode"}}))
+	for id, inst := range want {
+		pre := ""
+		if id == "prime-agent" {
+			pre = "# Mine\n\n"
+		}
+		if s := read(t, inst); s != pre+blockBegin+"\nUse tabs.\n"+blockEnd+"\n" {
+			t.Fatalf("%s's %s:\n%s", id, filepath.Base(inst), s)
+		}
+	}
+
+	// variables move them: $JCODE_HOME, $STEP_CODING_AGENT_DIR
+	j := filepath.Join(h, "jhome")
+	t.Setenv("JCODE_HOME", j)
+	write(t, filepath.Join(j, "config.toml"), "")
+	if tg := targetByID("jcode"); tg == nil || tg.Instructions != filepath.Join(j, "prompt-overlay.md") {
+		t.Fatalf("jcode under JCODE_HOME: %+v", tg)
+	}
+	s := filepath.Join(h, "step", "my-agent")
+	t.Setenv("STEP_CODING_AGENT_DIR", s)
+	write(t, filepath.Join(h, "step", "config.toml"), "")
+	if tg := targetByID("stepcode"); tg == nil || tg.Instructions != filepath.Join(s, "AGENTS.md") || tg.Override != filepath.Join(s, "AGENTS.override.md") {
+		t.Fatalf("StepCode under STEP_CODING_AGENT_DIR: %+v", tg)
+	}
+
+	// the old kimi-cli reads no user-wide instructions
+	t.Setenv("KIMI_CODE_HOME", "")
+	if err := os.RemoveAll(filepath.Join(h, ".kimi-code")); err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(h, ".kimi", "config.toml"), "")
+	if tg := targetByID("kimi"); tg == nil || tg.Instructions != "" {
+		t.Fatalf("kimi-cli's instructions: %+v", tg)
+	}
+}
+
+// Qoder, Command Code, CodeBuddy Code and Reasonix read a user-wide
+// instructions file in their own folders too: Qoder's renamed by its
+// settings' context.fileName, CodeBuddy's the first of its two names there
+// is, Reasonix's in its state folder wherever that is moved.
+func TestSiblingInstructionsMore(t *testing.T) {
+	h := sandbox(t)
+	write(t, filepath.Join(h, ".qoder", "settings.json"), "{}")
+	write(t, filepath.Join(h, ".commandcode", "settings.json"), "{}")
+	write(t, filepath.Join(h, ".codebuddy", "settings.json"), "{}")
+	holdCLI(t, h, "codebuddy") // the folder alone is gone (#2177)
+	write(t, filepath.Join(h, ".codebuddy", "CODEBUDDY.mdc"), "# Mine\n")
+	want := map[string]string{
+		"qoder":       filepath.Join(h, ".qoder", "AGENTS.md"),
+		"commandcode": filepath.Join(h, ".commandcode", "AGENTS.md"),
+		"codebuddy":   filepath.Join(h, ".codebuddy", "CODEBUDDY.mdc"),
+	}
+	for id, inst := range want {
+		if tg := targetByID(id); tg == nil || tg.Instructions != inst {
+			t.Fatalf("%s's instructions: %+v, want %s", id, tg, inst)
+		}
+	}
+	shared := "Use tabs."
+	ok(t)(SaveInstructions(InstructionsChange{Shared: &shared, Agents: []string{"qoder", "commandcode", "codebuddy"}}))
+	for id, inst := range want {
+		pre := ""
+		if id == "codebuddy" {
+			pre = "# Mine\n\n"
+		}
+		if s := read(t, inst); s != pre+blockBegin+"\nUse tabs.\n"+blockEnd+"\n" {
+			t.Fatalf("%s's %s:\n%s", id, filepath.Base(inst), s)
+		}
+	}
+	if cfg := read(t, filepath.Join(h, ".qoder", "settings.json")); cfg != "{}" {
+		t.Fatalf("instructions rewrote Qoder's settings: %s", cfg)
+	}
+
+	// Qoder's context.fileName; Reasonix's [storage] state, then its variable
+	write(t, filepath.Join(h, ".qoder", "settings.json"), `{"context": {"fileName": ["QODER.md", "AGENTS.md"]}}`)
+	if tg := targetByID("qoder"); tg == nil || tg.Instructions != filepath.Join(h, ".qoder", "QODER.md") {
+		t.Fatalf("Qoder with context.fileName: %+v", tg)
+	}
+	// Reasonix Studio is found by its app alone, so its target is asked
+	// of the agent as magpie makes it
+	rx := filepath.Join(h, ".reasonix")
+	reasonix := &agent.Agent{ID: "reasonix", Dir: rx, Path: filepath.Join(rx, "config.toml")}
+	if tg := targetOf(reasonix); tg == nil || tg.Instructions != filepath.Join(rx, "REASONIX.md") {
+		t.Fatalf("Reasonix's instructions: %+v", tg)
+	}
+	write(t, reasonix.Path, "[storage]\nstate = \"~/rx-state\"\n")
+	if tg := targetOf(reasonix); tg.Instructions != filepath.Join(h, "rx-state", "REASONIX.md") {
+		t.Fatalf("Reasonix with [storage] state: %+v", tg)
+	}
+	st := filepath.Join(h, "rx-env-state")
+	t.Setenv("REASONIX_STATE_HOME", st)
+	if tg := targetOf(reasonix); tg.Instructions != filepath.Join(st, "REASONIX.md") {
+		t.Fatalf("Reasonix under REASONIX_STATE_HOME: %+v", tg)
+	}
+}
+
+// Grok App's independent home (Use on a custom provider) reads AGENTS.md
+// and skills beside agent-home/config.toml, not Grok Build's ~/.grok.
+func TestGrokAppInstructions(t *testing.T) {
+	h := sandbox(t)
+	root := filepath.Join(h, "grok-app-data")
+	t.Setenv("GROK_APP_HOME", root)
+	home := filepath.Join(root, "agent-home")
+	write(t, filepath.Join(home, "config.toml"), "[models]\ndefault = \"deepseek\"\n")
+	inst := filepath.Join(home, "AGENTS.md")
+	write(t, inst, "# Mine\n")
+	tg := targetByID("grok-app")
+	if tg == nil || tg.Instructions != inst || tg.Skills != filepath.Join(home, "skills") || tg.MCP == nil || tg.MCP.Path != filepath.Join(home, "config.toml") {
+		t.Fatalf("Grok App library places: %+v", tg)
+	}
+	if !slices.Contains(readsShared, "grok-app") {
+		t.Fatal("Grok App doesn't read ~/.agents/skills")
+	}
+	shared := "Use tabs."
+	ok(t)(SaveInstructions(InstructionsChange{Shared: &shared, Agents: []string{"grok-app"}}))
+	if s := read(t, inst); s != "# Mine\n\n"+blockBegin+"\nUse tabs.\n"+blockEnd+"\n" {
+		t.Fatalf("AGENTS.md:\n%s", s)
+	}
+	if cfg := read(t, filepath.Join(home, "config.toml")); !strings.Contains(cfg, `default = "deepseek"`) {
+		t.Fatalf("instructions rewrote the route:\n%s", cfg)
+	}
+}
+
+// Pi and OmO's engine (senpi, a fork of Pi) read AGENTS.override.md in
+// their agent folder when it is there, else the first there is of
+// AGENTS.md, AGENTS.MD, CLAUDE.md and CLAUDE.MD, so a user's own CLAUDE.md
+// is written into rather than hidden by a new AGENTS.md.
+func TestPiInstructionsFirstThere(t *testing.T) {
+	h := sandbox(t)
+	pi := filepath.Join(h, ".pi", "agent")
+	omo := filepath.Join(h, ".omo", "agent")
+	write(t, filepath.Join(omo, "settings.json"), "{}")
+	holdCLI(t, h, "omo") // the folder alone is gone (#2177)
+	for _, d := range []string{pi, omo} {
+		if tg := targetByID(map[string]string{pi: "pi", omo: "omo"}[d]); tg == nil ||
+			tg.Instructions != filepath.Join(d, "AGENTS.md") || tg.Override != filepath.Join(d, "AGENTS.override.md") {
+			t.Fatalf("with no file there: %+v", tg)
+		}
+		write(t, filepath.Join(d, "CLAUDE.md"), "# Mine\n")
+	}
+	want := map[string]string{"pi": filepath.Join(pi, "CLAUDE.md"), "omo": filepath.Join(omo, "CLAUDE.md")}
+	for id, inst := range want {
+		if tg := targetByID(id); tg == nil || tg.Instructions != inst {
+			t.Fatalf("%s's instructions: %+v, want %s", id, tg, inst)
+		}
+	}
+	shared := "Use tabs."
+	ok(t)(SaveInstructions(InstructionsChange{Shared: &shared, Agents: []string{"pi", "omo"}}))
+	for id, inst := range want {
+		if s := read(t, inst); s != "# Mine\n\n"+blockBegin+"\nUse tabs.\n"+blockEnd+"\n" {
+			t.Fatalf("%s's CLAUDE.md:\n%s", id, s)
+		}
+		if _, err := os.Stat(filepath.Join(filepath.Dir(inst), "AGENTS.md")); !os.IsNotExist(err) {
+			t.Fatalf("%s got an AGENTS.md that hides CLAUDE.md: %v", id, err)
+		}
+	}
+	// an AGENTS.md there comes first again
+	write(t, filepath.Join(pi, "AGENTS.md"), "")
+	if tg := targetByID("pi"); tg.Instructions != filepath.Join(pi, "AGENTS.md") {
+		t.Fatalf("AGENTS.md comes before CLAUDE.md: %q", tg.Instructions)
+	}
+}
+
+// A skill kept in ~/.agents/skills reaches ZCode, which reads that folder
+// beside its own ~/.zcode/skills: giving it to zcode ticks the chip the
+// shared copy already answers, and no second link lands in its own folder
+// (#4987).
+func TestSharedSkillReachesZCode(t *testing.T) {
+	h := sandbox(t)
+	write(t, filepath.Join(h, ".zcode/cli/config.json"), "")
+	write(t, filepath.Join(h, ".zcode/v2/config.json"), "{}")
+	shared := filepath.Join(h, ".agents/skills/orca")
+	skill(t, shared, "orca", "Orca")
+	ok(t)(ImportSkill("orca"))
+	own := filepath.Join(h, ".zcode/skills/orca")
+
+	ok(t)(SkillAgents("orca", []string{"kimi", "zcode"}))
+	if _, err := os.Lstat(own); !os.IsNotExist(err) {
+		t.Error("zcode has a second link to it in its own folder")
+	}
+	ok(t)(Sync())
+	if _, err := os.Lstat(own); !os.IsNotExist(err) {
+		t.Error("zcode's own folder got it on the sync too")
+	}
+}
+
+// Mistral Vibe reads $VIBE_HOME/AGENTS.md and $VIBE_HOME/skills/<name>, else
+// the same under ~/.vibe (alterxyz4 on X).
+func TestVibeTarget(t *testing.T) {
+	h := sandbox(t)
+	t.Setenv("VIBE_HOME", "")
+	write(t, filepath.Join(h, ".vibe", "config.toml"), "")
+	tg := targetByID("vibe")
+	if tg == nil || tg.Instructions != filepath.Join(h, ".vibe", "AGENTS.md") || tg.Skills != filepath.Join(h, ".vibe", "skills") {
+		t.Fatalf("vibe: %+v", tg)
+	}
+	v := filepath.Join(h, "vhome")
+	t.Setenv("VIBE_HOME", v)
+	write(t, filepath.Join(v, "config.toml"), "")
+	if tg := targetByID("vibe"); tg == nil || tg.Instructions != filepath.Join(v, "AGENTS.md") || tg.Skills != filepath.Join(v, "skills") {
+		t.Fatalf("vibe under VIBE_HOME: %+v", tg)
 	}
 }

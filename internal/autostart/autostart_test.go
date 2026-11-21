@@ -17,14 +17,16 @@ func TestSet(t *testing.T) {
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)
 	t.Setenv("XDG_CONFIG_HOME", home+"/.config")
+	// Linux's system folders, a package's entry in them: the test's own
+	t.Setenv("XDG_CONFIG_DIRS", home+"/etc/xdg")
 	t.Setenv("APPIMAGE", "/opt/my apps/magpie.AppImage")
-	if Enabled() {
+	if Enabled() != Off {
 		t.Fatal("on before it was turned on")
 	}
 	if err := Set(true); err != nil {
 		t.Fatal(err)
 	}
-	if !Enabled() {
+	if Enabled() == Off {
 		t.Fatal("not on after Set(true)")
 	}
 	path := record()
@@ -41,7 +43,7 @@ func TestSet(t *testing.T) {
 			t.Errorf("%s lacks %q:\n%s", path, want, b)
 		}
 	}
-	if err := Set(false); err != nil || Enabled() {
+	if err := Set(false); err != nil || Enabled() != Off {
 		t.Fatalf("still on after Set(false): %v", err)
 	}
 	if err := Set(false); err != nil {

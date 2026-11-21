@@ -85,15 +85,15 @@ func TestProxiedLoopbackNeedsTheKey(t *testing.T) {
 	}
 	t.Setenv("MAGPIE_TRUST_PROXY", "")
 
-	// MAGPIE_ADDR on loopback is closed to a tunnel; one open to the
-	// network is open to it as to everyone else
+	// MAGPIE_ADDR on loopback is closed to a tunnel; one on the network
+	// asks it for a gateway key, as it asks everyone else
 	t.Setenv("MAGPIE_ADDR", "127.0.0.1:4555")
 	if c, _ := call("/v1/messages", "Cf-Connecting-IP", "203.0.113.9"); c != http.StatusForbidden {
 		t.Fatal("MAGPIE_ADDR on loopback, through a tunnel:", c)
 	}
 	t.Setenv("MAGPIE_ADDR", "0.0.0.0:4555")
-	if c, _ := call("/v1/messages", "Cf-Connecting-IP", "203.0.113.9"); c != 200 {
-		t.Fatal("MAGPIE_ADDR open, through a tunnel:", c)
+	if c, _ := call("/v1/messages", "Authorization", "Bearer magpie", "Cf-Connecting-IP", "203.0.113.9"); c != http.StatusUnauthorized {
+		t.Fatal("MAGPIE_ADDR on the network, through a tunnel, no key:", c)
 	}
 }
 

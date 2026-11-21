@@ -23,23 +23,29 @@ const (
 	npmMirror    = "https://registry.npmmirror.com"
 	githubMirror = "https://gh-proxy.com"
 	// with the 「国内镜像」 switch: Bun's releases at npmmirror, and the
-	// plugin list at jsDelivr, both copies of the very files
-	bunMirror  = "https://registry.npmmirror.com/-/binary/bun"
-	listMirror = "https://cdn.jsdelivr.net/gh/magpie-community/plugins@"
+	// plugin lists at jsDelivr, all copies of the very files
+	bunMirror = "https://registry.npmmirror.com/-/binary/bun"
+	jsDelivr  = "https://cdn.jsdelivr.net/gh/"
+	hfMirror  = "https://hf-mirror.com"
 )
+
+// listRepos are the GitHub repositories whose files jsDelivr serves with
+// the switch on: the community's plugin list, and Claude Code's official
+// plugins marketplace (the Library's Claude plugins market).
+var listRepos = []string{"magpie-community/plugins", "anthropics/claude-plugins-official"}
 
 // NPMMirror is npm's registry in China, npmmirror.
 const NPMMirror = npmMirror
 
 // China is whether the Plugins page's 「国内镜像」 switch is on
 // (settings.ChinaMirror); a var for tests.
-var China = func() bool { return settings.Load().ChinaMirror }
+var China = func() bool { return settings.Shared().ChinaMirror }
 
 // chinaFirst is the mirror in China asked before raw with the switch on,
 // "" when there is none. Only mirrors that serve the same bytes as the
 // official address: npmmirror for npm's registry and Bun's releases (whose
 // zips are checked against Bun's checksums all the same), jsDelivr for the
-// community repo's plugin list. Never a proxy such as gh-proxy, which
+// community repo's plugin list and Claude Code's official marketplace, hf-mirror for the masking models. Never a proxy such as gh-proxy, which
 // would hand magpie whatever it liked.
 func chinaFirst(raw string) string {
 	u, err := url.Parse(raw)
@@ -53,12 +59,46 @@ func chinaFirst(raw string) string {
 		if rest, ok := strings.CutPrefix(u.EscapedPath(), "/oven-sh/bun/releases/download/"); ok && rest != "" {
 			return bunMirror + "/" + rest
 		}
+	case "huggingface.co":
+		return modelMirror(u)
 	case "raw.githubusercontent.com":
-		// /magpie-community/plugins/<branch>/<path>
-		if rest, ok := strings.CutPrefix(u.EscapedPath(), "/magpie-community/plugins/"); ok {
-			if ref, path, ok := strings.Cut(rest, "/"); ok && ref != "" && path != "" && u.RawQuery == "" {
-				return listMirror + ref + "/" + path
+		// /<repo>/<branch>/<path>, for the repositories whose lists magpie
+		// reads: the community's plugins and Claude Code's official
+		// plugins marketplace
+		for _, repo := range listRepos {
+			if rest, ok := strings.CutPrefix(u.EscapedPath(), "/"+repo+"/"); ok {
+				if ref, path, ok := strings.Cut(rest, "/"); ok && ref != "" && path != "" && u.RawQuery == "" {
+					return jsDelivr + repo + "@" + ref + "/" + path
+				}
 			}
+		}
+	}
+	return ""
+}
+
+// ChinaFirst is the mirror in China the 「国内镜像」 switch asks before raw,
+// "" with the switch off or when no mirror serves raw.
+func ChinaFirst(raw string) string {
+	if !China() {
+		return ""
+	}
+	return chinaFirst(raw)
+}
+
+// modelMirror is hf-mirror's copy of one of the local masking models'
+// files (internal/pii), "" for anything else of Hugging Face's. Those
+// files are fetched at the revision their sha256 were pinned at, and what
+// hf-mirror serves is checked against those pins, so it is asked with the
+// switch off too, after Hugging Face: where huggingface.co is blocked or
+// poisoned (a *.facebook.com certificate, EOF, a handshake that times out;
+// hh0592821 on Discord) the model still comes.
+func modelMirror(u *url.URL) string {
+	if u.Scheme != "https" || !strings.EqualFold(u.Hostname(), "huggingface.co") || u.RawQuery != "" {
+		return ""
+	}
+	for _, repo := range []string{"/LocalAI-io/privacy-filter-GGUF/resolve/", "/QuantumNous/astrlink-guard/resolve/"} {
+		if strings.HasPrefix(u.EscapedPath(), repo) {
+			return hfMirror + u.EscapedPath()
 		}
 	}
 	return ""
@@ -90,14 +130,20 @@ func githubBase() string {
 
 // URLs is the official address followed by its mirrors, or just the
 // official one when there is no mirror for it; with the 「国内镜像」 switch
-// on, a mirror in China comes before it.
+// on, a mirror in China comes before it. A masking model's file has
+// hf-mirror after it with no switch at all (modelMirror); every other
+// fallback mirror waits for MAGPIE_MIRRORS.
 func URLs(raw string) []string {
 	out := faithful(raw)
-	if !Enabled() {
-		return out
-	}
 	u, err := url.Parse(raw)
 	if err != nil {
+		return out
+	}
+	if m := modelMirror(u); m != "" {
+		// pinned by sha256: no switch needed (modelMirror)
+		return distinct(append(out, m)...)
+	}
+	if !Enabled() {
 		return out
 	}
 	switch strings.ToLower(u.Hostname()) {
@@ -132,12 +178,32 @@ func distinct(urls ...string) []string {
 
 // Do sends req as usual and, when the official answer fails in a way a
 // mirror could answer, tries its mirrors in order. A request that carries
-// credentials is never sent to a mirror.
+// credentials is never sent to a mirror with them: GitHub's, whose only
+// one is the user's token, goes to a mirror without it (bare).
 func Do(c *http.Client, req *http.Request) (*http.Response, error) {
-	if !mirrorable(req) {
+	if !mirrorable(req) && !bare(req) {
 		return do(c, req, []string{req.URL.String()})
 	}
 	return do(c, req, URLs(req.URL.String()))
+}
+
+// bare is whether req's one credential is an Authorization header to
+// GitHub, whose answers come without it too, at the anonymous rate: a
+// mirror is then asked without the header, and never sees the token. A
+// GitHub token in Settings turned the mirror off for every request to
+// GitHub's API (MYCF711, #3923).
+func bare(req *http.Request) bool {
+	if req.URL == nil || req.Header.Get("Authorization") == "" {
+		return false
+	}
+	switch strings.ToLower(req.URL.Hostname()) {
+	case "github.com", "api.github.com", "raw.githubusercontent.com", "codeload.github.com":
+	default:
+		return false
+	}
+	r := req.Clone(req.Context())
+	r.Header.Del("Authorization")
+	return mirrorable(r)
 }
 
 // mirrorable is whether req may be sent to a mirror. Credentials stay with
@@ -179,7 +245,7 @@ func DoOfficial(c *http.Client, req *http.Request) (*http.Response, error) {
 // when the 「国内镜像」 switch is on, but never to a fallback mirror: for a
 // file nothing checks, which only a copy of the very file may stand in for.
 func DoFaithful(c *http.Client, req *http.Request) (*http.Response, error) {
-	if !mirrorable(req) {
+	if !mirrorable(req) && !bare(req) {
 		return DoOfficial(c, req)
 	}
 	return do(c, req, faithful(req.URL.String()))
@@ -201,6 +267,8 @@ func do(c *http.Client, req *http.Request, urls []string) (*http.Response, error
 			}
 			r.URL = u
 			r.Host = ""
+			// only a request bare allows has one here (Do)
+			r.Header.Del("Authorization")
 			if r.Body != nil {
 				if r.GetBody == nil {
 					break

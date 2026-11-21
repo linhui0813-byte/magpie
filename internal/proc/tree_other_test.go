@@ -4,6 +4,8 @@ package proc
 
 import (
 	"bufio"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -67,4 +69,51 @@ func TestTreeWaitEndsWhatWasLeft(t *testing.T) {
 	if !gone(child) {
 		t.Fatalf("its child %d outlived it", child)
 	}
+}
+
+// Stop lets the command clean up before its tree ends: Claude Code removes
+// the OAuth refresh lock it holds on SIGTERM, which a SIGKILL left behind
+// (#2195). What it started still ends with it.
+func TestTreeStopLetsItCleanUp(t *testing.T) {
+	lock := filepath.Join(t.TempDir(), "refresh.lock")
+	tree, child := startSh(t, `sleep 600 >/dev/null 2>&1 & echo $!; trap 'rmdir "`+lock+`"; exit 0' TERM; mkdir "`+lock+`"; while :; do sleep 0.02; done`)
+	for end := time.Now().Add(3 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		if _, err := os.Stat(lock); err == nil {
+			break
+		} else if time.Now().After(end) {
+			t.Fatal("the lock was never made")
+		}
+	}
+	go func() { _ = tree.Wait() }()
+	select {
+	case <-tree.Stop(time.Minute):
+	case <-time.After(10 * time.Second):
+		t.Fatal("Stop never ended a command that exits on SIGTERM")
+	}
+	if _, err := os.Stat(lock); !os.IsNotExist(err) {
+		t.Fatalf("the command's lock is left after Stop: %v", err)
+	}
+	if !gone(child) {
+		t.Fatalf("its child %d outlived Stop", child)
+	}
+}
+
+// A command that doesn't end when asked is killed, tree and all, once the
+// grace has passed; a second Stop shares the first's.
+func TestTreeStopKillsOneThatStays(t *testing.T) {
+	tree, child := startSh(t, `sleep 600 >/dev/null 2>&1 & echo $!; trap '' TERM; while :; do sleep 0.02; done`)
+	go func() { _ = tree.Wait() }()
+	first := tree.Stop(50 * time.Millisecond)
+	if second := tree.Stop(time.Hour); second != first {
+		t.Fatal("a second Stop started a grace of its own")
+	}
+	select {
+	case <-first:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Stop never killed a command that ignores SIGTERM")
+	}
+	if !gone(child) {
+		t.Fatalf("its child %d outlived Stop", child)
+	}
+	tree.Kill() // ended already: a no-op
 }

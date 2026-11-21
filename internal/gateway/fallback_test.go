@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -163,6 +164,141 @@ func TestSeveralKeysOnTakeOverFromEachOther(t *testing.T) {
 	up.seen = nil
 	if body := send(); !strings.Contains(body, "from-k-team") || strings.Join(up.seen, ",") != "k-team" {
 		t.Fatalf("body %s, tried %v", body, up.seen)
+	}
+}
+
+// #1235: two SenseNova keys, whose plan doesn't have deepseek-v4.1-flash.
+// An agent kept asking for it, every try refused with SenseNova's 403 "model
+// is not available in the current token plan", and each refusal rested the
+// whole key, longer each time, till both keys sat out for every model. Only
+// the model rests: the keys serve deepseek-v4-flash first in their order,
+// and no key's rest grows.
+func TestModelNotInPlanRestsTheModelNotTheKey(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	restingUntil.Lock()
+	restingUntil.m, restingUntil.note = map[string]time.Time{}, map[string]Rest{}
+	restingUntil.Unlock()
+	routed.Lock()
+	routed.failures = map[string]int{}
+	routed.Unlock()
+	var seen []string
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Model string `json:"model"`
+		}
+		json.NewDecoder(r.Body).Decode(&req)
+		key := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		seen = append(seen, key+":"+req.Model)
+		w.Header().Set("Content-Type", "application/json")
+		if req.Model == "deepseek-v4.1-flash" {
+			w.WriteHeader(403)
+			io.WriteString(w, `{"error": {"code": 7,"message": "model is not available in the current token plan"}}`)
+			return
+		}
+		io.WriteString(w, `{"id":"from-`+key+`","choices":[]}`)
+	}))
+	defer up.Close()
+	p := provider.Provider{ID: "sensenova", Name: "sensenova", Chat: up.URL + "/v1",
+		Models: []string{"deepseek-v4-flash", "deepseek-v4.1-flash"},
+		Key:    "k-one", KeyName: "One", Keys: []provider.KeyAccount{{Name: "Two", Key: "k-two"}}}
+	if err := provider.Save(p); err != nil {
+		t.Fatal(err)
+	}
+	saved, err := provider.Find("sensenova")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := New()
+	send := func(model string) (int, string) {
+		rec := httptest.NewRecorder()
+		body := `{"model":"sensenova/` + model + `","messages":[{"role":"user","content":"hi"}]}`
+		s.Handler().ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body)))
+		return rec.Code, rec.Body.String()
+	}
+	for range 4 {
+		if code, body := send("deepseek-v4.1-flash"); code != 403 || !strings.Contains(body, "not available in the current token plan") {
+			t.Fatalf("v4.1: %d %s", code, body)
+		}
+	}
+	for _, k := range saved.KeyList() {
+		if r, ok := RestOf(saved.RestKey(k)); ok {
+			t.Errorf("key %s rests for a model its plan lacks: %+v", k.Name, r)
+		}
+	}
+	// the model itself rests on each key, as the failure it is
+	for _, k := range saved.KeyList() {
+		r, ok := RestOf(saved.RestKey(k) + "/deepseek-v4.1-flash")
+		if !ok {
+			t.Errorf("key %s: deepseek-v4.1-flash doesn't rest", k.Name)
+		} else if r.Why != failOther || r.Status != 403 {
+			t.Errorf("key %s: rest %+v", k.Name, r)
+		}
+	}
+	seen = nil
+	if code, body := send("deepseek-v4-flash"); code != 200 || !strings.Contains(body, "from-k-one") {
+		t.Fatalf("v4: %d %s", code, body)
+	}
+	if strings.Join(seen, ",") != "k-one:deepseek-v4-flash" {
+		t.Fatalf("v4 tried %v; want the first key, straight", seen)
+	}
+}
+
+// The same words said escaped as \uXXXX (a relay whose encoder escapes
+// what isn't ASCII, #1669) are read by the other deciders too: what
+// rests the model alone, and what another provider may answer.
+func TestEscapedWordsReadByTheOtherDeciders(t *testing.T) {
+	unserved := []byte(`{"error":{"code":7,"message":"\u8be5\u6a21\u578b\u4e0d\u652f\u6301\u5f53\u524d\u4ee4\u724c\u8ba1\u5212"}}`)
+	if !modelRefused(403, unserved) {
+		t.Errorf("escaped 模型不支持: modelRefused false; the key would rest for its model")
+	}
+	if !modelRefused(403, []byte(`{"error":{"message":"该模型不支持当前令牌计划"}}`)) {
+		t.Errorf("the same refusal unescaped: modelRefused false")
+	}
+	quota := []byte(`{"error":{"message":"\u989d\u5ea6\u5df2\u7528\u5b8c\uff0c\u8bf7\u660e\u5929\u518d\u8bd5","type":"invalid_request_error"}}`)
+	if !retryable(400, quota) {
+		t.Errorf("escaped 额度已用完: retryable false; the next decision model isn't asked")
+	}
+	if !retryable(400, []byte(`{"error":{"message":"额度已用完，请明天再试","type":"invalid_request_error"}}`)) {
+		t.Errorf("the same refusal unescaped: retryable false")
+	}
+}
+
+// The rest of the deciders whose words are Chinese read them escaped as
+// well: a conversation too long, a retired model or a shape refusal that
+// also says the quota is spent, and a size inferred only when nothing
+// else is said. Each case beside the same words unescaped.
+func TestEscapedWordsReadByEveryDecider(t *testing.T) {
+	for _, esc := range []bool{true, false} {
+		say := func(s string) []byte {
+			if !esc {
+				return []byte(`{"error":{"message":"` + s + `"}}`)
+			}
+			q, _ := json.Marshal(s)
+			// as Python's json.dumps writes it
+			var b strings.Builder
+			for _, r := range string(q) {
+				if r > 127 {
+					fmt.Fprintf(&b, `\u%04x`, r)
+				} else {
+					b.WriteRune(r)
+				}
+			}
+			return []byte(`{"error":{"message":` + b.String() + `}}`)
+		}
+		if !overflowed(400, say("上下文长度超过限制")) {
+			t.Errorf("escaped %v: 上下文长度超过限制 not overflowed", esc)
+		}
+		if modelRetired(410, say("Model m1 has been deprecated, 额度已用完")) {
+			t.Errorf("escaped %v: a retirement that says the quota is spent rests the model alone", esc)
+		}
+		if shapeRefused(400, say("Unknown parameter: 'x'. 额度已用完")) {
+			t.Errorf("escaped %v: a shape refusal that says the quota is spent rests nobody", esc)
+		}
+		p := provider.Provider{ID: "fake", Name: "Fake", Contexts: map[string]int{"m": 100}}
+		if said, ok := tooLongUnsaid(p, "m", 1000, 0, 400, say("该模型不支持当前令牌计划")); ok {
+			t.Errorf("escaped %v: a model the plan doesn't serve told as too long: %s", esc, said)
+		}
 	}
 }
 

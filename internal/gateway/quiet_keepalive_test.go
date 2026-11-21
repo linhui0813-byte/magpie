@@ -66,6 +66,13 @@ func quietOn(t *testing.T, id, before, after string, heard <-chan struct{}) *ato
 // took.
 func askChat(t *testing.T, s *Server, model string, heard chan struct{}) (int, string, time.Duration) {
 	t.Helper()
+	return askChatAfter(t, s, model, heard, "")
+}
+
+// askChatAfter is askChat closing heard at the first keepalive after after
+// (readQuiet).
+func askChatAfter(t *testing.T, s *Server, model string, heard chan struct{}, after string) (int, string, time.Duration) {
+	t.Helper()
 	gw := httptest.NewServer(s.Handler())
 	t.Cleanup(gw.Close)
 	began := time.Now()
@@ -76,20 +83,42 @@ func askChat(t *testing.T, s *Server, model string, heard chan struct{}) (int, s
 	}
 	headers := time.Since(began)
 	defer resp.Body.Close()
+	return resp.StatusCode, readQuiet(resp.Body, heard, after), headers
+}
+
+// readQuiet reads a stream to its end, closing heard at its first
+// keepalive once after has come in it. A keepalive may come before the
+// vendor's first words as well, the vendor slow to send them, or the try
+// slow to read them, with the stream held and nothing of it sent: that is
+// the held stream's (TestSilentHeldStreamKeptAlive), and says nothing of a
+// quiet after them.
+func readQuiet(r io.Reader, heard chan struct{}, after string) string {
 	var once sync.Once
 	var body strings.Builder
-	rd := bufio.NewReader(resp.Body)
+	rd := bufio.NewReader(r)
 	for {
 		line, err := rd.ReadString('\n')
 		body.WriteString(line)
-		if strings.HasPrefix(line, ": keepalive") {
+		if strings.HasPrefix(line, ": keepalive") && strings.Contains(body.String(), after) {
 			once.Do(func() { close(heard) })
 		}
 		if err != nil {
-			break
+			return body.String()
 		}
 	}
-	return resp.StatusCode, body.String(), headers
+}
+
+// aliveAfter is where body's first keepalive after after is, or -1.
+func aliveAfter(body, after string) int {
+	i := strings.Index(body, after)
+	if i < 0 {
+		return -1
+	}
+	j := strings.Index(body[i:], ": keepalive")
+	if j < 0 {
+		return -1
+	}
+	return i + j
 }
 
 // A vendor that sent its 200 and response.created, then nothing while it
@@ -116,15 +145,16 @@ func TestSilentHeldStreamKeptAlive(t *testing.T) {
 // One quiet mid-reply, its first words sent: a translated reply's client
 // was kept alive only as its vendor sent something, so a vendor that said
 // nothing at all left it to the proxy's timeout, which reset the stream
-// (#947, "INTERNAL_ERROR; received from peer").
+// (#947, "INTERNAL_ERROR; received from peer"). The keepalive this is
+// about is the one after them (readQuiet).
 func TestQuietStreamMidReplyKeptAlive(t *testing.T) {
 	fresh(t)
 	quietFast(t)
 	heard := make(chan struct{})
 	timedOut := quietOn(t, "fixture", quietCreated+quietDelta("hel"), quietDelta("lo")+quietDone, heard)
-	code, body, _ := askChat(t, New(), "fixture/gpt-test", heard)
-	alive := strings.Index(body, ": keepalive")
-	if timedOut.Load() || code != 200 || alive < 0 || !strings.Contains(body[:alive], "hel") || !strings.Contains(body[alive:], `"lo"`) || !strings.Contains(body, "[DONE]") {
+	code, body, _ := askChatAfter(t, New(), "fixture/gpt-test", heard, "hel")
+	alive := aliveAfter(body, "hel")
+	if timedOut.Load() || code != 200 || alive < 0 || !strings.Contains(body[alive:], `"lo"`) || !strings.Contains(body, "[DONE]") {
 		t.Fatalf("timed out %v: %d %q", timedOut.Load(), code, body)
 	}
 }
@@ -154,25 +184,46 @@ func TestSilentHeldStreamStillFailsOver(t *testing.T) {
 	}
 }
 
-// A vendor quiet for longer than keepaliveLongest is no longer covered
-// for: the comments stop, for a stuck stream to end at a timeout.
+// A vendor quiet for longer than translatedQuietLongest, which both the
+// held stream's comments (keepQuiet) and a translated stream's own
+// (keepThroughSilence) cover, is let go: the client is told so as its
+// stream's error, not left with comments that stop and then silence
+// (Wing8Aqua on X; TestQuietClaudeStreamStuckEndsWithAnError).
 func TestQuietKeptAliveOnlySoLong(t *testing.T) {
 	fresh(t)
 	quietFast(t)
 	keepaliveLongest = 200 * time.Millisecond
+	was := translatedQuietLongest
+	translatedQuietLongest = 200 * time.Millisecond
+	t.Cleanup(func() { translatedQuietLongest = was })
 	never := make(chan struct{})
 	quietOn(t, "fixture", quietCreated+quietDelta("hel"), quietDelta("lo")+quietDone, never)
 	gw := httptest.NewServer(New().Handler())
 	t.Cleanup(gw.Close)
+	began := time.Now()
 	resp, err := http.Post(gw.URL+"/v1/chat/completions", "application/json",
 		strings.NewReader(`{"model":"fixture/gpt-test","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
-	b, _ := io.ReadAll(resp.Body) // the vendor goes on after 3s
-	if n := strings.Count(string(b), ": keepalive"); n == 0 || n > 8 {
-		t.Fatalf("%d keepalives in 3s, kept for 200ms: %q", n, b)
+	b, _ := io.ReadAll(resp.Body) // the vendor would go on after 3s
+	took := time.Since(began)
+	body := string(b)
+	i := strings.Index(body, "hel")
+	if i < 0 || strings.Contains(body, `"lo"`) {
+		t.Fatalf("%q", body)
+	}
+	if !strings.Contains(body[i:], "Fixture sent nothing for") || !strings.Contains(body[i:], `"error"`) {
+		t.Fatalf("the stuck vendor's stream ended with no error: %q", body)
+	}
+	if took >= 2500*time.Millisecond {
+		t.Fatalf("ended after %v, the vendor's own 3s: it wasn't let go", took)
+	}
+	// kept alive until then: 200ms at one each 40ms, from each keeper,
+	// with room
+	if n := strings.Count(body[i:], ": keepalive"); n == 0 || n > 24 {
+		t.Fatalf("%d keepalives: %q", n, body)
 	}
 }
 
@@ -204,6 +255,8 @@ func TestQuietStreamsKeptAliveEveryProtocol(t *testing.T) {
 			func(string) string { return chatRole }, chatText, func(string) string { return chatEnd }},
 		{"anthropic from chat", "/v1/messages", `{"model":"q/m","stream":true,"max_tokens":100,"messages":[{"role":"user","content":"hi"}]}`, provider.Chat,
 			func(string) string { return chatRole }, chatText, func(string) string { return chatEnd }},
+		{"chat from anthropic", "/v1/chat/completions", `{"model":"q/m","stream":true,"messages":[{"role":"user","content":"hi"}]}`, provider.Anthropic,
+			func(string) string { return anthropicStart + anthropicBlock }, anthropicText, func(string) string { return anthropicEnd }},
 	} {
 		for _, mid := range []bool{false, true} {
 			t.Run(c.name+map[bool]string{false: " held", true: " mid-reply"}[mid], func(t *testing.T) {
@@ -211,8 +264,10 @@ func TestQuietStreamsKeptAliveEveryProtocol(t *testing.T) {
 				quietFast(t)
 				heard := make(chan struct{})
 				before, after := c.start(""), c.text("lo")+c.end("")
+				said := "" // what the agent has before the quiet
 				if mid {
 					before += c.text("hel")
+					said = "hel"
 				}
 				var timedOut atomic.Bool
 				up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -249,22 +304,9 @@ func TestQuietStreamsKeptAliveEveryProtocol(t *testing.T) {
 					t.Fatal(err)
 				}
 				defer resp.Body.Close()
-				var once sync.Once
-				var body strings.Builder
-				rd := bufio.NewReader(resp.Body)
-				for {
-					line, err := rd.ReadString('\n')
-					body.WriteString(line)
-					if strings.HasPrefix(line, ": keepalive") {
-						once.Do(func() { close(heard) })
-					}
-					if err != nil {
-						break
-					}
-				}
-				b := body.String()
-				alive := strings.Index(b, ": keepalive")
-				if timedOut.Load() || resp.StatusCode != 200 || alive < 0 || !strings.Contains(b[alive:], "lo") || mid && !strings.Contains(b[:alive], "hel") {
+				b := readQuiet(resp.Body, heard, said)
+				alive := aliveAfter(b, said)
+				if timedOut.Load() || resp.StatusCode != 200 || alive < 0 || !strings.Contains(b[alive:], `"lo"`) {
 					t.Fatalf("timed out %v: %d %q", timedOut.Load(), resp.StatusCode, b)
 				}
 			})

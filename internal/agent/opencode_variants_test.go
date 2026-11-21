@@ -27,9 +27,26 @@ func TestOpenCodeVariants(t *testing.T) {
 		// and high of its own
 		{nil, `{}`},
 	} {
-		b, err := json.Marshal(openCodeVariants(c.efforts))
+		b, err := json.Marshal(openCodeVariants(c.efforts, false))
 		if err != nil || string(b) != c.want {
 			t.Errorf("%v: got %s (%v), want %s", c.efforts, b, err, c.want)
+		}
+	}
+	// a model Codex's /fast is asked of: each level again, fast, after them,
+	// the tier both as OpenCode 1 sends an option (service_tier as it is)
+	// and as OpenCode 2 does (extraBody); fast alone with no levels (#2379)
+	for _, c := range []struct {
+		efforts []string
+		want    string
+	}{
+		{[]string{"high", "low"}, `{"low":{"reasoningEffort":"low"},"high":{"reasoningEffort":"high"},` +
+			`"low-fast":{"extraBody":{"service_tier":"priority"},"reasoningEffort":"low","service_tier":"priority"},` +
+			`"high-fast":{"extraBody":{"service_tier":"priority"},"reasoningEffort":"high","service_tier":"priority"}}`},
+		{nil, `{"fast":{"extraBody":{"service_tier":"priority"},"service_tier":"priority"}}`},
+	} {
+		b, err := json.Marshal(openCodeVariants(c.efforts, true))
+		if err != nil || string(b) != c.want {
+			t.Errorf("fast %v: got %s (%v), want %s", c.efforts, b, err, c.want)
 		}
 	}
 }
@@ -112,6 +129,69 @@ func TestOpenCodeVariantsInOrder(t *testing.T) {
 	}
 	if b2, _ := os.ReadFile(path); !bytes.Equal(b, b2) {
 		t.Fatalf("rewritten though in order:\n%s\n%s", b, b2)
+	}
+}
+
+// modelKeys are the ids of magpie's models in an opencode config at path,
+// in the order the file's bytes list them.
+func modelKeys(t *testing.T, path string) []string {
+	t.Helper()
+	raw, ok := edit.GetJSON(path, "provider.magpie.models")
+	if !ok {
+		t.Fatalf("no models of magpie's in %s", path)
+	}
+	var out []string
+	for _, p := range objectPairs([]byte(raw)) {
+		out = append(out, p.k)
+	}
+	return out
+}
+
+// TestOpenCodeModelsInOrder: opencode.json lists magpie's models in the
+// order the user dragged them to on the Agents page (#4575); they were
+// alphabetical — the models were a map, whose keys marshal sorted, and a
+// pure re-ordering wasn't even written, the file and the new block sorting
+// alike. The variants under each model kept theirs since #713.
+func TestOpenCodeModelsInOrder(t *testing.T) {
+	home := syncHome(t)
+	// a provider the catalog lists after relay's, whose models sort before:
+	// magpie's own order and the alphabetical one differ
+	if err := provider.Save(provider.Provider{ID: "aaa", Name: "AAA", Key: "k", Chat: "http://127.0.0.1:1/v1", Models: []string{"m1"}}); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(home, ".config", "opencode", "opencode.json")
+	writeFile(t, path, `{"theme":"dark"}`)
+	if err := opencode(home, filepath.Join(home, ".config")).Field("model").Set("magpie/relay/glm-4.6"); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"relay/glm-4.6", "aaa/m1"}
+	if got := modelKeys(t, path); !slices.Equal(got, want) {
+		t.Fatalf("written: %v, want %v\n%s", got, want, readFile(path))
+	}
+	if err := provider.SetModelOrder("opencode", []string{"aaa/m1"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := opencode(home, filepath.Join(home, ".config")).Sync(); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(path)
+	if got := modelKeys(t, path); !slices.Equal(got, []string{"aaa/m1", "relay/glm-4.6"}) {
+		t.Fatalf("reordered: %v, want aaa/m1 first\n%s", got, b)
+	}
+	if err := opencode(home, filepath.Join(home, ".config")).Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if b2, _ := os.ReadFile(path); !bytes.Equal(b, b2) {
+		t.Fatalf("rewritten though in order:\n%s\n%s", b, b2)
+	}
+	if err := provider.SetModelOrder("opencode", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := opencode(home, filepath.Join(home, ".config")).Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if got := modelKeys(t, path); !slices.Equal(got, want) {
+		t.Fatalf("default: %v, want %v\n%s", got, want, readFile(path))
 	}
 }
 
@@ -215,7 +295,9 @@ func TestOpenCodeWritesVariants(t *testing.T) {
 // thinking switch alone, gets no variants in opencode.json — under Xiaomi's
 // preset or a relay of the user's alike — and no thinking levels in Pi:
 // OpenCode offered it the resellers' levels up to max, which Xiaomi turns
-// away with a 400 (#214). A model no maker lists keeps the resellers'.
+// away with a 400 (#214). A model no maker lists keeps the resellers'. Pi is
+// told it reasons, as /v1/models says (#2380), with no map, so Pi offers
+// its own off to high and never xhigh or max.
 func TestOpenCodeNoResellerLevelsForSwitchModel(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -284,7 +366,7 @@ func TestOpenCodeNoResellerLevelsForSwitchModel(t *testing.T) {
 		switch m.ID {
 		case "xiaomi/mimo-v2.6-flash", "relay/mimo-v2.6-flash":
 			seen++
-			if m.Reasoning || m.Levels != nil {
+			if !m.Reasoning || m.Levels != nil {
 				t.Errorf("pi %s: reasoning %v, levels %v", m.ID, m.Reasoning, m.Levels)
 			}
 		case "relay/open-model":

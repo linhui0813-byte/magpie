@@ -18,15 +18,30 @@ type KV struct {
 
 // GetJSON reads a dot-separated key path from a JSON or JSONC file.
 func GetJSON(path, keyPath string) (string, bool) {
-	raw, err := Read(path)
+	raw, err := jsonHeld(path)
 	if err != nil || len(raw) == 0 {
 		return "", false
 	}
-	r := gjson.GetBytes(jsonc.ToJSONInPlace(raw), keyPath)
+	r := gjson.GetBytes(raw, keyPath)
 	if !r.Exists() {
 		return "", false
 	}
 	return r.String(), true
+}
+
+// GetJSONRaw is the value at a dot-separated key path as it is written in
+// the file (a string with its quotes, a number, true), for putting back
+// exactly as it was (a json.RawMessage given to SetJSON).
+func GetJSONRaw(path, keyPath string) (string, bool) {
+	raw, err := jsonHeld(path)
+	if err != nil || len(raw) == 0 {
+		return "", false
+	}
+	r := gjson.GetBytes(raw, keyPath)
+	if !r.Exists() {
+		return "", false
+	}
+	return r.Raw, true
 }
 
 // SetJSON sets one or more key paths in a JSON/JSONC file, preserving
@@ -40,13 +55,18 @@ func SetJSON(path string, kvs ...KV) error {
 		raw = []byte("{}\n")
 	}
 	orig := raw
+	raw = dropLoneCommas(raw)
 	for _, kv := range kvs {
 		raw, err = setJSONBytes(raw, kv.Path, kv.Value)
 		if err != nil {
 			return fmt.Errorf("%s: %w", path, err)
 		}
 	}
-	return WriteAtomic(path, keepCRLF(raw, orig))
+	out, err := checkJSONC(keepCRLF(raw, orig), dropLoneCommas(orig))
+	if err != nil {
+		return fmt.Errorf("%s: %w", path, err)
+	}
+	return WriteAtomic(path, out)
 }
 
 // keepCRLF is out, an edit of orig, with \r\n at every line break when orig
@@ -61,12 +81,15 @@ func keepCRLF(out, orig []byte) []byte {
 	return bytes.ReplaceAll(out, []byte("\n"), []byte("\r\n"))
 }
 
-// PatchJSON computes a config change without writing a file.
+// PatchJSON computes a config change without writing a file. A byte order
+// mark raw starts with is read through and kept.
 func PatchJSON(raw []byte, set []KV, del []string) ([]byte, error) {
+	raw, marked := bytes.CutPrefix(raw, bom)
 	if len(bytes.TrimSpace(raw)) == 0 {
 		raw = []byte("{}\n")
 	}
 	orig := raw
+	raw = dropLoneCommas(raw)
 	var err error
 	for _, kv := range set {
 		raw, err = setJSONBytes(raw, kv.Path, kv.Value)
@@ -80,13 +103,23 @@ func PatchJSON(raw []byte, set []KV, del []string) ([]byte, error) {
 			return nil, err
 		}
 	}
-	return keepCRLF(raw, orig), nil
+	out, err := checkJSONC(keepCRLF(raw, orig), dropLoneCommas(orig))
+	if err != nil {
+		return nil, err
+	}
+	if marked {
+		return append(append([]byte(nil), bom...), out...), nil
+	}
+	return out, nil
 }
 
 func setJSONBytes(raw []byte, keyPath string, value any) ([]byte, error) {
 	// Comments are blanked out in a copy of identical length so gjson offsets
 	// map 1:1 back onto the original bytes.
 	stripped := jsonc.ToJSONInPlace(append([]byte(nil), raw...))
+	if !json.Valid(stripped) {
+		return nil, fmt.Errorf("invalid JSON/JSONC")
+	}
 	root := gjson.ParseBytes(stripped)
 	if !root.IsObject() {
 		return nil, fmt.Errorf("top level is not a JSON object")
@@ -132,8 +165,22 @@ func splitPath(keyPath string) []string {
 	return append(parts, keyPath[start:])
 }
 
-// unescapeKey is a key path's part as the key it names.
-func unescapeKey(part string) string { return strings.ReplaceAll(part, `\.`, ".") }
+// unescapeKey is a key path's part as the key it names: each character
+// after a backslash as it is, as gjson.Escape writes them (a model id's
+// '.', a '*' or '?' gjson would match on).
+func unescapeKey(part string) string {
+	if !strings.Contains(part, `\`) {
+		return part
+	}
+	var b strings.Builder
+	for i := 0; i < len(part); i++ {
+		if part[i] == '\\' && i+1 < len(part) {
+			i++
+		}
+		b.WriteByte(part[i])
+	}
+	return b.String()
+}
 
 func splice(raw []byte, at, n int, with []byte) ([]byte, error) {
 	out := make([]byte, 0, len(raw)-n+len(with))
@@ -157,11 +204,15 @@ func insertKey(raw, stripped []byte, from int, key string, value any) ([]byte, e
 	k, _ := json.Marshal(key)
 	pretty := bytes.IndexByte(raw, '\n') >= 0
 	empty := len(bytes.TrimSpace(raw[open+1:close])) == 0
+	// an object of comments only has no member for the new one to come
+	// before: a comma after it would be the object's trailing comma, which
+	// only some apps read
+	members := len(bytes.TrimSpace(stripped[open+1:close])) > 0
 
 	if !pretty {
 		v, _ := json.Marshal(value)
 		ins := string(k) + ":" + string(v)
-		if !empty {
+		if members {
 			ins += ","
 		}
 		return splice(raw, open+1, 0, []byte(ins))
@@ -174,6 +225,9 @@ func insertKey(raw, stripped []byte, from int, key string, value any) ([]byte, e
 	kv := child + string(k) + ": " + string(v)
 	if empty {
 		return splice(raw, open, close-open+1, []byte("{\n"+kv+"\n"+base+"}"))
+	}
+	if !members {
+		return splice(raw, open+1, 0, []byte("\n"+kv))
 	}
 	return splice(raw, open+1, 0, []byte("\n"+kv+","))
 }
@@ -248,6 +302,8 @@ func DelJSON(path string, keyPaths ...string) error {
 	if err != nil || len(bytes.TrimSpace(raw)) == 0 {
 		return err
 	}
+	orig := raw
+	raw = dropLoneCommas(raw)
 	changed := false
 	for _, kp := range keyPaths {
 		out, ok, err := delJSONBytes(raw, kp)
@@ -261,11 +317,31 @@ func DelJSON(path string, keyPaths ...string) error {
 	if !changed {
 		return nil
 	}
-	return WriteAtomic(path, raw)
+	out, err := checkJSONC(raw, dropLoneCommas(orig))
+	if err != nil {
+		return fmt.Errorf("%s: %w", path, err)
+	}
+	return WriteAtomic(path, out)
+}
+
+// pastLineEnd is i past the line end raw has at i, \n or \r\n, else i: a
+// member deleted with its line takes the whole line end along, so a CRLF
+// file isn't left a blank line.
+func pastLineEnd(raw []byte, i int) int {
+	switch {
+	case bytes.HasPrefix(raw[i:], []byte("\r\n")):
+		return i + 2
+	case bytes.HasPrefix(raw[i:], []byte("\n")):
+		return i + 1
+	}
+	return i
 }
 
 func delJSONBytes(raw []byte, keyPath string) ([]byte, bool, error) {
 	stripped := jsonc.ToJSONInPlace(append([]byte(nil), raw...))
+	if !json.Valid(stripped) {
+		return nil, false, fmt.Errorf("invalid JSON/JSONC")
+	}
 	r := gjson.GetBytes(stripped, keyPath)
 	if !r.Exists() || r.Index == 0 {
 		return raw, false, nil
@@ -300,17 +376,26 @@ func delJSONBytes(raw []byte, keyPath string) ([]byte, bool, error) {
 		to = j + 1
 		if alone {
 			from = ls
-			if to < len(raw) && raw[to] == '\n' {
-				to++
-			}
+			to = pastLineEnd(raw, to)
 		}
 		out, _ = splice(raw, from, to-from, nil)
 	} else {
-		// last member: drop the line, then the comma that preceded it
+		// last member: its own trailing comma goes (jsonc blanks it in
+		// stripped, so it isn't seen above), or the only member's would be
+		// left with nothing before it, "{ , }", which OpenCode calls invalid
+		if t := nextToken(raw, b); t < len(raw) && raw[t] == ',' {
+			raw = append(raw[:t:t], raw[t+1:]...)
+			stripped = append(stripped[:t:t], stripped[t+1:]...)
+		}
+		// then drop the line, and the comma that preceded it
 		if alone {
 			from = ls
-			if to < len(raw) && raw[to] == '\n' {
-				to++
+			e := to
+			for e < len(raw) && (raw[e] == ' ' || raw[e] == '\t') {
+				e++
+			}
+			if p := pastLineEnd(raw, e); p > e {
+				to = p
 			}
 		}
 		out, _ = splice(raw, from, to-from, nil)

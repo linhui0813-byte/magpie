@@ -25,6 +25,13 @@ import (
 // takeEdits takes into the library the newest edit made in an agent's copy
 // of each of its skills, before the sync gives the library's to the agents.
 func (l *Library) takeEdits(targets []*Target, res *Result) {
+	failed := func(agent, name, p string, err error) {
+		res.fail(agent, "skill:"+name, err)
+		if l.blockedSkills == nil {
+			l.blockedSkills = map[string]bool{}
+		}
+		l.blockedSkills[realDir(p)] = true
+	}
 	for _, s := range l.Skills {
 		lib := realDir(skillDir(s.Name))
 		if l.libHash(s.Name) == "" {
@@ -37,10 +44,15 @@ func (l *Library) takeEdits(targets []*Target, res *Result) {
 		var edits []edit
 		seen := map[string]bool{}
 		for _, t := range targets {
-			if t.Skills == "" || t.Desktop != nil || !slices.Contains(s.Agents, t.Agent.ID) {
+			if t.Skills == "" || t.Desktop != nil || t.Unreached != nil || !s.gives(t.Agent.ID) {
 				continue
 			}
 			p := filepath.Join(t.Skills, s.Name)
+			// an agent in WSL linked to magpie's copy there: an edit made
+			// through the link is in that copy (wsl_skills.go)
+			if t.Store != "" && ours(p, s.Name) && linked(p) {
+				p = filepath.Join(t.Store, s.Name)
+			}
 			if !ours(p, s.Name) || linked(p) || seen[realDir(p)] {
 				continue
 			}
@@ -49,7 +61,11 @@ func (l *Library) takeEdits(targets []*Target, res *Result) {
 			if !ok {
 				continue
 			}
-			at := changedAt(p)
+			at, err := changedAt(p)
+			if err != nil {
+				failed(t.Agent.ID, s.Name, p, err)
+				continue
+			}
 			if !at.After(made) {
 				if l.untouched == nil {
 					l.untouched = map[string]bool{}
@@ -62,13 +78,66 @@ func (l *Library) takeEdits(targets []*Target, res *Result) {
 			}
 			edits = append(edits, edit{t.Agent.ID, p, at})
 		}
+		// a copy outside an agent's own folder: an edit made there is the
+		// library's to take as one in an agent's copy is
+		// (a project's that can't be read is said by its sync, as one)
+		other := func(agent, p string) {
+			if seen[realDir(p)] || !ours(p, s.Name) || linked(p) {
+				return
+			}
+			seen[realDir(p)] = true
+			made, ok := copiedAt(p)
+			if !ok {
+				return
+			}
+			at, err := changedAt(p)
+			switch {
+			case err != nil:
+				if agent != "project" {
+					failed(agent, s.Name, p, err)
+				}
+			case !at.After(made):
+				if l.untouched == nil {
+					l.untouched = map[string]bool{}
+				}
+				l.untouched[p] = true
+			case !sameTree(p, lib):
+				edits = append(edits, edit{agent, p, at})
+			}
+		}
+		// the shared copy (#4958), in ~/.agents/skills where no link could
+		// be made (Windows without the right to), before syncShared sets
+		// the stale copy aside. An agent whose own folder that is has had
+		// its copy read above.
+		if !seen[realDir(sharedSkillsDir())] {
+			other("agents", filepath.Join(sharedSkillsDir(), s.Name))
+		}
+		// a project's copies: of a project that takes copies, and those
+		// of an agent that skips a junction (#6610), where a link was
+		// edited in place in the library's own folder
+		for _, p := range l.Projects {
+			for _, f := range append([]*Project{p}, p.Trees...) {
+				for _, e := range f.Placed {
+					if filepath.Base(filepath.FromSlash(e)) == s.Name {
+						other("project", filepath.Join(f.Dir, filepath.FromSlash(e)))
+					}
+				}
+			}
+		}
 		if len(edits) == 0 {
 			continue
 		}
 		// the newest edit, unless the library changed after it
 		slices.SortStableFunc(edits, func(a, b edit) int { return b.at.Compare(a.at) })
+		at, err := changedAt(lib)
+		if err != nil {
+			for _, e := range edits {
+				failed(e.agent, s.Name, e.path, err)
+			}
+			continue
+		}
 		won := -1
-		if edits[0].at.After(changedAt(lib)) {
+		if edits[0].at.After(at) {
 			won = 0
 		}
 		if won == 0 {
@@ -120,12 +189,12 @@ func copiedAt(p string) (time.Time, bool) {
 // changedAt is when anything in the folder last changed: the newest time
 // of what is in it, a file or a folder (one taken away changes its
 // folder's), leaving aside magpie's mark and what Finder or version
-// control keep in it.
-func changedAt(dir string) time.Time {
+// control keep in it. An incomplete walk can't establish when it changed.
+func changedAt(dir string) (time.Time, error) {
 	var at time.Time
-	filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
+	err := filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
-			return nil
+			return err
 		}
 		if p != dir && skipInSkill(d.Name()) {
 			if d.IsDir() {
@@ -133,12 +202,16 @@ func changedAt(dir string) time.Time {
 			}
 			return nil
 		}
-		if fi, err := d.Info(); err == nil && fi.ModTime().After(at) {
+		fi, err := d.Info()
+		if err != nil {
+			return err
+		}
+		if fi.ModTime().After(at) {
 			at = fi.ModTime()
 		}
 		return nil
 	})
-	return at
+	return at, err
 }
 
 func skipInSkill(name string) bool {

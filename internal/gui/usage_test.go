@@ -326,6 +326,16 @@ func TestCSVStamp(t *testing.T) {
 			t.Fatalf("%q: %s", day, got)
 		}
 	}
+	// a rolling window's name has no colon, which Windows refuses (#2075)
+	p, _ := usage.LastOf(24 * time.Hour)
+	if got := csvStamp(p, "", now); strings.ContainsAny(got, `:/\\`) {
+		t.Errorf("rolling window: %s", got)
+	}
+	// nor has a range whose ends name their minutes
+	r, _ := usage.RangeOf("2026-09-29T09:30", "2026-09-30T18:00")
+	if got := csvStamp(r, "", now); got != "magpie-requests-2026-09-29T0930-to-2026-09-30T1800" {
+		t.Errorf("range of minutes: %s", got)
+	}
 }
 
 // midnightUsageClock sets usage.Clock to read a tenth of a second before
@@ -376,5 +386,34 @@ func TestUsageCSVAtMidnight(t *testing.T) {
 	}
 	if err := json.Unmarshal(w.Body.Bytes(), &out); w.Code != 200 || err != nil || out.Rows != 1 || out.Path != filepath.Join("~", "Downloads", want) {
 		t.Errorf("export: %d %s, want %s with 1 row", w.Code, w.Body, want)
+	}
+}
+
+// GET /api/usage/heatmap (#1369): the last 53 weeks a day each, of the
+// requests the page's filters keep (here the provider), every day's though a
+// day is picked on the page.
+func TestUsageHeatmapRoute(t *testing.T) {
+	sandboxHome(t)
+	now := holdUsageClock(t, time.Date(2026, 10, 9, 12, 0, 0, 0, time.Local))
+	for i, at := range []time.Time{now.AddDate(0, 0, -380), now.AddDate(0, 0, -100), now.AddDate(0, 0, -1), now.Add(-time.Hour)} {
+		usage.Append(usage.Record{Time: at, Agent: "codex", Provider: "relay", Model: "m", Input: 10 + i, Output: 1, Status: 200})
+	}
+	usage.Append(usage.Record{Time: now.Add(-time.Hour), Agent: "claude", Provider: "anthropic", Model: "m", Input: 500, Status: 200})
+	mux := http.NewServeMux()
+	usageRoutes(mux, folderOnly{})
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, httptest.NewRequest("GET", "/api/usage/heatmap?provider=relay&day=2026-10-09&period=today", nil))
+	var h usage.Heatmap
+	if err := json.Unmarshal(w.Body.Bytes(), &h); w.Code != 200 || err != nil {
+		t.Fatalf("heatmap: %d %s", w.Code, w.Body)
+	}
+	if h.From != "2025-10-06" || h.To != "2026-10-09" || len(h.Days) != 3 {
+		t.Fatalf("heatmap: %s", w.Body)
+	}
+	if d := h.Days[0]; d.Date != now.AddDate(0, 0, -100).Format(time.DateOnly) || d.Calls != 1 || d.Tokens != 12 {
+		t.Fatalf("100 days ago: %+v", d)
+	}
+	if d := h.Days[2]; d.Date != "2026-10-09" || d.Calls != 1 || d.Tokens != 14 {
+		t.Fatalf("today: %+v", d)
 	}
 }

@@ -18,13 +18,29 @@ import (
 type fastUp struct {
 	mu                    sync.Mutex
 	host, path, beta, raw string
+	// refuseTier turns service_tier away as OpenAI does on a model
+	// without it; refused counts the times
+	refuseTier bool
+	refused    int
+	calls      int
 }
 
 func (u *fastUp) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	b, _ := io.ReadAll(r.Body)
 	u.mu.Lock()
 	u.path, u.beta, u.raw = r.URL.Path, r.Header.Get("anthropic-beta"), string(b)
+	u.calls++
+	refuse := u.refuseTier && strings.Contains(string(b), `"service_tier"`)
+	if refuse {
+		u.refused++
+	}
 	u.mu.Unlock()
+	if refuse {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(400)
+		io.WriteString(w, `{"error":{"message":"Unsupported parameter: 'service_tier' is not supported with this model.","param":"service_tier","code":"unsupported_parameter"}}`)
+		return
+	}
 	if strings.Contains(string(b), `"stream":true`) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		switch {
@@ -83,14 +99,14 @@ func fasted(t *testing.T) (*Server, *fastUp) {
 	for _, p := range []provider.Provider{
 		{ID: "oa", Name: "OpenAI", Key: "ko", Chat: "https://api.openai.com/v1", Responses: "https://api.openai.com/v1", Models: []string{"gpt-6.1-sol", "gpt-6.1-mini"}},
 		{ID: "an", Name: "Anthropic", Key: "ka", Anthropic: "https://api.anthropic.com", Models: []string{"claude-opus-5-5", "claude-sonnet-5"}},
-		{ID: "rl", Name: "Relay", Key: "kr", Chat: "https://relay.example/v1", Models: []string{"gpt-6.1-sol"}},
+		{ID: "rl", Name: "Relay", Key: "kr", Chat: "https://relay.example/v1", Models: []string{"gpt-6.1-sol", "glm-5"}},
 	} {
 		if err := provider.Save(p); err != nil {
 			t.Fatal(err)
 		}
 	}
 	s := New()
-	s.client = &http.Client{Transport: qoderRoundTrip(func(r *http.Request) (*http.Response, error) {
+	s.client = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		up.mu.Lock()
 		up.host = r.URL.Host
 		up.mu.Unlock()
@@ -208,18 +224,88 @@ func TestFastMemberLeftAlone(t *testing.T) {
 	saveFastGroup(t, []string{"an/claude-opus-5-5"}, nil)
 	check("opus not fast")
 	// fast saved while it was OpenAI's, the provider's address since moved
-	// to a relay: the member stays, sent as asked
+	// to a relay on Anthropic's API only: the member stays, sent as asked
 	saveFastGroup(t, []string{"oa/gpt-6.1-sol:fast"}, nil)
 	p, _ := provider.Find("oa")
-	p.Chat, p.Responses = "https://relay.example/v1", ""
+	p.Chat, p.Responses, p.Anthropic = "", "", "https://relay.example"
 	if err := provider.Save(*p); err != nil {
 		t.Fatal(err)
 	}
 	check("moved to a relay")
-	for _, m := range []string{"rl/gpt-6.1-sol:fast", "an/claude-sonnet-5:fast"} {
+	for _, m := range []string{"rl/glm-5:fast", "an/claude-sonnet-5:fast"} {
 		if err := provider.SaveGroup(provider.Group{ID: "g", Members: []string{m}}); err == nil || !strings.Contains(err.Error(), "no fast mode") {
 			t.Errorf("%s saved: %v", m, err)
 		}
+	}
+}
+
+// A GPT model on a provider the user added by its address, sent fast
+// (#1615, iomect): it is asked for priority on the provider's OpenAI API,
+// whichever API the agent spoke, never Claude's speed or its beta.
+func TestFastMemberOwnProvider(t *testing.T) {
+	s, up := fasted(t)
+	saveFastGroup(t, []string{"rl/gpt-6.1-sol:fast"}, nil)
+	for _, a := range fastAsks {
+		r := postProto(t, s, a.path, a.body)
+		host, path, beta, body := up.last(t)
+		if host != "relay.example" || body["service_tier"] != "priority" || body["model"] != "gpt-6.1-sol" {
+			t.Fatalf("%s: sent to %s%s %v", a.name, host, path, body)
+		}
+		if _, ok := body["speed"]; ok || strings.Contains(beta, claudeFastBeta) {
+			t.Errorf("%s: Claude's speed sent %v %q", a.name, body, beta)
+		}
+		if len(r.Tries) != 1 || !r.Tries[0].Fast {
+			t.Fatalf("%s: traced %+v", a.name, r.Tries)
+		}
+	}
+	// one that serves Anthropic's API as well has an agent on it relayed
+	// there as it is: never with Claude's speed, which a relay may turn
+	// away (or bill), only the tier where it is asked on an OpenAI API
+	p, _ := provider.Find("rl")
+	p.Anthropic = "https://relay.example"
+	if err := provider.Save(*p); err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range fastAsks {
+		postProto(t, s, a.path, a.body)
+		_, path, beta, body := up.last(t)
+		if _, ok := body["speed"]; ok || strings.Contains(beta, claudeFastBeta) {
+			t.Errorf("both APIs, %s: Claude's speed sent to %s %v %q", a.name, path, body, beta)
+		}
+		if !strings.HasSuffix(path, "/messages") && body["service_tier"] != "priority" {
+			t.Errorf("both APIs, %s: no tier to %s %v", a.name, path, body)
+		}
+	}
+	// not switched fast, it is sent no tier
+	saveFastGroup(t, []string{"rl/gpt-6.1-sol"}, nil)
+	for _, a := range fastAsks {
+		postProto(t, s, a.path, a.body)
+		if _, _, _, body := up.last(t); body["service_tier"] != nil {
+			t.Errorf("%s: tier sent unasked %v", a.name, body)
+		}
+	}
+}
+
+// One that turns the field away is asked again without it, and not sent it
+// again, whichever API the agent spoke.
+func TestFastMemberOwnProviderRefusing(t *testing.T) {
+	for _, a := range fastAsks {
+		t.Run(a.name, func(t *testing.T) {
+			s, up := fasted(t)
+			up.refuseTier = true
+			saveFastGroup(t, []string{"rl/gpt-6.1-sol:fast"}, nil)
+			for range 2 {
+				postProto(t, s, a.path, a.body)
+				if _, _, _, body := up.last(t); body["service_tier"] != nil {
+					t.Fatalf("answered with the tier %v", body)
+				}
+			}
+			up.mu.Lock()
+			defer up.mu.Unlock()
+			if up.refused != 1 || up.calls != 3 {
+				t.Errorf("refused %d times in %d calls, want once in 3", up.refused, up.calls)
+			}
+		})
 	}
 }
 
@@ -265,5 +351,58 @@ func TestWithFastWire(t *testing.T) {
 		if got := strings.Contains(string(buildResponses(r, "gpt-6.1-sol", host, false)), `"service_tier":"priority"`); got != want {
 			t.Errorf("responses %s: tier %v, want %v", host, got, want)
 		}
+	}
+}
+
+// The tier a member on a provider the user added goes at (KoiLx0 on X: a
+// relay that serves Ultrafast), for each of the group's speeds and the
+// provider's extra body, whichever API the agent spoke. The extra body's
+// service_tier fills in a member not sent fast; sent fast, the member is
+// never sent slower than the extra body asks (its Ultrafast stays), and
+// sent Ultrafast it is asked for it; a forced "!service_tier" goes over
+// all of them as it says.
+func TestFastMemberOwnProviderExtraTier(t *testing.T) {
+	cases := []struct {
+		name  string
+		extra provider.ExtraBody
+		fast  bool
+		ultra bool
+		want  any
+	}{
+		{"usual, no extra", nil, false, false, nil},
+		{"usual, extra ultrafast", provider.ExtraBody{"service_tier": json.RawMessage(`"ultrafast"`)}, false, false, "ultrafast"},
+		{"fast, extra ultrafast", provider.ExtraBody{"service_tier": json.RawMessage(`"ultrafast"`)}, true, false, "ultrafast"},
+		{"ultrafast, no extra", nil, true, true, "ultrafast"},
+		{"ultrafast, extra ultrafast", provider.ExtraBody{"service_tier": json.RawMessage(`"ultrafast"`)}, true, true, "ultrafast"},
+		{"fast, extra flex", provider.ExtraBody{"service_tier": json.RawMessage(`"flex"`)}, true, false, "priority"},
+		{"fast, forced flex", provider.ExtraBody{"!service_tier": json.RawMessage(`"flex"`)}, true, false, "flex"},
+		{"ultrafast, forced priority", provider.ExtraBody{"!service_tier": json.RawMessage(`"priority"`)}, true, true, "priority"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s, up := fasted(t)
+			p, _ := provider.Find("rl")
+			p.ExtraBody = c.extra
+			if err := provider.Save(*p); err != nil {
+				t.Fatal(err)
+			}
+			g := provider.Group{ID: "f", Name: "F", Members: []string{"rl/gpt-6.1-sol"}, Routing: provider.Ordered}
+			if c.fast {
+				g.Fast = []string{"rl/gpt-6.1-sol"}
+			}
+			if c.ultra {
+				g.Ultra = []string{"rl/gpt-6.1-sol"}
+			}
+			if err := provider.SaveGroup(g); err != nil {
+				t.Fatal(err)
+			}
+			for _, a := range fastAsks {
+				postProto(t, s, a.path, a.body)
+				host, path, _, body := up.last(t)
+				if host != "relay.example" || body["service_tier"] != c.want {
+					t.Errorf("%s: sent to %s%s service_tier %v, want %v: %v", a.name, host, path, body["service_tier"], c.want, body)
+				}
+			}
+		})
 	}
 }

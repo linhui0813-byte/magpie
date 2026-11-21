@@ -60,7 +60,7 @@ func TestPublicURL(t *testing.T) {
 				if got := PublicHost(); got != "" {
 					t.Errorf("invalid public host: %q", got)
 				}
-				if got := ContainerAddrs(); got != inContainer("/") {
+				if got := ContainerAddrs(); got != (inContainer("/") && !hostNetwork(ifaceNames())) {
 					t.Errorf("invalid URL must be treated as unset in a container: %v", got)
 				}
 				for _, got := range LANURLs() {
@@ -128,10 +128,10 @@ func TestPublicURLWarningOnce(t *testing.T) {
 	}
 }
 
-// OpenToAnyone: the gateway listens beyond loopback (MAGPIE_ADDR) and no key
-// is shared, so anyone who reaches it is let in — the console says so, as
+// OnNetwork: MAGPIE_ADDR puts the gateway beyond loopback, shared or not,
+// so callers from elsewhere need a gateway key — the console says so, as
 // keyNote does.
-func TestOpenToAnyone(t *testing.T) {
+func TestOnNetwork(t *testing.T) {
 	h := t.TempDir()
 	testenv.SetHome(t, h)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(h, ".config"))
@@ -144,16 +144,19 @@ func TestOpenToAnyone(t *testing.T) {
 	}{
 		{"127.0.0.1:3425", false, false},
 		{"127.0.0.1:3425", true, false},
+		{"localhost:3425", false, false},
+		{"[::1]:3425", false, false},
 		{"0.0.0.0:3425", false, true},
-		{"0.0.0.0:3425", true, false},
+		{"0.0.0.0:3425", true, true},
+		{":3425", false, true},
 		{"10.0.0.5:3425", false, true},
-		{"10.0.0.5:3425", true, false},
+		{"10.0.0.5:3425", true, true},
 	} {
 		t.Setenv("MAGPIE_ADDR", c.addr)
 		if err := settings.Save(settings.Settings{LAN: c.lan}); err != nil {
 			t.Fatal(err)
 		}
-		if got := OpenToAnyone(); got != c.want {
+		if got := OnNetwork(); got != c.want {
 			t.Errorf("%s shared=%v: %v, want %v", c.addr, c.lan, got, c.want)
 		}
 	}

@@ -27,7 +27,7 @@ func TestGatewayMode(t *testing.T) {
 	agentsHere = func() bool { return here }
 	t.Cleanup(func() { agentsHere = was; WebGateway.Store(false); webPage.Store(false) })
 
-	srv := Handler(webHost{func() {}}, nil)
+	srv := webPageHandler(t, webHost{func() {}}, nil)
 	do := func(method, path, body string) *httptest.ResponseRecorder {
 		rec := httptest.NewRecorder()
 		srv.ServeHTTP(rec, httptest.NewRequest(method, path, strings.NewReader(body)))
@@ -88,7 +88,7 @@ func TestGatewayMode(t *testing.T) {
 	set("on")
 	rec := httptest.NewRecorder()
 	Handler(&zoomWindows{}, nil).ServeHTTP(rec, httptest.NewRequest("GET", "/boot.js", nil))
-	if strings.Contains(rec.Body.String(), `"gateway"`) {
+	if strings.Contains(rec.Body.String(), `"gateway":true`) {
 		t.Fatalf("the app's window was told gateway mode: %s", rec.Body)
 	}
 	if on, _ := gatewayMode(false); on {

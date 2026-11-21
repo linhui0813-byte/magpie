@@ -52,8 +52,8 @@ function serve(lang, gate, posts) {
 }
 
 const words = {
-  en: { refresh: "Refresh", forget: "Forget", own: "Added by hand" },
-  zh: { refresh: "刷新", forget: "清除", own: "手动添加" },
+  en: { refresh: "Fetch models again", forget: "Forget", own: "Added by hand" },
+  zh: { refresh: "重新获取模型", forget: "清除", own: "手动添加" },
 };
 
 for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium", "webkit"])) {
@@ -70,6 +70,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await browser.close();
       });
       page.setDefaultTimeout(5000);
+      page.setDefaultNavigationTimeout(60000);
       const errors = [];
       page.on("pageerror", (e) => errors.push(e.message));
       const gate = { shut: null, waiting: 0 };

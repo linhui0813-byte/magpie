@@ -21,10 +21,32 @@ const base = () => ({
     { name: "fs", transport: "stdio", command: "npx", args: ["fs-mcp"], agents: ["codex"] },
     { name: "neon", transport: "http", url: "https://mcp.neon.tech/mcp", agents: ["codex", "claude"], signIn: { signedIn: false } },
     { name: "exa", transport: "http", url: "https://mcp.exa.ai/mcp", agents: ["codex"], signIn: { signedIn: false } },
+    { name: "figma", transport: "http", url: "https://mcp.figma.com/mcp", agents: ["claude"], signIn: { signedIn: false } },
+    { name: "sofa", transport: "http", url: "https://agents.stackoverflow.com/mcp", agents: ["claude"], signIn: { signedIn: false } },
+    { name: "notion", transport: "http", url: "https://mcp.notion.com/mcp", agents: ["claude"], signIn: { signedIn: false } },
+    { name: "linear", transport: "http", url: "https://mcp.linear.app/mcp", agents: ["claude"], signIn: { signedIn: false } },
   ],
 });
 // mcpauth.ErrNoSignIn, as the API says it
 const noSignIn = "this server already works without signing in, so there is nothing to sign in to: the agents given it can use it as it is. A key it takes goes in Headers; a server that signs in at another address (as Exa's ?login) needs that URL";
+// mcpauth.ErrClientRefused: Figma's registration 403s any app it doesn't list (#1619)
+const refused = "this server's sign-in admits only the apps it lists and turned magpie away, so magpie can't sign in for the agents. The agents given it still have the server's own address: sign in from each agent itself (in Claude Code, run /mcp and pick the server)";
+
+// mcpauth.ErrTurnedAway: a firewall's 403 page in front of the server
+// (fremontdango on Discord, Cloudflare at agents.stackoverflow.com)
+const turnedAway = "a firewall in front of this server turned magpie's request away (403) before the server could offer a sign-in. It judges the network the request came from: try again on another network, or give magpie a proxy in Settings";
+
+// mcpauth.UnreachableError as api.go says it: the key of unreachableSaid
+// by whether a proxy was used, with the host, the proxy and Go's words
+// (CHENGJIAHEGOXIS on X read Notion's bare "couldn't reach mcp.notion.com:
+// Post …: EOF" as Notion having no sign-in)
+const unreachable = (host, proxy) => ({
+  code: "unreachable", host, proxy, detail: `Post "https://${host}/mcp": EOF`,
+  error: `couldn't reach ${host} (${proxy ? "through the proxy " + proxy : "directly, with no proxy"}): Post "https://${host}/mcp": EOF`,
+  said: proxy
+    ? "magpie got no answer from {host} through the proxy {proxy}, so the sign-in couldn't start. The server's sign-in isn't the problem: the way to {host} is. Check that the proxy reaches {host}, or pick another in Settings › Network and sharing, then click Sign in again ({detail})"
+    : "magpie got no answer from {host}, going direct with no proxy, so the sign-in couldn't start. The server's sign-in isn't the problem: the network between this computer and {host} is. Give magpie a proxy in Settings › Network and sharing, or try another network, then click Sign in again ({detail})",
+});
 
 function server(lang, calls) {
   const lib = base();
@@ -42,6 +64,10 @@ function server(lang, calls) {
       // the backend signs in to the saved URL: Exa's plain one asks for none
       const s = lib.servers.find((x) => x.name === name);
       if (s.url === "https://mcp.exa.ai/mcp") return route.fulfill({ status: 400, json: { error: noSignIn } });
+      if (s.url === "https://mcp.figma.com/mcp") return route.fulfill({ status: 400, json: { error: refused } });
+      if (s.url === "https://agents.stackoverflow.com/mcp") return route.fulfill({ status: 400, json: { error: turnedAway } });
+      if (s.url === "https://mcp.notion.com/mcp") return route.fulfill({ status: 400, json: unreachable("mcp.notion.com", "") });
+      if (s.url === "https://mcp.linear.app/mcp") return route.fulfill({ status: 400, json: unreachable("mcp.linear.app", "http://127.0.0.1:7890") });
       polls = 0;
       // no url: the test's browser opens no window
       return route.fulfill({ json: { id: "s-" + name, server: name, state: "waiting" } });
@@ -77,8 +103,10 @@ function server(lang, calls) {
 }
 
 const words = {
-  en: { signIn: "Sign in", signOut: "Sign out", signed: "Signed in", label: "Sign-in", done: "Signed in to neon — the agents given it use magpie's sign-in", out: "Signed out of neon — the agents are given the server's own address again", exaDone: "Signed in to exa — the agents given it use magpie's sign-in", noSignIn: "already works without signing in" },
-  zh: { signIn: "登录", signOut: "退出登录", signed: "已登录", label: "登录", done: "已登录 neon，分配到它的 agent 共用 magpie 的登录", out: "已退出 neon，agent 改回使用服务器自身的地址", exaDone: "已登录 exa，分配到它的 agent 共用 magpie 的登录", noSignIn: "无需登录即可使用" },
+  en: { signIn: "Sign in", signOut: "Sign out", signed: "Signed in", label: "Sign-in", done: "Signed in to neon — the agents given it use magpie's sign-in", out: "Signed out of neon — the agents are given the server's own address again", exaDone: "Signed in to exa — the agents given it use magpie's sign-in", noSignIn: "already works without signing in", refused: "admits only the apps it lists", turnedAway: "a firewall in front of this server", saveSignIn: "Save and sign in",
+    direct: "magpie got no answer from mcp.notion.com, going direct with no proxy, so the sign-in couldn't start. The server's sign-in isn't the problem", viaProxy: "magpie got no answer from mcp.linear.app through the proxy http://127.0.0.1:7890, so the sign-in couldn't start" },
+  zh: { signIn: "登录", signOut: "退出登录", signed: "已登录", label: "登录", done: "已登录 neon，分配到它的 agent 共用 magpie 的登录", out: "已退出 neon，agent 改回使用服务器自身的地址", exaDone: "已登录 exa，分配到它的 agent 共用 magpie 的登录", noSignIn: "无需登录即可使用", refused: "只接受它列出的应用", turnedAway: "服务器前面的防火墙拦下了", saveSignIn: "保存并登录",
+    direct: "magpie 直连（未用代理）mcp.notion.com 没有得到回应，所以登录没能开始。问题不在服务器的登录", viaProxy: "magpie 通过代理 http://127.0.0.1:7890 访问 mcp.linear.app 没有得到回应" },
 };
 
 for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium", "webkit"])) {
@@ -98,6 +126,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await ctx.addInitScript(() => { try { localStorage.setItem("magpie.libTab", "mcp"); } catch {} });
         const page = await ctx.newPage();
         page.setDefaultTimeout(5000);
+        page.setDefaultNavigationTimeout(60000);
         page.on("pageerror", (e) => errors.push(e.message));
         await page.route("**/*", server(lang, calls));
         await page.goto("http://magpie.test/");
@@ -141,11 +170,11 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await exa.getByRole("button", { name: w.signIn, exact: true }).click();
         await exa.locator(".lib-signin-err", { hasText: w.noSignIn }).waitFor();
         assert.deepEqual(calls.slice(2), ["start exa"]);
-        // the URL changed to ?login: Sign in saves it, the dialog stays,
-        // and the sign-in is to it
+        // the URL changed to ?login: Sign in saves it, and says so (新v学员
+        // on Discord), the dialog stays, and the sign-in is to it
         const urlField = page.locator("#modal .lib-editor input.mono").first();
         await urlField.fill("https://mcp.exa.ai/mcp?login");
-        await exa.getByRole("button", { name: w.signIn, exact: true }).click();
+        await exa.getByRole("button", { name: w.saveSignIn, exact: true }).click();
         await page.waitForFunction((want) => document.querySelector("#status").textContent === want, w.exaDone);
         assert.deepEqual(calls.slice(3), ["save exa https://mcp.exa.ai/mcp?login {}", "start exa"]);
         await exa.locator(".lib-tag", { hasText: w.signed }).waitFor();
@@ -156,6 +185,42 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await page.locator("#modal .lib-editor").waitFor({ state: "detached" });
         assert.deepEqual(calls.slice(5), ["save exa https://mcp.exa.ai/mcp?login {}"]);
         await row("exa").locator(".lib-tag", { hasText: w.signed }).waitFor();
+
+        // Xichun123 (#1619): Figma admits only the apps it lists. The
+        // refusal says so, in the reader's language, and that each agent
+        // signs in itself, not a bare "(403): Forbidden"
+        await row("figma").click();
+        const figma = page.locator("#modal .lib-signin");
+        await figma.getByRole("button", { name: w.signIn, exact: true }).click();
+        await figma.locator(".lib-signin-err", { hasText: w.refused }).waitFor();
+        assert.match(await figma.locator(".lib-signin-err").textContent(), /\/mcp/);
+        assert.deepEqual(calls.slice(6), ["start figma"]);
+        await page.keyboard.press("Escape");
+        await page.locator("#modal .lib-editor").waitFor({ state: "detached" });
+
+        // a firewall's 403 says it was the firewall, judging the network,
+        // in the reader's language, not "says nothing of a sign-in"
+        await row("sofa").click();
+        const sofa = page.locator("#modal .lib-signin");
+        await sofa.getByRole("button", { name: w.signIn, exact: true }).click();
+        await sofa.locator(".lib-signin-err", { hasText: w.turnedAway }).waitFor();
+        assert.deepEqual(calls.slice(7), ["start sofa"]);
+        await page.keyboard.press("Escape");
+        await page.locator("#modal .lib-editor").waitFor({ state: "detached" });
+
+        // a server magpie got no answer from: the network, said with the
+        // way it went and Go's words, in the reader's language, never read
+        // as the server having no sign-in
+        for (const [name, want] of [["notion", w.direct], ["linear", w.viaProxy]]) {
+          await row(name).click();
+          const box = page.locator("#modal .lib-signin");
+          await box.getByRole("button", { name: w.signIn, exact: true }).click();
+          await box.locator(".lib-signin-err", { hasText: want }).waitFor();
+          assert.match(await box.locator(".lib-signin-err").textContent(), /mcp": EOF/);
+          await page.keyboard.press("Escape");
+          await page.locator("#modal .lib-editor").waitFor({ state: "detached" });
+        }
+        assert.deepEqual(calls.slice(8), ["start notion", "start linear"]);
         assert.equal(await scrolled(), before, "no click moved the page");
         await ctx.close();
       });

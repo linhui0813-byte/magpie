@@ -14,6 +14,10 @@ import (
 // ErrCanceled is the administrator's password prompt dismissed.
 var ErrCanceled = errors.New("the update was canceled")
 
+// ErrNoAdmin is no administrator to be had: the system has no prompt for
+// one, or it couldn't be shown. What was to run as one didn't run.
+var ErrNoAdmin = errors.New("no administrator prompt")
+
 // NeedsAdmin reports whether err is magpie not being allowed to change the
 // folder it lives in, which the administrator's password gets past.
 func NeedsAdmin(err error) bool {
@@ -52,12 +56,16 @@ var run = func(name string, args ...string) ([]byte, error) {
 }
 
 // asAdmin runs a shell script as root, after the system's password prompt.
-func asAdmin(script string) error {
+func asAdmin(script string) error { return AsAdmin("magpie is updating itself.", script) }
+
+// AsAdmin runs a shell script as root, after the system's password prompt,
+// which says why (on a Mac). ErrCanceled is the prompt dismissed.
+func AsAdmin(why, script string) error {
 	var out []byte
 	var err error
 	switch runtime.GOOS {
 	case "darwin":
-		out, err = run("osascript", "-e", `do shell script "`+appleString(script)+`" with prompt "magpie is updating itself." with administrator privileges`)
+		out, err = run("osascript", "-e", `do shell script "`+appleString(script)+`" with prompt "`+appleString(why)+`" with administrator privileges`)
 		if err != nil && strings.Contains(string(out), "(-128)") {
 			return ErrCanceled
 		}
@@ -83,6 +91,9 @@ func swapScript(staged, bundle, old string) string {
 	s, b, o := shellQuote(staged), shellQuote(bundle), shellQuote(old)
 	return "rm -rf " + o + " && mv " + b + " " + o + " && if mv " + s + " " + b + "; then rm -rf " + o + "; else mv " + o + " " + b + "; exit 1; fi"
 }
+
+// ShellQuote quotes s for /bin/sh.
+func ShellQuote(s string) string { return shellQuote(s) }
 
 // shellQuote quotes s for /bin/sh.
 func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }

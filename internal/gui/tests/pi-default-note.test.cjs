@@ -2,7 +2,7 @@
 // #709: Pi has no default model of its own — Default in its model picker
 // clears the default it has, and Pi then takes the first provider signed in
 // (openai's gpt-5.5 before openai-codex's), so "what Pi ships with" read as
-// a model Pi would keep. Pi's and OmO's Default says it clears the default
+// a model Pi would keep. Pi's, OmO's, Prime Agent's (#1528) and mu's Default says it clears the default
 // and Pi picks one itself; other agents' says what it said. Pi's
 // openai-codex models are rows of their own beside openai's of the same
 // name. Both connected to magpie, so the pickers in their rows list every
@@ -23,6 +23,11 @@ const piOptions = [
 const state = {
   agents: [
     { id: "pi", name: "Pi", icon: "generic", path: "/fixture/pi", wired: true, fields: [{ key: "model", label: "model", value: "openai/gpt-6-astra", options: piOptions }] },
+    // #1528: Prime Agent, Pi's files in ~/.prime/agent, with no default of
+    // its own either (it starts on its featured model)
+    { id: "prime-agent", name: "Prime Agent", icon: "prime-agent", path: "/fixture/prime", wired: true, fields: [{ key: "model", label: "model", value: "magpie/relay/m1", options: piOptions.filter((o) => o.ref) }] },
+    // mu (xteam3301 on X): Pi in ~/.mu/agent, the same
+    { id: "mu", name: "mu", icon: "mu", path: "/fixture/mu", wired: true, fields: [{ key: "model", label: "model", value: "magpie/relay/m1", options: piOptions.filter((o) => o.ref) }] },
     { id: "claude", name: "Claude Code", icon: "generic", path: "/fixture/claude", wired: true, fields: [{ key: "model", label: "model", value: "opus", options: [{ value: "opus" }, { value: "sonnet" }, { value: "relay/m1", label: "m1", ref: "relay/m1", note: "Relay · via magpie" }] }] },
   ],
   profiles: [],
@@ -61,6 +66,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       t.after(() => browser.close());
       const page = await (await browser.newContext({ viewport: { width: 980, height: 620 }, reducedMotion: "reduce" })).newPage();
       page.setDefaultTimeout(5000);
+      page.setDefaultNavigationTimeout(60000);
       const errors = [];
       page.on("pageerror", (e) => errors.push(e.message));
       await page.route("**/*", server(lang));
@@ -83,6 +89,23 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       const values = await page.evaluate(() => pick.options.map((o) => o.value));
       assert.ok(values.includes("openai/gpt-6-astra") && values.includes("openai-codex/gpt-6-astra"), "same-named models stay a row each: " + values);
       await close();
+
+      await open("prime-agent");
+      assert.equal(await page.locator("#list li", { hasText: w.pi.replace("Pi", "Prime Agent") }).count(), 1, "Prime Agent's Default says it clears the default");
+      await close();
+      // its icon is its own, loaded, not the generic one a missing file falls to
+      const ic = page.locator(`${row("prime-agent")} .ic[data-icon="prime-agent"]`).first();
+      await ic.locator(".mask").waitFor();
+      assert.equal(await ic.evaluate((e) => e.classList.contains("generic")), false);
+      assert.ok(await page.evaluate(() => new Promise((ok) => { const i = new Image(); i.onload = () => ok(i.naturalWidth > 0); i.onerror = () => ok(false); i.src = "icons/prime-agent.svg"; })), "icons/prime-agent.svg loads");
+
+      await open("mu");
+      assert.equal(await page.locator("#list li", { hasText: w.pi.replace("Pi", "mu") }).count(), 1, "mu's Default says it clears the default");
+      await close();
+      const mi = page.locator(`${row("mu")} .ic[data-icon="mu"]`).first();
+      await mi.locator(".mask").waitFor();
+      assert.equal(await mi.evaluate((e) => e.classList.contains("generic")), false);
+      assert.ok(await page.evaluate(() => new Promise((ok) => { const i = new Image(); i.onload = () => ok(i.naturalWidth > 0); i.onerror = () => ok(false); i.src = "icons/mu.svg"; })), "icons/mu.svg loads");
 
       await open("claude");
       assert.equal(await page.locator("#list li", { hasText: w.claude }).count(), 1, "other agents' Default is as it was");

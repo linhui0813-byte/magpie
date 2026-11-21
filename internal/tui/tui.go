@@ -24,6 +24,7 @@ import (
 	"github.com/yetone/magpie/internal/provider"
 	"github.com/yetone/magpie/internal/sessions"
 	"github.com/yetone/magpie/internal/settings"
+	"github.com/yetone/magpie/internal/uilang"
 	"github.com/yetone/magpie/internal/usage"
 )
 
@@ -72,6 +73,9 @@ type picker struct {
 	crumbs []string
 	input  textinput.Model
 	items  []agent.Option
+	// relist, on a picker of models, lists them again when an account's
+	// list or the models.dev catalog arrives while it is open
+	relist func() []agent.Option
 	match  []int
 	cursor int
 	custom bool
@@ -80,7 +84,10 @@ type picker struct {
 	// toggle, when set, is what enter does instead of onPick: it changes
 	// the item and the list stays open, with its items anew.
 	toggle func(string) (items []agent.Option, done string, ok bool)
-	empty  string
+	// refetch, on a provider's models, asks its vendor for the list again
+	// (ctrl+r): a free model list changes often (#2113)
+	refetch func() tea.Cmd
+	empty   string
 }
 
 type model struct {
@@ -92,10 +99,15 @@ type model struct {
 	mode    mode
 	pk      picker
 	name    textinput.Model
+	rename  string // the profile the name line renames, "" when it saves one
 	flash   string
 	flashOK bool
 	w, h    int
 	syncing bool
+
+	// failover: what an agent going through magpie for account failover
+	// alone, not connected, says of it (agent.FailoverSaid, #1385)
+	failover []string
 
 	page      page
 	back      mode // where esc goes from a picker or a line to type
@@ -107,6 +119,7 @@ type model struct {
 	bal       map[string]string
 	asked     bool // balances were asked for
 	groups    []provider.Group
+	provOff   map[string]bool // providers switched off, read with the groups
 	grow      int
 	shown     int    // groups from here on were removed: listed last, to bring back
 	gid       string // the group open
@@ -116,6 +129,9 @@ type model struct {
 	direct    usage.Summary                // the agents' own calls, read from their session files
 	quotas    []provider.SubscriptionQuota // nil while the vendors are asked
 	qasked    bool                         // quotas were asked for
+	qaskedAt  time.Time                    // when they were last asked for (an asked read)
+	qgen      int                          // the quotas load the page waits for
+	qtries    int                          // that load's asks again while a read was under way
 	qleft     bool                         // windows read as what is left, not what is used
 	sstats    sessions.Stats               // the sessions' usage in the range picked
 	srange    int                          // in sessRanges
@@ -144,21 +160,25 @@ type syncedMsg struct{ err error }
 // and a signal then is the caller's to handle, as bubbletea starts
 // listening only as the program runs.
 func Run(ready func()) error {
+	lang = speak(uilang.Pick(settings.Load().Lang, uilang.System))
 	m := newModel()
 	if ready != nil {
 		ready()
 	}
 	if len(m.agents) == 0 {
-		return fmt.Errorf("no supported agents found on this machine")
+		return fmt.Errorf("%s", tr("no supported agents found on this machine"))
 	}
 	ctx, stop := context.WithCancel(context.Background())
 	wait := serveGateway(ctx)
+	halt := func() { stop(); wait() }
+	serving.Store(&halt)
+	defer serving.Store(nil)
 	_, err := tea.NewProgram(m, tea.WithAltScreen()).Run()
 	served := gw.here.Load()
 	stop()
 	wait()
 	if served {
-		fmt.Fprintln(os.Stderr, gatewayGoneNote())
+		fmt.Fprintln(os.Stderr, keepGateway(connected(m.agents)))
 	}
 	return err
 }
@@ -166,15 +186,17 @@ func Run(ready func()) error {
 func newModel() model {
 	// in the order the app lists them, those hidden there last
 	// an app magpie has no fields in (Cindy, which takes it by a link) has
-	// nothing to pick here
+	// nothing to pick here, nor one whose CLI is gone, its folder left
+	// behind (#2177): nothing would read what is picked
 	var set []*agent.Agent
 	for _, a := range agent.Detected() {
-		if len(a.Fields) > 0 {
+		if len(a.Fields) > 0 && !a.CLIMissing() {
 			set = append(set, a)
 		}
 	}
-	shown, hidden := settings.Arrange(settings.Load(), set, func(a *agent.Agent) string { return a.ID })
-	m := model{agents: append(shown, hidden...), hidden: len(shown), period: usage.Week, srange: 1}
+	s := settings.Load()
+	shown, hidden := settings.Arrange(s, set, func(a *agent.Agent) string { return a.ID })
+	m := model{agents: append(shown, hidden...), hidden: len(shown), period: usage.Week, srange: 1, qleft: s.QuotaLeft}
 	// no model catalog yet: Init syncs it. Set here, as Init's receiver is
 	// a copy the program never sees.
 	m.syncing = catalog.Source() == ""
@@ -184,8 +206,10 @@ func newModel() model {
 
 func (m *model) reload() {
 	m.values = make([]map[string]string, len(m.agents))
+	m.failover = make([]string, len(m.agents))
 	for i, a := range m.agents {
 		m.values[i] = a.Values()
+		m.failover[i] = a.FailoverSaid()
 	}
 	switch m.page {
 	case pageProviders:
@@ -215,18 +239,53 @@ func (m *model) goTo(p page) tea.Cmd {
 		m.asked = true
 		return balancesCmd(m.provs)
 	}
-	if p == pageUsage && !m.qasked {
-		m.qasked = true
-		return quotasCmd
+	if p == pageUsage {
+		// opened: an asked read, or what is kept within quotasOpenGap of
+		// the last ask (going to another page and back)
+		return m.loadQuotas(!m.qasked || time.Since(m.qaskedAt) >= quotasOpenGap)
 	}
 	return nil
 }
 
 func (m model) Init() tea.Cmd {
+	// a signed-in account's list exists only at its vendor: asked for at
+	// start, as the app does, or Cursor offered its fallback Auto alone
+	// until m on the Providers page asked for it (#1789)
 	if m.syncing {
-		return syncCmd
+		return tea.Batch(syncCmd, fetchModelsCmd)
 	}
-	return nil
+	return fetchModelsCmd
+}
+
+// modelsMsg says FetchNew is done; missing, that an account is left
+// without its list.
+type modelsMsg struct{ missing bool }
+
+func fetchModelsCmd() tea.Msg {
+	return modelsMsg{missing: provider.FetchNew(20 * time.Second)}
+}
+
+// modelsRetry is how long the terminal waits to ask again for a list it
+// couldn't get (the network not up yet at start, a vendor slow to answer),
+// while it stays open: the app asks again each time its page is read.
+var modelsRetry = time.Minute
+
+// modelsChanged shows the models as they are now: the page, and a picker
+// of models open meanwhile, its filter and the model on its cursor kept.
+func (m *model) modelsChanged() {
+	m.reload()
+	if m.mode != modePick || m.pk.relist == nil {
+		return
+	}
+	on, _ := m.pk.choice()
+	m.pk.items = m.pk.relist()
+	m.pk.refilter()
+	for i, j := range m.pk.match {
+		if m.pk.items[j].Value == on {
+			m.pk.cursor = i
+			break
+		}
+	}
 }
 
 func syncCmd() tea.Msg {
@@ -244,17 +303,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case flashMsg:
 		m.flash, m.flashOK = msg.text, msg.ok
-		m.reload()
+		// and a picker of models open shows what was done to them (a list
+		// fetched again from it)
+		m.modelsChanged()
 		return m, nil
 	case balanceMsg:
 		m.bal = msg
-		if m.flash == "asking the vendors for balances…" {
+		if m.flash == tr("asking the vendors for balances…") {
 			m.flash = ""
 		}
 		return m, nil
 	case quotaMsg:
-		m.quotas = msg
-		return m, nil
+		return m, m.gotQuotas(msg)
 	case checkinMsg:
 		m.flash, m.flashOK = msg.text, msg.ok
 		// the accounts' lines say today's check-in now, with nothing asked
@@ -284,7 +344,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.gid == msg.from {
 			m.gid = msg.to
 		}
-		m.flash, m.flashOK = "group/"+msg.from+" is group/"+msg.to+" now", true
+		m.flash, m.flashOK = trf("group/%s is group/%s now", msg.from, msg.to), true
 		m.reload()
 		return m, nil
 	case editedMsg:
@@ -293,12 +353,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		return m, saveInstructions(msg.text)
+	case modelsMsg:
+		m.modelsChanged()
+		if msg.missing {
+			return m, tea.Tick(modelsRetry, func(time.Time) tea.Msg { return fetchModelsCmd() })
+		}
+		return m, nil
 	case syncedMsg:
 		m.syncing = false
+		m.modelsChanged()
 		if msg.err != nil {
-			m.flash, m.flashOK = "catalog sync failed: "+msg.err.Error(), false
+			m.flash, m.flashOK = trf("catalog sync failed: %s", msg.err.Error()), false
 		} else {
-			m.flash, m.flashOK = "model catalog synced from models.dev", true
+			m.flash, m.flashOK = tr("model catalog synced from models.dev"), true
 		}
 		return m, nil
 	case tea.KeyMsg:
@@ -318,10 +385,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				if msg.String() == "r" {
 					m.reload()
-					m.flash, m.flashOK = "reloaded", true
+					m.flash, m.flashOK = tr("reloaded"), true
 					if m.page == pageUsage {
-						m.quotas, m.qasked = nil, true
-						return m, quotasCmd
+						m.quotas = nil
+						// every account read again, a saved Claude
+						// account's /usage run too, as the app's
+						// Refresh does (#5380)
+						provider.AskEveryClaudeUsage()
+						return m, m.loadQuotas(true)
 					}
 					return m, nil
 				}
@@ -392,15 +463,15 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.openFieldPicker()
 	case "r":
 		m.reload()
-		m.flash, m.flashOK = "reloaded", true
+		m.flash, m.flashOK = tr("reloaded"), true
 	case "S":
 		if !m.syncing {
 			m.syncing = true
 			return m, syncCmd
 		}
 	case "s":
-		m.mode = modeName
-		m.name = newInput("profile name")
+		m.mode, m.rename = modeName, ""
+		m.name = newInput(tr("profile name"))
 	case "p":
 		m.openProfiles()
 	}
@@ -411,16 +482,17 @@ func (m *model) openFieldPicker() {
 	a := m.agents[m.row]
 	f := a.Fields[m.col]
 	cur := m.values[m.row][f.Key]
-	items := f.Options(m.values[m.row])
+	items := a.Picks(f, m.values[m.row])
 	items = withCurrent(items, cur)
 	set := f.Set
-	label := a.Name + " · " + f.Label
+	label := a.Name + " · " + tr(f.Label)
 	m.pk = picker{
-		crumbs: []string{a.Name, f.Label},
-		input:  newInput("type to filter, or enter a custom value"),
+		crumbs: []string{a.Name, tr(f.Label)},
+		input:  newInput(tr("type to filter, or enter a custom value")),
 		items:  items,
+		relist: func() []agent.Option { return withCurrent(a.Picks(f, a.Values()), f.Get()) },
 		custom: true,
-		empty:  "no models known yet, type one",
+		empty:  tr("no models known yet, type one"),
 		onPick: func(v string) tea.Cmd {
 			return func() tea.Msg {
 				if err := set(v); err != nil {
@@ -442,14 +514,19 @@ func (m *model) openProfiles() {
 		return
 	}
 	var items []agent.Option
+	detected := agent.Detected()
 	for _, n := range profile.Names(ps) {
-		items = append(items, agent.Option{Value: n, Note: profile.LongSummary(ps[n])})
+		note := profile.LongSummary(ps[n])
+		if profile.InUse(ps[n], detected, nil) {
+			note = strings.TrimSuffix(tr("in use")+" · "+note, " · ")
+		}
+		items = append(items, agent.Option{Value: n, Note: note})
 	}
 	m.pk = picker{
-		crumbs: []string{"profiles"},
-		input:  newInput("filter profiles"),
+		crumbs: []string{tr("profiles")},
+		input:  newInput(tr("filter profiles")),
 		items:  items,
-		empty:  "no profiles yet · press s in the list to save one",
+		empty:  tr("no profiles yet · press s in the list to save one"),
 		onPick: func(n string) tea.Cmd {
 			return func() tea.Msg {
 				ps, err := profile.Load()
@@ -460,7 +537,7 @@ func (m *model) openProfiles() {
 				if err != nil {
 					return flashMsg{text: err.Error()}
 				}
-				text := fmt.Sprintf("profile %s applied · %d change%s", n, a.Changed, plural(a.Changed))
+				text := trf("profile %s applied · %d change%s", n, a.Changed, plural(a.Changed))
 				for _, line := range profile.Report(a) {
 					text += " · " + line
 				}
@@ -472,7 +549,7 @@ func (m *model) openProfiles() {
 				if err := profile.Delete(n); err != nil {
 					return flashMsg{text: err.Error()}
 				}
-				return flashMsg{text: "profile " + n + " deleted", ok: true}
+				return flashMsg{text: trf("profile %s deleted", n), ok: true}
 			}
 		},
 	}
@@ -495,6 +572,21 @@ func (m model) updatePicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "up", "ctrl+p":
 		if len(m.pk.match) > 0 {
 			m.pk.cursor = (m.pk.cursor + len(m.pk.match) - 1) % len(m.pk.match)
+		}
+		return m, nil
+	case "ctrl+r":
+		if m.pk.refetch != nil {
+			m.flash, m.flashOK = tr("asking for the models again…"), true
+			return m, m.pk.refetch()
+		}
+		return m, nil
+	case "ctrl+e":
+		// the profile picked, renamed on a line holding its name (#2721)
+		if m.mode == modeProfiles && len(m.pk.match) > 0 {
+			m.rename = m.pk.items[m.pk.match[m.pk.cursor]].Value
+			m.name = newInput(tr("new name"))
+			m.name.SetValue(m.rename)
+			m.mode = modeName
 		}
 		return m, nil
 	case "ctrl+d":
@@ -532,7 +624,7 @@ func (m model) updatePicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m model) updateName(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "esc":
-		m.mode = modeList
+		m.mode, m.rename = modeList, ""
 		return m, nil
 	case "enter":
 		n := strings.TrimSpace(m.name.Value())
@@ -540,6 +632,15 @@ func (m model) updateName(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.mode = modeList
+		if old := m.rename; old != "" {
+			m.rename = ""
+			return m, func() tea.Msg {
+				if err := profile.Rename(old, n); err != nil {
+					return flashMsg{text: err.Error()}
+				}
+				return flashMsg{text: trf("profile %s renamed to %s", old, n), ok: true}
+			}
+		}
 		return m, func() tea.Msg {
 			p, err := profile.Snapshot()
 			if err != nil {
@@ -548,7 +649,7 @@ func (m model) updateName(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if err := profile.Save(n, p); err != nil {
 				return flashMsg{text: err.Error()}
 			}
-			return flashMsg{text: "saved profile " + n, ok: true}
+			return flashMsg{text: trf("saved profile %s", n), ok: true}
 		}
 	}
 	var cmd tea.Cmd
@@ -576,10 +677,10 @@ func withCurrent(items []agent.Option, cur string) []agent.Option {
 	var out []agent.Option
 	if cur != "" {
 		seen[cur] = true
-		note := "current"
+		note := tr("current")
 		for _, it := range items {
 			if it.Value == cur && it.Note != "" {
-				note = it.Note + " · current"
+				note = it.Note + " · " + tr("current")
 			}
 		}
 		out = append(out, agent.Option{Value: cur, Note: note})
@@ -671,8 +772,10 @@ func clamp(i, n int) int {
 	return i
 }
 
+// plural is an English plural's "s"; a language without one (Chinese)
+// gets none.
 func plural(n int) string {
-	if n == 1 {
+	if n == 1 || lang != "en" {
 		return ""
 	}
 	return "s"
@@ -713,7 +816,9 @@ func (m model) View() string {
 		body = m.viewPicker()
 		switch {
 		case m.mode == modeProfiles:
-			footer = hints("↑↓", "move", "↵", "apply", "ctrl+d", "delete", "esc", "back")
+			footer = hints("↑↓", "move", "↵", "apply", "ctrl+e", "rename", "ctrl+d", "delete", "esc", "back")
+		case m.pk.refetch != nil:
+			footer = hints("↑↓", "move", "↵", "on / off", "ctrl+r", "fetch models again", "esc", "back")
 		case m.pk.toggle != nil:
 			footer = hints("↑↓", "move", "↵", "on / off", "esc", "back")
 		default:
@@ -726,10 +831,13 @@ func (m model) View() string {
 		body = m.viewGroup()
 		// two lines: there is more to do to a group than one holds
 		footer = hints("↑↓", "model / rule", "J K", "move", "a", "add model", "n", "new rule", "↵", "edit rule", "d", "take out", "esc", "back") + "\n" +
-			pad + hints("E", "effort", "F", "fast", "c", "classifier", "o", "routing", "s", "stays", "x", "context", "l", "levels", "f", "family", "R", "rename")
+			pad + hints("E", "effort", "F", "fast", "c", "classifier", "o", "routing", "s", "stays", "x", "context", "l", "levels", "f", "family", "N", "note", "R", "rename")
 	case modeName:
 		body = m.viewName()
 		footer = hints("↵", "save", "esc", "cancel")
+		if m.rename != "" {
+			footer = hints("↵", "rename", "esc", "cancel")
+		}
 	}
 
 	status := ""
@@ -739,7 +847,7 @@ func (m model) View() string {
 	case m.flash != "":
 		status = sBad.Render("✗ ") + sText.Render(m.flash)
 	case m.syncing:
-		status = sMuted.Render("… syncing model catalog")
+		status = sMuted.Render("… " + tr("syncing model catalog"))
 	default:
 		status = gatewayStatus()
 	}
@@ -758,7 +866,7 @@ func (m model) header(crumbs ...string) string {
 		// the pages, this one marked
 		s += "  "
 		for i, n := range pageNames {
-			label := fmt.Sprintf("%d %s", i+1, n)
+			label := fmt.Sprintf("%d %s", i+1, tr(n))
 			if page(i) == m.page {
 				s += sPill.Render(label) + " "
 			} else {
@@ -781,7 +889,17 @@ func (m model) viewList() string {
 	var b strings.Builder
 	b.WriteString(m.header())
 	b.WriteString("\n\n")
-	for i, a := range m.agents {
+	// the rows around the one picked, as many as fit — a machine with more
+	// agents than the terminal has rows would otherwise scroll the highlight
+	// off and freeze the page, as the library page did (#2220)
+	visible := max(3, m.h-7)
+	start := 0
+	if m.row >= visible {
+		start = m.row - visible + 1
+	}
+	end := min(len(m.agents), start+visible)
+	for i := start; i < end; i++ {
+		a := m.agents[i]
 		sel := i == m.row
 		marker := "  "
 		name := sName.Render(padRight(a.Name, nameW))
@@ -808,9 +926,12 @@ func (m model) viewList() string {
 				cell = sValue.Render(v)
 			}
 			if j > 0 || f.Label != "model" {
-				line += sMuted.Render(" " + f.Label)
+				line += sMuted.Render(" " + tr(f.Label))
 			}
 			line += cell + " "
+		}
+		if i < len(m.failover) && m.failover[i] != "" {
+			line += sMuted.Render(" · " + m.failover[i])
 		}
 		if sel {
 			p := tilde(a.Path)
@@ -834,11 +955,11 @@ func (m model) viewPicker() string {
 
 	if len(p.match) == 0 {
 		if v, ok := p.choice(); ok {
-			b.WriteString(pad + "  " + sMuted.Render("↵ use ") + sText.Render(v) + sMuted.Render(" as a custom value"))
+			b.WriteString(pad + "  " + sMuted.Render(trf("↵ use %s as a custom value", sText.Render(v))))
 		} else if len(p.items) == 0 {
 			b.WriteString(pad + "  " + sMuted.Render(p.empty))
 		} else {
-			b.WriteString(pad + "  " + sMuted.Render("no match"))
+			b.WriteString(pad + "  " + sMuted.Render(tr("no match")))
 		}
 		return b.String()
 	}
@@ -878,18 +999,23 @@ func (m model) viewPicker() string {
 
 func (m model) viewName() string {
 	var b strings.Builder
-	b.WriteString(m.header("save profile"))
+	if m.rename != "" {
+		b.WriteString(m.header(tr("rename profile")) + "\n\n" + pad + sCursor.Render("❯ ") + m.name.View() + "\n\n")
+		b.WriteString(pad + "  " + sMuted.Render(trf("renames %s · the settings it holds stay as they are", m.rename)))
+		return b.String()
+	}
+	b.WriteString(m.header(tr("save profile")))
 	b.WriteString("\n\n")
 	b.WriteString(pad + sCursor.Render("❯ ") + m.name.View())
 	b.WriteString("\n\n")
-	b.WriteString(pad + "  " + sMuted.Render("snapshots every agent's current settings"))
+	b.WriteString(pad + "  " + sMuted.Render(tr("snapshots every agent's current settings")))
 	b.WriteString("\n\n")
 	snap, _ := profile.Snapshot()
 	for _, k := range sortedKeys(snap.Fields) {
 		b.WriteString(pad + "  " + sFaint.Render(padRight(k, 18)) + sText.Render(snap.Fields[k]) + "\n")
 	}
 	if snap.Library != nil {
-		b.WriteString(pad + "  " + sFaint.Render(padRight("library", 18)) + sText.Render(strings.TrimPrefix(snap.Library.Summary(), "library: ")) + "\n")
+		b.WriteString(pad + "  " + sFaint.Render(padRight(tr("library"), 18)) + sText.Render(strings.TrimPrefix(snap.Library.Summary(), "library: ")) + "\n")
 	}
 	return strings.TrimRight(b.String(), "\n")
 }
@@ -897,7 +1023,7 @@ func (m model) viewName() string {
 func hints(kv ...string) string {
 	var parts []string
 	for i := 0; i+1 < len(kv); i += 2 {
-		parts = append(parts, sKey.Render(kv[i])+" "+sMuted.Render(kv[i+1]))
+		parts = append(parts, sKey.Render(kv[i])+" "+sMuted.Render(tr(kv[i+1])))
 	}
 	return strings.Join(parts, sFaint.Render("  ·  "))
 }

@@ -83,6 +83,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       const page = await (await browser.newContext({ viewport: { width: 440, height: 420 } })).newPage();
       pages.push(page);
       page.setDefaultTimeout(5000);
+      page.setDefaultNavigationTimeout(60000);
       page.on("pageerror", (e) => errors.push(e.message));
       await page.route("**/*", server(lang, saved, opts));
       await page.goto("http://magpie.test/?mode=panel");
@@ -101,6 +102,10 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         const page = await open(lang, saved);
         const button = page.locator("#save");
         assert.equal((await button.textContent()).trim(), add);
+        // what a profile holds, and what it leaves as it is, in the button's tip
+        const holds = "A profile holds each agent's settings and model list, and who gets what from the Library. Providers, routing and Settings stay as they are.";
+        assert.equal(await button.getAttribute("title"), await page.evaluate((k) => t(k), holds));
+        if (lang === "zh") assert.notEqual(await button.getAttribute("title"), holds, "the tip is in Chinese");
 
         // over the list, upward from the button at its foot's left, the list
         // left where it was

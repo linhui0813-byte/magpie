@@ -14,11 +14,14 @@ package agent
 // on Windows; the npm install follows in the same line.
 
 import (
+	"context"
+	"errors"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strings"
+	"time"
 
 	"github.com/yetone/magpie/internal/proc"
 )
@@ -33,6 +36,9 @@ type InstallCmd struct {
 	// here: nvm (Linux), nvm-mac (a Mac, where nvm's installer wants the
 	// Xcode Command Line Tools) or winget (Windows); "" when it doesn't
 	Node string `json:"node,omitempty"`
+	// Admin is npm's global folder, for an npm command run where only an
+	// administrator can change it (Windows' Program Files); "" otherwise
+	Admin string `json:"admin,omitempty"`
 }
 
 // Install is an agent not on this machine, and how to install it.
@@ -63,7 +69,9 @@ var vendorInstall = map[string]func(goos string) []InstallCmd{
 		if goos == "windows" {
 			return nil
 		}
-		return []InstallCmd{{Via: "script", Command: "curl -fsSL https://opencode.ai/install | bash"}}
+		// OpenCode 2's (its README, opencode.ai/v2/docs); opencode.ai/install
+		// installs OpenCode 1 only, and refuses a 2.x version
+		return []InstallCmd{{Via: "script", Command: "curl -fsSL https://opencode.ai/v2/install | bash"}}
 	},
 	"codex": func(goos string) []InstallCmd {
 		switch goos {
@@ -73,6 +81,14 @@ var vendorInstall = map[string]func(goos string) []InstallCmd{
 			return []InstallCmd{{Via: "script", Command: "curl -fsSL https://chatgpt.com/codex/install.sh | sh"}, {Via: "brew", Command: "brew install --cask codex"}}
 		}
 		return []InstallCmd{{Via: "script", Command: "curl -fsSL https://chatgpt.com/codex/install.sh | sh"}}
+	},
+	// PenguinHarness's (penguin.ooo; its README): a tarball in ~/.penguin
+	// that brings its own Node.js, which it needs at 24 or later
+	"penguin": func(goos string) []InstallCmd {
+		if goos == "windows" {
+			return []InstallCmd{{Via: "powershell", Command: "irm https://penguin.ooo/install.ps1 | iex"}}
+		}
+		return []InstallCmd{{Via: "script", Command: "curl -fsSL https://penguin.ooo/install.sh | sh"}}
 	},
 	"gemini": func(goos string) []InstallCmd {
 		if goos == "windows" {
@@ -88,11 +104,18 @@ var vendorInstall = map[string]func(goos string) []InstallCmd{
 // magpie knows no command for.
 func installCommands(id, goos string, node bool) []InstallCmd {
 	var out []InstallCmd
+	if only := cliSpecs[id].only; len(only) > 0 && !slices.Contains(only, goos) {
+		return nil
+	}
 	if f := vendorInstall[id]; f != nil {
 		out = append(out, f(goos)...)
 	}
 	if spec, ok := cliSpecs[id]; ok && len(spec.npm) > 0 {
-		out = append(out, npmInstall(spec.npm[0], goos, node))
+		pkg := spec.npm[0]
+		if spec.scripts {
+			pkg = "--allow-scripts=" + pkg + " " + pkg
+		}
+		out = append(out, npmInstall(pkg, goos, node))
 	}
 	return out
 }
@@ -101,8 +124,10 @@ func installCommands(id, goos string, node bool) []InstallCmd {
 // (github.com/nvm-sh/nvm/releases/latest).
 const nvmVersion = "v0.40.8"
 
-// npmInstall is the command installing pkg with npm on goos, with Node.js
-// installed first when node is false.
+// npmInstall is the command installing pkg (what follows npm install -g:
+// the package, with --allow-scripts for it when it has an install script
+// it needs, which npm 12 runs only when asked) with npm on goos, with
+// Node.js installed first when node is false.
 //
 // On a Mac or Linux: nvm's installer, then nvm.sh read into the shell the
 // command runs in (the installer adds it to the profile, which only the
@@ -140,34 +165,91 @@ func npmInstall(pkg, goos string, node bool) InstallCmd {
 // Homebrew's, …) or, on Windows, in the PATH a terminal opened now has
 // and in Node.js's installer's own folder.
 func nodeHere() bool {
-	if _, err := exec.LookPath("npm"); err == nil {
+	if _, err := proc.Look("npm"); err == nil {
 		return true
 	}
 	dirs := proc.UserBinDirs()
 	if runtime.GOOS == "windows" {
-		dirs = append(dirs, proc.LoginPath()...)
+		dirs = append(dirs, proc.SystemDirs(proc.LoginPath()...)...)
 		if pf := os.Getenv("ProgramFiles"); pf != "" {
-			dirs = append(dirs, filepath.Join(pf, "nodejs"))
+			dirs = append(dirs, proc.SystemDirs(filepath.Join(pf, "nodejs"))...)
 		}
 	}
 	return npmIn(dirs, runtime.GOOS)
 }
 
-// npmIn says whether one of dirs has npm in it.
+// npmIn says whether one of dirs has npm in it: on Windows Node.js's
+// npm.cmd, or mise's shim npm.exe (its default shim mode) or npm.cmd.
 func npmIn(dirs []string, goos string) bool {
-	name := "npm"
+	names := []string{"npm"}
 	if goos == "windows" {
-		name = "npm.cmd"
+		names = []string{"npm.cmd", "npm.exe"}
 	}
 	return slices.ContainsFunc(dirs, func(d string) bool {
-		return d != "" && isFile(filepath.Join(d, name))
+		return d != "" && slices.ContainsFunc(names, func(n string) bool { return isFile(filepath.Join(d, n)) })
 	})
 }
 
 // Installs is every agent magpie knows a command for that isn't on this
 // machine, in the Agents page's order.
 func Installs() []Install {
-	return installsOf(All(), runtime.GOOS, nodeHere())
+	node := nodeHere()
+	out := installsOf(All(), runtime.GOOS, node)
+	if node && adminNPM {
+		npmNeedsAdmin(out, npmGlobalPrefix())
+	}
+	return out
+}
+
+// npmNeedsAdmin marks the npm commands of out with prefix, npm's global
+// folder, when it is one this user can't write in: Node.js's own under
+// Program Files, where npm's prefix was left there (新v学员 on Discord),
+// whose npm install -g fails with EPERM outside a terminal opened as
+// administrator.
+func npmNeedsAdmin(out []Install, prefix string) {
+	if prefix == "" || canWrite(prefix) {
+		return
+	}
+	for i := range out {
+		for j := range out[i].Commands {
+			if out[i].Commands[j].Via == "npm" {
+				out[i].Commands[j].Admin = prefix
+			}
+		}
+	}
+}
+
+var npmPrefixes memo
+
+// npmGlobalPrefix is where npm install -g puts packages (npm prefix -g),
+// "" when that isn't known.
+func npmGlobalPrefix() string {
+	npm, err := proc.Look("npm")
+	if err != nil {
+		pf := proc.SystemDirs(os.Getenv("ProgramFiles"))
+		if len(pf) == 0 {
+			return ""
+		}
+		npm = filepath.Join(pf[0], "nodejs", "npm.cmd")
+		if !isFile(npm) {
+			return ""
+		}
+	}
+	return npmPrefixes.get(npm, "", time.Hour, 5*time.Minute, func() (string, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		cmd := proc.CommandContext(ctx, npm, "prefix", "-g")
+		cmd.Stdin = nil
+		out, err := cmd.Output()
+		if err != nil {
+			return "", err
+		}
+		p := strings.TrimSpace(string(out))
+		if !filepath.IsAbs(p) {
+			return "", errors.New("npm prefix -g: " + p)
+		}
+		return p, nil
+	})
 }
 
 func installsOf(all []*Agent, goos string, node bool) []Install {
@@ -191,20 +273,32 @@ func installsOf(all []*Agent, goos string, node bool) []Install {
 // Codex app), ~/.claude (Claude Desktop's Code, the editors' extensions),
 // ~/.gemini (Antigravity, Gemini Code Assist), OpenCode's (its desktop
 // app), ~/.cline (Cline's extensions), Goose's (Goose Desktop). Their
-// folder without the CLI is no sign it was uninstalled.
+// folder without the CLI is no sign it was uninstalled while one of those
+// is here (cliHeld).
 var cliShared = map[string]bool{"codex": true, "claude": true, "gemini": true, "opencode": true, "cline": true, "goose": true}
 
 // CLIMissing reports an agent that is here by its settings alone: its
 // folder or config is, its command-line program isn't — not on PATH nor
-// where users' tools go (proc.FindTool), as after an uninstall that left
-// ~/.dsh behind (#843). Only for an agent that is its CLI and that magpie
-// knows an install command for, so the Agents page can offer it again.
+// where users' tools go (proc.FindTool) nor where its own installer puts
+// it — and nothing else that reads the folder is either (cliHeld): no
+// desktop app of its (DeepSeek Harness Desktop, star on Discord), no
+// editor extension, no IDE. That is an uninstall that left ~/.dsh (#843),
+// ~/.claude (#2177) or ~/.hermes/config.yaml (#2173) behind. The Agents
+// page shows it as gone, with none of its settings, and Install another
+// agent offers it again where magpie knows how. Only for an agent that is
+// its CLI: one magpie knows an install command for, or cliOnly; never one
+// detected its own way (detect), but for Goose, whose is its folder or its
+// program.
 func (a *Agent) CLIMissing() bool {
-	if a.WSL != "" || a.detect != nil || a.Bin == "" || cliShared[a.ID] {
+	if a.WSL != "" || a.Plugin != "" || a.Bin == "" || a.detect != nil && a.ID != "goose" {
 		return false
 	}
-	if len(installCommands(a.ID, runtime.GOOS, true)) == 0 {
+	if len(installCommands(a.ID, runtime.GOOS, true)) == 0 && !cliOnly[a.ID] {
 		return false
 	}
-	return a.Detected() && proc.FindTool(a.Bin) == ""
+	if !a.Detected() {
+		return false
+	}
+	held, known := a.cliHeld()
+	return known && !held
 }

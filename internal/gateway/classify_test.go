@@ -1,6 +1,8 @@
 package gateway
 
 import (
+	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -9,8 +11,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yetone/magpie/internal/access"
 	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/provider"
+	"github.com/yetone/magpie/internal/settings"
+	"github.com/yetone/magpie/internal/usage"
 )
 
 // clsUp is a Chat vendor that classifies: it answers what answer says,
@@ -130,7 +135,17 @@ func TestIntentRoutesATurn(t *testing.T) {
 	if r.Rule.N != 0 || r.Rule.Classified == nil || r.Rule.Classified.Intent != "" || c.n() != 2 {
 		t.Fatalf("turn 2: %+v %d", r.Rule, c.n())
 	}
-	if !strings.Contains(c.last(), "what does this function return?") || strings.Contains(c.last(), "add a unit test") {
+	// about the new message; the one before is there only as what came
+	// before it, the agent's context still left out
+	var asked2 struct {
+		Messages []struct{ Content string } `json:"messages"`
+	}
+	if err := json.Unmarshal([]byte(c.last()), &asked2); err != nil || len(asked2.Messages) != 2 {
+		t.Fatalf("turn 2 asked %v %s", err, c.last())
+	}
+	if q := asked2.Messages[1].Content; !strings.Contains(q, "<message>\nwhat does this function return?\n</message>") ||
+		!strings.Contains(q, "<previous_user_message>\nadd a unit test for the parser\n</previous_user_message>") ||
+		strings.Contains(q, "secret agent context") {
 		t.Fatalf("turn 2 asked about %s", c.last())
 	}
 	// it was told what the turn before was, for a message that only
@@ -142,15 +157,33 @@ func TestIntentRoutesATurn(t *testing.T) {
 	if r.Rule.Classified == nil || r.Rule.Classified.After != "" || strings.Contains(c.last(), "was of kind") || c.n() != 3 {
 		t.Fatalf("turn 3: %+v %s", r.Rule.Classified, c.last())
 	}
-	// the classifier's call is magpie's own, in the usage
+	// the classifier's call is magpie's own, in the usage, marked as the
+	// routing classifier's (#1839)
 	var seen bool
 	for _, call := range s.Recent() {
-		if call.Model == "c/cls" && call.Agent == "magpie-router" {
+		if call.Model == "c/cls" && call.Agent == "magpie-router" && call.Kind == "routing" {
 			seen = true
 		}
 	}
 	if !seen {
-		t.Fatal("the classifier's call isn't recorded as magpie-router's")
+		t.Fatal("the classifier's call isn't recorded as magpie-router's routing")
+	}
+	var recs, agents int
+	for _, r := range usage.Load(time.Time{}) {
+		switch {
+		case r.Provider == "c":
+			if r.Kind != "routing" || !r.ByMagpie() || usage.PurposeOf(r.Kind) != "kind:routing" {
+				t.Fatalf("the classifier's record: %+v", r)
+			}
+			recs++
+		case r.ByMagpie() || r.Kind == "routing":
+			t.Fatalf("an agent's record marked magpie's or routing: %+v", r)
+		default:
+			agents++
+		}
+	}
+	if recs != 3 || agents == 0 {
+		t.Fatalf("%d classifier records, %d the agent's", recs, agents)
 	}
 }
 
@@ -216,10 +249,10 @@ func TestIntentNotAskedWhenItCantMatter(t *testing.T) {
 	g, ms, _ := provider.FindGroup("group/r")
 	img := &Request{Messages: []Message{{Role: "user", Parts: []Part{{Kind: Image}}}}}
 	asked := 0
-	hit := ruleFor("img", g, ms, img, "claude", func(string, []string, before, bool, string) (verdict, error) {
+	hit := ruleFor("img", g, ms, img, "claude", func(access.Identity, string, []string, before, bool, string) (verdict, error) {
 		asked++
 		return verdict{Intent: "debugging"}, nil
-	})
+	}, "")
 	if hit.N != 0 || hit.Classified == nil || !strings.Contains(hit.Classified.Error, "no words") || asked != 0 {
 		t.Fatalf("image: %+v %+v", hit, hit.Classified)
 	}
@@ -251,9 +284,9 @@ func TestIntentClassifierFails(t *testing.T) {
 		t.Fatalf("rested: %s %+v", out, r.Rule)
 	}
 	// slow: past the timeout it's no answer
-	was := classifyTimeout
-	classifyTimeout = 200 * time.Millisecond
-	t.Cleanup(func() { classifyTimeout = was })
+	was := classifyUnit
+	classifyUnit = 20 * time.Millisecond // the 15 seconds unset are 300ms
+	t.Cleanup(func() { classifyUnit = was })
 	c.mu.Lock()
 	c.wait = 2 * time.Second
 	c.mu.Unlock()
@@ -261,6 +294,126 @@ func TestIntentClassifierFails(t *testing.T) {
 	out, r = postOK(t, s, "f4", chat("rename everything", nil, 0, ""))
 	if !strings.Contains(out, "from ka") || !strings.Contains(r.Rule.Classified.Error, "no answer") || time.Since(t0) > 1500*time.Millisecond {
 		t.Fatalf("slow: %s %+v %s", out, r.Rule, time.Since(t0))
+	}
+}
+
+// #2934 (aurochs-code): a Kiro subscription's haiku answered past the 8
+// seconds a classifier was given, so every turn fell back. Settings'
+// Classifier timeout gives it longer: a classifier slower than the 15
+// seconds unset routes the turn by its answer once it is given 60, and
+// one given 8 is no answer.
+func TestClassifierTimeoutSetting(t *testing.T) {
+	was := classifyUnit
+	classifyUnit = 100 * time.Millisecond // 15 seconds unset are 1.5s, 8 are 800ms, 60 are 6s
+	t.Cleanup(func() { classifyUnit = was })
+	s, _, _, c := intented(t, provider.Rule{Use: "b/big", Intent: "refactoring"})
+	c.set("1", 0)
+	c.mu.Lock()
+	c.wait = 2 * time.Second
+	c.mu.Unlock()
+	for i, x := range []struct {
+		seconds int
+		answers bool
+		wait    string
+	}{{0, false, "1.5s"}, {60, true, ""}, {8, false, "800ms"}} {
+		st := settings.Load()
+		st.ClassifyTimeout = x.seconds
+		if err := settings.Save(st); err != nil {
+			t.Fatal(err)
+		}
+		// a failure rests the classifier: each case asks it afresh
+		classified.Lock()
+		delete(classified.failed, "c/cls")
+		classified.Unlock()
+		out, r := postOK(t, s, fmt.Sprintf("ct%d", i), chat(fmt.Sprintf("rename package %d", i), nil, 0, ""))
+		cl := r.Rule.Classified
+		if x.answers && (!strings.Contains(out, "from kb") || r.Rule.N != 1 || cl.Intent != "refactoring" || cl.Error != "") {
+			t.Fatalf("given %ds: %s %+v %+v", x.seconds, out, r.Rule, cl)
+		}
+		if !x.answers && (!strings.Contains(out, "from ka") || r.Rule.N != 0 || !strings.Contains(cl.Error, "no answer in "+x.wait)) {
+			t.Fatalf("given %ds: %s %+v %+v", x.seconds, out, r.Rule, cl)
+		}
+	}
+}
+
+// ESern29751 on X: a routing group whose classifier reasons before it
+// answers (MiniMax, which thinks even asked for none; Grok 4.6 and GPT-6
+// Luna, which go no lower than low) lost its intent routing on most turns.
+// Asked with a real routing prompt they answered in 4 to 10 seconds, past
+// the 8 a classifier was given unset, and every such call was logged 499
+// "the agent canceled the request", though no agent had. Unset, a
+// classifier that answers in 10 seconds now routes the turn, and one past
+// the wait is logged as magpie stopping, a failure.
+func TestReasoningClassifierAnswersInTheWaitUnset(t *testing.T) {
+	was := classifyUnit
+	classifyUnit = 50 * time.Millisecond // 10 seconds are 500ms
+	t.Cleanup(func() { classifyUnit = was })
+	s, _, _, c := intented(t, provider.Rule{Use: "b/big", Intent: "refactoring"})
+	c.set("1", 0)
+	c.mu.Lock()
+	c.wait = 10 * classifyUnit
+	c.mu.Unlock()
+	out, r := postOK(t, s, "rs1", chat("rename the parser package and move its tests", nil, 0, ""))
+	if cl := r.Rule.Classified; !strings.Contains(out, "from kb") || r.Rule.N != 1 || cl.Intent != "refactoring" || cl.Error != "" {
+		t.Fatalf("a classifier answering in 10s, unset: %s %+v %+v", out, r.Rule, cl)
+	}
+	// past the whole wait it is no answer, and the call magpie stopped is
+	// its failure, not an agent canceling
+	c.mu.Lock()
+	c.wait = time.Duration(settings.ClassifyTimeoutMost) * classifyUnit
+	c.mu.Unlock()
+	out, r = postOK(t, s, "rs2", chat("rename everything under internal", nil, 0, ""))
+	if cl := r.Rule.Classified; !strings.Contains(out, "from ka") || !strings.Contains(cl.Error, "no answer") {
+		t.Fatalf("a classifier past its wait: %s %+v %+v", out, r.Rule, cl)
+	}
+	var cut []usage.Record
+	for i := 0; i < 100 && len(cut) == 0; i++ {
+		for _, rec := range usage.Load(time.Time{}) {
+			if rec.Model == "cls" && rec.Status == usage.StatusCanceled {
+				cut = append(cut, rec)
+			}
+		}
+		if len(cut) == 0 {
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+	if len(cut) != 1 {
+		t.Fatalf("the classifier's cut call in the usage log: %+v", cut)
+	}
+	rec := cut[0]
+	if !strings.Contains(rec.Error, "magpie stopped waiting") || !strings.Contains(rec.Error, "decision model") || usage.CanceledBy(rec.Status, rec.Error) || !rec.Failed() {
+		t.Fatalf("the classifier's cut call: %d %q", rec.Status, rec.Error)
+	}
+}
+
+// A classifier that fails, times out or rests on a turn whose conversation
+// had an intent keeps that intent, marked as kept, rather than sending the
+// turn to the group's first member (#1826: two timeouts in a row sent
+// 复杂 turns to the cheap member); one with none before has none.
+func TestIntentClassifierFailsKeepsThePreviousIntent(t *testing.T) {
+	s, _, _, c := intented(t, provider.Rule{Use: "b/big", Intent: "refactoring"})
+	c.set("1", 0)
+	out, r := postOK(t, s, "k1", chat("rename this package", nil, 0, ""))
+	if !strings.Contains(out, "from kb") || r.Rule.N != 1 || r.Rule.Classified.Fallback != "" {
+		t.Fatalf("turn 1: %s %+v", out, r.Rule)
+	}
+	c.set("", 500)
+	out, r = postOK(t, s, "k1", chat("rename this package", []string{"and the tests"}, 0, ""))
+	cl := r.Rule.Classified
+	if !strings.Contains(out, "from kb") || r.Rule.N != 1 || !strings.Contains(cl.Error, "classifier down") || cl.Intent != "refactoring" || cl.Fallback != "previous" {
+		t.Fatalf("down: %s %+v %+v", out, r.Rule, cl)
+	}
+	// resting after the failure, the turn after keeps it too
+	asked := c.n()
+	out, r = postOK(t, s, "k1", chat("rename this package", []string{"and the tests", "and the docs"}, 0, ""))
+	cl = r.Rule.Classified
+	if !strings.Contains(out, "from kb") || !strings.Contains(cl.Error, "not asked again") || cl.Fallback != "previous" || c.n() != asked {
+		t.Fatalf("resting: %s %+v %d/%d", out, cl, c.n(), asked)
+	}
+	// another conversation, with no turn before, has no intent to keep
+	out, r = postOK(t, s, "k2", chat("rename that package", nil, 0, ""))
+	if cl = r.Rule.Classified; !strings.Contains(out, "from ka") || r.Rule.N != 0 || cl.Intent != "" || cl.Fallback != "" {
+		t.Fatalf("no turn before: %s %+v", out, cl)
 	}
 }
 
@@ -281,12 +434,13 @@ func TestIntentOddAnswerDoesNotRest(t *testing.T) {
 }
 
 // A classifier that reasons is asked to reason least, with room for its
-// reasoning and the number; one whose levels aren't known is asked plainly.
+// reasoning and the number; one whose levels aren't known is asked for
+// none (TestClassifierAsksThinkingOff).
 func TestIntentClassifierEffort(t *testing.T) {
 	s, _, _, c := intented(t, provider.Rule{Use: "b/big", Intent: "refactoring"})
 	c.set("1", 0)
 	postOK(t, s, "e1", chat("rename this package", nil, 0, ""))
-	if asked := c.last(); strings.Contains(asked, "reasoning_effort") || !strings.Contains(asked, `"max_tokens":2048`) {
+	if asked := c.last(); !strings.Contains(asked, `"reasoning_effort":"none"`) || !strings.Contains(asked, `"max_tokens":2048`) {
 		t.Fatalf("plain: %s", asked)
 	}
 	p, _ := provider.Find("c")
@@ -331,12 +485,16 @@ func TestUserText(t *testing.T) {
 		t.Fatalf("%d", len(got))
 	}
 	for in, want := range map[string]string{"1": "x", "2": "y", " 0 ": "", "2\n": "y"} {
-		if got, err := readIntent(in, []string{"x", "y"}); err != nil || got != want {
+		got, said, err := readIntent(in, []string{"x", "y"})
+		if err != nil || got != want {
 			t.Fatalf("%q: %q %v", in, got, err)
+		}
+		if said != strings.TrimSpace(in) {
+			t.Fatalf("%q: said %q", in, said)
 		}
 	}
 	for _, in := range []string{"3", "-", "none", ""} {
-		if _, err := readIntent(in, []string{"x", "y"}); err == nil {
+		if _, _, err := readIntent(in, []string{"x", "y"}); err == nil {
 			t.Fatalf("%q read", in)
 		}
 	}

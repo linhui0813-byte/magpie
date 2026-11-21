@@ -39,10 +39,11 @@ func (c *capturedBody) add(p []byte) {
 
 func (c *capturedBody) text() string { return c.buf.String() }
 
+// captureRequestBody is a request's first callBodyLimit bytes, copied once:
+// through a capturedBody it was copied into a buffer and then again into
+// its string, 512 KiB for every request of 256 KiB or more.
 func captureRequestBody(p []byte) (string, bool) {
-	var c capturedBody
-	c.add(p)
-	return c.text(), c.truncated
+	return string(p[:min(len(p), callBodyLimit)]), len(p) > callBodyLimit
 }
 
 type captureResponseWriter struct {
@@ -50,17 +51,24 @@ type captureResponseWriter struct {
 	body capturedBody
 	// full: the whole body, for the request archive, when it is on
 	full *spool
-	// otel: the whole body, for the OTLP export, when it asks for it uncut (#538)
-	otel *spool
+	// whole: the whole body, for an observer that asks for it uncut (#538)
+	whole *spool
+	// tools: whether the reply calls a tool, for a turn's end (turns)
+	tools *toolScan
+	// live: the reply counted for the Routing page while it is out
+	// (live.go), nil when it isn't
+	live *liveRow
 }
 
 func (w *captureResponseWriter) Write(p []byte) (int, error) {
+	w.live.observe(p)
 	w.body.add(p)
+	w.tools.add(p)
 	if w.full != nil {
 		w.full.add(p)
 	}
-	if w.otel != nil {
-		w.otel.add(p)
+	if w.whole != nil {
+		w.whole.add(p)
 	}
 	return w.ResponseWriter.Write(p)
 }
@@ -137,22 +145,30 @@ func (w *captureResponseWriter) Flush() {
 }
 
 // withBodies hands a call's captured request and reply to its usage
-// record when the OTLP export sends them (#538) — their secrets scrubbed
-// as the request archive's are, on top of the placeholders Mask secrets
-// puts in — and leaves the record without them otherwise. A call captured
-// whole (OTelWhole) carries them in otelIn/otelOut; otherwise the first
-// 256 KiB Recent calls keeps is what goes.
+// record while an observer wants them (the OTLP export's bodies, #538) —
+// their secrets scrubbed as the request archive's are, on top of the
+// placeholders Mask secrets puts in — and leaves the record without them
+// otherwise. A call captured whole (usage.WholeBodies) carries them in
+// wholeIn/wholeOut; otherwise the first 256 KiB Recent calls keeps is what
+// goes.
 func withBodies(rec *usage.Record, c *Call) {
-	if !usage.OTelBodies() {
+	if usage.ObservedBodies() == usage.NoBodies {
 		return
 	}
 	in, inCut := c.RequestBody, c.RequestTruncated
-	if c.otelIn != nil {
-		in, inCut = string(c.otelIn), c.otelInCut
+	if c.wholeIn != nil {
+		in, inCut = string(c.wholeIn), c.wholeInCut
+	}
+	if c.maskIn != nil {
+		if m := c.maskIn.body(); c.wholeIn != nil {
+			in = string(m)
+		} else {
+			in, inCut = captureRequestBody(m)
+		}
 	}
 	out, outCut := c.ResponseBody, c.ResponseTruncated
-	if c.otelOut != nil {
-		out, outCut = string(c.otelOut), c.otelOutCut
+	if c.wholeOut != nil {
+		out, outCut = string(c.wholeOut), c.wholeOutCut
 	}
 	rec.BodyIn = bodyForExport(in, inCut)
 	rec.BodyOut = bodyForExport(out, outCut)

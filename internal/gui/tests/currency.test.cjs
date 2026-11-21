@@ -9,6 +9,7 @@ const fs = require("node:fs/promises");
 const path = require("node:path");
 const { test } = require("node:test");
 const { chromium, webkit } = require("playwright");
+const { openPart } = require("./reader.cjs");
 
 const assets = path.resolve(__dirname, "../assets");
 
@@ -84,20 +85,21 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         const page = await context.newPage();
         pages.push(page);
         page.setDefaultTimeout(5000);
+        page.setDefaultNavigationTimeout(60000);
         page.on("pageerror", (e) => errors.push(e.message));
         await page.route("**/*", server(lang));
 
         // the Usage page shows $ by default
         await page.goto("http://magpie.test/?view=usage");
         await page.locator("#usageCost b").waitFor();
-        assert.equal((await page.locator("#usageCost b").textContent()).trim(), "≈$12.34", "usd is the default");
+        assert.equal((await page.locator("#usageCost b").textContent()).trim(), "$12.34", "usd is the default");
 
         // Settings: the currency row, its rate in the tooltip
         await page.locator("#prefs").click();
-        await page.locator("#setTab-usage").click();
+        await openPart(page, "usage");
         await page.locator("#currencySegs .opt").first().waitFor();
         const segs = page.locator("#currencySegs .opt");
-        assert.equal(await segs.count(), 2);
+        assert.equal(await segs.count(), 3, "$, ¥ and By provider");
         assert.equal((await segs.nth(0).textContent()).trim(), usd);
         assert.equal((await segs.nth(1).textContent()).trim(), cny);
         assert.equal(await segs.nth(0).evaluate((b) => b.classList.contains("on")), true, "usd starts picked");
@@ -109,6 +111,15 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         // ¥ CNY moves nothing
         await page.locator("#currencySegs").hover();
         for (let i = 0; i < 20 && !(await view(page)); i++) { await page.mouse.wheel(0, 200); await page.waitForTimeout(20); }
+        // and back until the row is clear of the header, as a reader would
+        // before clicking it: a button partly under the header is scrolled
+        // into view by the browser as it takes focus
+        for (let i = 0; i < 40; i++) {
+          const box = await segs.nth(1).boundingBox();
+          if (box && box.y >= 60) break;
+          await page.mouse.wheel(0, -60);
+          await page.waitForTimeout(30);
+        }
         const before = await view(page);
         assert(before > 0, "the settings list must be long enough to scroll");
         const tall = () => page.locator("#view-settings").evaluate((v) => v.getBoundingClientRect().height);
@@ -127,12 +138,12 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         // the Usage page now shows ¥, at the fixed rate (12.34 * 7.2)
         await page.locator('[data-view="usage"]').click();
         await page.waitForTimeout(200);
-        assert.equal((await page.locator("#usageCost b").textContent()).trim(), "≈¥88.85");
+        assert.equal((await page.locator("#usageCost b").textContent()).trim(), "¥88.85");
 
         // and back to Settings, ¥ CNY is still picked after a reload
         await page.reload();
         await page.locator("#prefs").click();
-        await page.locator("#setTab-usage").click();
+        await openPart(page, "usage");
         await page.locator("#currencySegs .opt").first().waitFor();
         assert.equal(await page.locator('#currencySegs .opt', { hasText: cny }).evaluate((b) => b.classList.contains("on")), true);
 
@@ -171,24 +182,25 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         const context = await browser.newContext({ viewport: { width: 900, height: 420 }, reducedMotion: "reduce" });
         const page = await context.newPage();
         page.setDefaultTimeout(5000);
+        page.setDefaultNavigationTimeout(60000);
         page.on("pageerror", (e) => errors.push(e.message));
         await page.route("**/*", restartedServer(lang));
 
         // no visit to Settings first: the Usage page at start is in ¥
         await page.goto("http://magpie.test/?view=usage");
         await page.locator("#usageCost b").waitFor();
-        assert.equal((await page.locator("#usageCost b").textContent()).trim(), "≈¥88.85", "cny at the rate state gave");
+        assert.equal((await page.locator("#usageCost b").textContent()).trim(), "¥88.85", "cny at the rate state gave");
 
         // Settings agrees
         await page.locator("#prefs").click();
-        await page.locator("#setTab-usage").click();
+        await openPart(page, "usage");
         await page.locator("#currencySegs .opt").first().waitFor();
         assert.equal(await page.locator("#currencySegs .opt", { hasText: cny }).evaluate((b) => b.classList.contains("on")), true);
 
         // and back on Usage, still ¥
         await page.locator('[data-view="usage"]').click();
         await page.waitForTimeout(200);
-        assert.equal((await page.locator("#usageCost b").textContent()).trim(), "≈¥88.85");
+        assert.equal((await page.locator("#usageCost b").textContent()).trim(), "¥88.85");
 
         assert.deepEqual(errors, []);
         await context.close();

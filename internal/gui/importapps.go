@@ -33,11 +33,12 @@ func importAppsRoutes(mux *http.ServeMux) {
 			Source      string `json:"source"`
 		}
 		out := []candidate{}
-		for _, s := range provider.ImportSources() {
+		// only the apps looked in unasked: OpenCode waits for the picker
+		for _, s := range provider.DiscoverSources() {
 			for _, it := range s.Items {
 				// Match openImportApps' default selection: disabled entries and
 				// ID collisions without an add-key option need a manual choice.
-				if it.Skip == "" && it.Status != "same" && it.Off == "" && (it.Status != "taken" || it.KeyOf != "") {
+				if it.Skip == "" && it.Status != "same" && it.Off == "" && (it.Status != "taken" || it.KeyOf != "" || it.Reserved) {
 					out = append(out, candidate{importFingerprint(s.ID, it), s.Name})
 				}
 			}
@@ -72,7 +73,12 @@ func importAppsRoutes(mux *http.ServeMux) {
 			fail(rw, err)
 			return
 		}
+		had := provider.KeysHeld()
 		added, err := provider.ImportFromApps(in.Picks)
+		// a key imported beside others is given the models its own list
+		// has, as one added by hand is (PrefillNewKeys); those an import
+		// that stopped part way added too
+		provider.PrefillNewKeys(r.Context(), had)
 		if err != nil {
 			fail(rw, err)
 			return

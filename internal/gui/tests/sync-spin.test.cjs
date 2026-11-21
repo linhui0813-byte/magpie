@@ -19,6 +19,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       t.after(() => browser.close());
       const page = await (await browser.newContext({ viewport: { width: 900, height: 600 } })).newPage();
       page.setDefaultTimeout(5000);
+      page.setDefaultNavigationTimeout(60000);
       const errors = [];
       page.on("pageerror", (e) => errors.push(e.message));
       const settings = { lang, theme: "light" };
@@ -61,7 +62,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
           return remove.apply(this, names);
         };
         b.click();
-        spin = svg.getAnimations()[0];
+        spin = svg.getAnimations({ subtree: true })[0];
       }));
       assert.equal(end.state, "finished", `the spin was cut off mid-turn at ${Math.round(end.time)}ms`);
       assert(Number.isFinite(end.end) && Math.round(end.end) % 900 === 0, `the spin ends on a whole turn, not at ${end.end}ms`);

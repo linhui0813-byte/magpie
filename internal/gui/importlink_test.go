@@ -68,4 +68,8 @@ func TestImportLink(t *testing.T) {
 	if ImportLink([]string{"MAGPIE://import?preset=x"}) == "" {
 		t.Fatal("missed an upper-case link")
 	}
+	// ccswitch:// is CC Switch's scheme, not magpie's
+	if ImportLink([]string{"ccswitch://v1/import?resource=provider&app=claude&name=x"}) != "" {
+		t.Fatal("took a CC Switch link")
+	}
 }

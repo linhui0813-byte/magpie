@@ -174,15 +174,21 @@ type longVendor struct{}
 
 func (longVendor) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	b, _ := io.ReadAll(r.Body)
-	words := strings.Repeat("lorem ipsum dolor ", 25000) // 450 KB
+	// Words that don't repeat: the same few words over and over with no
+	// break is a loop the loop guard ends (#1489).
+	var sb strings.Builder
+	for i := 0; sb.Len() < 450_000; i++ {
+		fmt.Fprintf(&sb, "word%d ", i)
+	}
+	words := sb.String() // 450 KB
 	if !strings.Contains(string(b), `"stream":true`) {
 		w.Header().Set("Content-Type", "application/json")
 		io.WriteString(w, `{"id":"c1","object":"chat.completion","model":"m1","choices":[{"index":0,"message":{"role":"assistant","content":"`+words+`RES-TAIL"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1}}`)
 		return
 	}
 	w.Header().Set("Content-Type", "text/event-stream")
-	for range 1000 {
-		io.WriteString(w, `data: {"id":"c1","object":"chat.completion.chunk","model":"m1","choices":[{"index":0,"delta":{"content":"`+words[:450]+`"}}]}`+"\n\n")
+	for i := range 1000 {
+		io.WriteString(w, `data: {"id":"c1","object":"chat.completion.chunk","model":"m1","choices":[{"index":0,"delta":{"content":"`+words[i*450:(i+1)*450]+`"}}]}`+"\n\n")
 	}
 	io.WriteString(w, `data: {"id":"c1","object":"chat.completion.chunk","model":"m1","choices":[{"index":0,"delta":{"content":"RES-TAIL"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1}}`+"\n\ndata: [DONE]\n\n")
 }
@@ -220,11 +226,19 @@ func TestArchiveWholeBodies(t *testing.T) {
 			if a.Request.Body != body || a.Request.Size != int64(len(body)) || a.Request.Truncated {
 				t.Errorf("request kept %d of %d, size %d, cut %v", len(a.Request.Body), len(body), a.Request.Size, a.Request.Truncated)
 			}
-			if a.Response.Body != rec.Body.String() || a.Response.Size != int64(rec.Body.Len()) || a.Response.Truncated {
-				t.Errorf("response kept %d of %d, size %d, cut %v", len(a.Response.Body), rec.Body.Len(), a.Response.Size, a.Response.Truncated)
+			// the reply as the vendor sent it, under its own model name;
+			// the agent got the name it asked for
+			sent := namedAs(rec.Body.String(), "m1")
+			if a.Response.Body != sent || a.Response.Size != int64(len(sent)) || a.Response.Truncated {
+				t.Errorf("response kept %d of %d, size %d, cut %v", len(a.Response.Body), len(sent), a.Response.Size, a.Response.Truncated)
 			}
 			if u := lastUsage(t); u.Archive == "" || u.Archive != c.Archive {
 				t.Errorf("usage row names archive %q, the call %q", u.Archive, c.Archive)
+			}
+			// the Routing page's request names it too, for its bodies to be
+			// read back once the recent calls have let them go
+			if rts := s.Trace(context.Background(), 0, 0).Routes; len(rts) != 1 || rts[0].Archive != c.Archive || c.Route != rts[0].ID {
+				t.Errorf("route names archive %q (call %q, route %d of %d)", rts[0].Archive, c.Archive, c.Route, rts[0].ID)
 			}
 			if left, _ := os.ReadDir(tmp); len(left) != 0 {
 				t.Errorf("files left behind: %v", left)

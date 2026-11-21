@@ -25,6 +25,8 @@ import (
 	"time"
 
 	"github.com/yetone/magpie/internal/catalog"
+	"github.com/yetone/magpie/internal/probelog"
+	"github.com/yetone/magpie/internal/settings"
 )
 
 // JevLatest is the Jev a decision provider is asked with when the user
@@ -36,16 +38,126 @@ const JevLatest = "jev-latest"
 const BailianDecision = "decision-model-preview"
 
 // bailianDecides reports whether base is Bailian's: a workspace's host or
-// the Token Plan's, <x>.<region>.maas.aliyuncs.com. Its /models lists
-// Qwen's chat models, never the decision model.
+// the Token Plan's, <x>.<region>.maas.aliyuncs.com, or the Qwen AI
+// platform's, maas.qianwenaiapi.com and its plan's under it (#1506). Its
+// /models lists Qwen's chat models, never the decision model.
 func bailianDecides(base string) bool {
 	h := HostOf(base)
-	return strings.HasSuffix(h, ".maas.aliyuncs.com") || strings.HasSuffix(h, ".maas.qianwenaiapi.com")
+	return strings.HasSuffix(h, ".maas.aliyuncs.com") || h == "maas.qianwenaiapi.com" || strings.HasSuffix(h, ".maas.qianwenaiapi.com")
+}
+
+// ArkDecision is the model Volcengine Ark answers System One with, in its
+// beta (axelburks on Discord): doubao-seed-2-1-lite-260915. Asked on
+// 11-01, Ark's other Seed models it serves the account
+// (doubao-seed-2-1-pro-260628, doubao-seed-2-0-lite-260428) and
+// deepseek-v4-1-flash were each refused 400 "does not support the
+// SystemOne API".
+const ArkDecision = "doubao-seed-2-1-lite-260915"
+
+// ArkSystemOneHeader is the header Ark's System One API is turned on by
+// while it is in beta: without it, POST …/systemone is a bare 404.
+const ArkSystemOneHeader = "ark-beta-systemone-api"
+
+// arkDecides reports whether base is Volcengine Ark's own API host,
+// ark.<region>.volces.com, whose pay-as-you-go /api/v1 and /api/v3 answer
+// System One at …/systemone. Its Coding and Agent Plans' paths
+// (/api/coding/v3, /api/plan/v3) answer it nothing (404), and neither
+// /models lists the decision model.
+func arkDecides(base string) bool {
+	h := HostOf(base)
+	return strings.HasPrefix(h, "ark.") && strings.HasSuffix(h, ".volces.com")
+}
+
+// arkSystemOne is the System One base of a key's provider asked at
+// Volcengine Ark's pay as you go (ark.<region>.volces.com/api/v3, as chat
+// completions or Responses): …/api/v1 on the same host, where
+// volcengine-decision asks it; "" for any other provider. The Coding and
+// Agent Plans' paths answer System One nothing, and a signed-in account,
+// a plugin, a remote magpie and Vertex say their own.
+func (p Provider) arkSystemOne() string {
+	if p.Account != nil || p.IsRemoteMagpie() || p.IsVertex() {
+		return ""
+	}
+	for _, raw := range []string{p.Chat, p.Responses} {
+		if !arkDecides(raw) {
+			continue
+		}
+		u, err := url.Parse(raw)
+		if err == nil && strings.TrimRight(u.Path, "/") == "/api/v3" {
+			return u.Scheme + "://" + u.Host + "/api/v1"
+		}
+	}
+	return ""
+}
+
+// GoogleDecision is Google's decision model, gemini-decision-1, which the
+// Gemini Developer API answers at its Decisions API (POST
+// /v1beta/decisions) on an AI Studio key: typed noul, choice and score
+// questions, as System One asks them, over an input (Google's docs,
+// aistudio.google.com/docs/decisions-api, 2026-11-11).
+const GoogleDecision = "gemini-decision-1"
+
+// googleDecides reports whether base is the Gemini Developer API's,
+// generativelanguage.googleapis.com, AI Studio keys' host: the one host
+// Google serves its Decisions API at ("Available on the Gemini Developer
+// API (v1beta) … only"; Vertex AI has none).
+func googleDecides(base string) bool {
+	return HostOf(base) == "generativelanguage.googleapis.com"
+}
+
+// googleDecisions is the decision base of a key's provider asked at the
+// Gemini Developer API (the google preset, AI Studio's OpenAI-compatible
+// …/v1beta/openai or its own …/v1beta): AIStudioGemini, whose
+// /decisions answers gemini-decision-1 on the same key (WangYeruo on X:
+// google/gemini-decision-1 was asked at OpenRouter, the google provider
+// having no decision API); "" for any other. A signed-in account, a
+// plugin, a remote magpie and Vertex say their own.
+func (p Provider) googleDecisions() string {
+	if p.Account != nil || p.IsRemoteMagpie() || p.IsVertex() {
+		return ""
+	}
+	if googleDecides(p.Chat) || googleDecides(p.Gemini) {
+		return AIStudioGemini
+	}
+	return ""
+}
+
+// vendorDecision is the decision model of the vendor whose System One
+// API base is, Bailian's, Ark's or Google's, which its model list never
+// names (Google's: its chat list is the chat models').
+func vendorDecision(base string) (catalog.Model, bool) {
+	switch {
+	case googleDecides(base):
+		return catalog.Model{ID: GoogleDecision, Name: "Gemini Decision 1"}, true
+	case bailianDecides(base):
+		return catalog.Model{ID: BailianDecision, Name: "Decision model (preview)"}, true
+	case arkDecides(base):
+		return catalog.Model{ID: ArkDecision, Name: "Doubao Seed 2.1 Lite"}, true
+	}
+	return catalog.Model{}, false
+}
+
+// DecideHeaders sets on h what p's decision API needs besides its key:
+// Ark's beta switch (ArkSystemOneHeader) on Ark's host.
+func (p Provider) DecideHeaders(h http.Header) {
+	if arkDecides(p.Decide) {
+		h.Set(ArkSystemOneHeader, "true")
+	}
+}
+
+// bailianApart reports whether p serves conversations and a vendor's own
+// decision model both (Bailian's Token Plan, #1506, or Ark's pay as you
+// go with its decision URL given): its chat models' list never names the
+// decision model, which is kept apart from it.
+func (p Provider) bailianApart() bool {
+	_, ok := vendorDecision(p.Decide)
+	return !p.DecideOnly() && ok
 }
 
 // ownDecideModels are a System One provider's models that its vendor's
 // list may not name: the ones picked for a decision-only provider (a
-// vendor's own decision model needn't be called jev-…), else Bailian's.
+// vendor's own decision model needn't be called jev-…), else Bailian's
+// or Ark's.
 func (p Provider) ownDecideModels() []catalog.Model {
 	var out []catalog.Model
 	if p.DecideOnly() {
@@ -55,8 +167,8 @@ func (p Provider) ownDecideModels() []catalog.Model {
 			}
 		}
 	}
-	if len(out) == 0 && bailianDecides(p.Decide) {
-		out = []catalog.Model{{ID: BailianDecision, Name: "Decision model (preview)"}}
+	if m, ok := vendorDecision(p.Decide); len(out) == 0 && ok {
+		out = []catalog.Model{m}
 	}
 	return out
 }
@@ -66,23 +178,79 @@ func (p Provider) Decides() bool { return p.Decide != "" }
 
 // DecideOnly reports whether the provider has no conversation endpoint.
 func (p Provider) DecideOnly() bool {
-	return p.Decides() && p.Chat == "" && p.Responses == "" && p.Anthropic == ""
+	return p.Decides() && p.Chat == "" && p.Responses == "" && p.Anthropic == "" && p.Gemini == ""
 }
 
 // DecidesModel distinguishes Jev from the conversation models a gateway
-// also serves. A dedicated decision API may use any model name.
+// also serves. A dedicated decision API may use any model name, and a
+// plugin's are the ones it marks besides Jev's (#1514).
 func (p Provider) DecidesModel(model string) bool {
 	if !p.Decides() {
 		return false
 	}
+	if p.IsPlugin() {
+		return p.pluginMarks(model) || jevID(model)
+	}
 	if p.DecideOnly() {
 		return true
 	}
+	// one the user set to be asked on System One (DecideAPI)
+	if p.decideSet(model) {
+		return true
+	}
+	if p.bailianApart() {
+		m, _ := vendorDecision(p.Decide)
+		return model == m.ID
+	}
+	// decideListed's answer, without its list copied for each model
+	// asked about: a provider's every model was asked, a copy of the whole
+	// list each time (0.4 GB of a real config's 4 GB over 20 polls)
+	if p.IsRemoteMagpie() {
+		return slices.ContainsFunc(catalog.LiveByID(p.ID, model), func(m catalog.Model) bool { return m.Decides })
+	}
 	if p.listsDecisions() {
 		// OpenRouter's Jev Router (typesafe/jev-router) is a chat model
-		return slices.ContainsFunc(p.decideListed(), func(m catalog.Model) bool { return m.ID == model })
+		if id := decisionsID(p.ID); catalog.LiveListed(id) {
+			return len(catalog.LiveByID(id, model)) > 0 || p.openRouterVariant(model)
+		}
+		return !p.serverMarksDecisions() && model == OpenRouterJev
 	}
 	return jevID(model) || p.DecideVia() == ViaCloudflare && CloudflareClef(model)
+}
+
+// isDecision uses a listed remote model's marker without reading its whole
+// list again. Other providers keep their endpoint and name-based rules.
+func (p Provider) isDecision(m catalog.Model) bool {
+	if p.IsRemoteMagpie() {
+		return m.Decides
+	}
+	if p.IsPlugin() && p.Decides() && m.Decides {
+		return true
+	}
+	return p.DecidesModel(m.ID)
+}
+
+// pluginMarks reports whether p's plugin marks model as a decision model
+// (plugin.Model.Decides), as it last listed its models.
+func (p Provider) pluginMarks(model string) bool {
+	pp := *p.Account.plugin
+	if cur, ok := PluginOf(p.ID); ok {
+		pp = cur
+	}
+	m, ok := pluginModel(pp, model)
+	return ok && m.Decides
+}
+
+// pluginDecisions are the decision models a plugin's account lists, in
+// its order: the ones it marks, and Jev's by name.
+func (p Provider) pluginDecisions() []catalog.Model {
+	var out []catalog.Model
+	for _, m := range p.available() {
+		if p.isDecision(m) {
+			out = append(out, m)
+		}
+	}
+	return out
 }
 
 // OpenRouter lists its decision models apart from its chat models (ARNO
@@ -99,18 +267,53 @@ func openRouterDecisions(base string) string {
 }
 
 // listsDecisions reports whether p's decision models are a list of their
-// own, OpenRouter's, rather than Jev's ids among its chat models.
-func (p Provider) listsDecisions() bool { return openRouterDecisions(p.Decide) != "" }
+// own, OpenRouter's or a server's that marks them (serverMarksDecisions),
+// rather than Jev's ids among its chat models.
+func (p Provider) listsDecisions() bool {
+	return openRouterDecisions(p.Decide) != "" || p.serverMarksDecisions()
+}
+
+// serverMarksDecisions reports whether p's server says which of the models
+// it serves are decision models, oMLX's (omlxDecides), MLX-Serve's
+// (mlxServeDecides) or Ollama's (ollamaDecides): it has no Jev of its own,
+// and lists none while it has none.
+func (p Provider) serverMarksDecisions() bool {
+	return p.omlxDecides() || p.mlxServeDecides() || p.ollamaDecides()
+}
+
+// openRouterVariant reports whether model is one of the decision models
+// OpenRouter lists with a variant after it (inception/mercury-decide:free,
+// …:nitro): OpenRouter's list names the model once, and a variant goes to
+// the same decisions endpoint, never chat/completions (coeo91 on Discord:
+// inception/mercury-decide:free, picked by hand, was sent as a chat model
+// and refused 400 "is a decisions model"). Only OpenRouter's ids take a
+// variant so; an Ollama decision model's :tag is a name of its own.
+func (p Provider) openRouterVariant(model string) bool {
+	if openRouterDecisions(p.Decide) == "" {
+		return false
+	}
+	i := strings.LastIndexByte(model, ':')
+	if i <= 0 || i == len(model)-1 || strings.Contains(model[i:], "/") {
+		return false
+	}
+	return len(catalog.LiveByID(decisionsID(p.ID), model[:i])) > 0
+}
 
 // decisionsID is where a provider that serves conversations too keeps the
 // list of its decision models, beside its chat models' list.
 func decisionsID(id string) string { return id + ".decisions" }
 
-// DecisionModels are the decision models a provider that serves
-// conversations too lists apart from them (OpenRouter's), for its editor
-// to show beside its chat models; nil for any other provider.
+// DecisionModels are the decision models listed separately from a provider's
+// conversations: OpenRouter's own list, a Bailian Token Plan's decision
+// model, or a remote magpie's or a plugin's marked models.
 func (p Provider) DecisionModels() []catalog.Model {
-	if p.DecideOnly() || !p.listsDecisions() {
+	if p.IsPlugin() {
+		if !p.Decides() {
+			return nil
+		}
+		return p.decideModels()
+	}
+	if !p.IsRemoteMagpie() && (p.DecideOnly() || !p.listsDecisions() && !p.bailianApart()) {
 		return nil
 	}
 	return p.decideModels()
@@ -135,6 +338,10 @@ func (p Provider) decideListDue() bool {
 		return false
 	}
 	live, _, ok := catalog.Live(id)
+	if p.serverMarksDecisions() {
+		// a server with no decision model loaded lists none, for good
+		return !ok
+	}
 	return !ok || !slices.ContainsFunc(live, func(m catalog.Model) bool { return m.Context > 0 || m.ImageInput != nil })
 }
 
@@ -170,20 +377,27 @@ var cloudflareDecideModels = []catalog.Model{
 // setup points, at the AI SDK's evaluation models (a boolean for a noul
 // and probabilities for a confidence); or Workers AI (System One's
 // questions and answers, in Cloudflare's envelope and at an account's
-// address).
+// address); or Google's Decisions API (System One's questions over an
+// input, at the Gemini API's /decisions, its key as x-goog-api-key).
 const (
 	ViaSystemOne  = "systemone"
 	ViaVercel     = "vercel"
 	ViaVercelEval = "vercel-eval"
 	ViaCloudflare = "cloudflare"
+	ViaGoogle     = "google"
 )
 
 // DecideVia is the way p's decision API is asked, known by its host or by
 // the gateway's own path (Vercel's /typesafe or /v4/ai, Cloudflare's
 // /client/v4).
 func (p Provider) DecideVia() string {
+	if p.IsRemoteMagpie() {
+		return ViaSystemOne
+	}
 	base := strings.TrimRight(p.Decide, "/")
 	switch h := HostOf(base); {
+	case googleDecides(base):
+		return ViaGoogle
 	case strings.HasSuffix(base, "/v4/ai"):
 		return ViaVercelEval
 	case h == "ai-gateway.vercel.sh" || strings.HasSuffix(base, "/typesafe") || strings.Contains(base, "/typesafe/v1"):
@@ -197,6 +411,12 @@ func (p Provider) DecideVia() string {
 // Jev is the model a decision provider is asked with when the user picked
 // none: TypeSafe's latest stable one, or the one Jev a gateway serves.
 func (p Provider) Jev() string {
+	if p.IsRemoteMagpie() || p.IsPlugin() {
+		if models := p.decideListed(); len(models) > 0 {
+			return models[0].ID
+		}
+		return ""
+	}
 	switch p.DecideVia() {
 	case ViaVercel, ViaVercelEval:
 		return "typesafe-ai/jev"
@@ -208,6 +428,14 @@ func (p Provider) Jev() string {
 	}
 	// OpenRouter's Jev is ~typesafe/jev-latest, in its list of decision
 	// models; its Jev Router is a chat model
+	if p.serverMarksDecisions() {
+		// oMLX, MLX-Serve and Ollama have no Jev of their own: their first decision
+		// model, if any
+		if ms := p.decideListed(); len(ms) > 0 {
+			return ms[0].ID
+		}
+		return ""
+	}
 	if p.listsDecisions() || p.DecideOnly() && HostOf(strings.TrimSpace(p.ModelsURL)) == "openrouter.ai" {
 		ms := p.decideListed()
 		if i := slices.IndexFunc(ms, func(m catalog.Model) bool { return jevID(m.ID) }); i >= 0 {
@@ -243,7 +471,15 @@ func (p Provider) Jev() string {
 // list when fetched, else Jev's aliases (a gateway's one Jev), each with
 // its window and whether it takes images where its vendor's docs say.
 func (p Provider) decideModels() []catalog.Model {
-	return withDecideFacts(p.decideListed())
+	ms := p.decideListed()
+	// and the ones the user set to be asked on System One, first
+	if set := p.decideSetModels(); len(set) > 0 {
+		set = slices.DeleteFunc(set, func(m catalog.Model) bool {
+			return slices.ContainsFunc(ms, func(l catalog.Model) bool { return l.ID == m.ID })
+		})
+		ms = append(set, ms...)
+	}
+	return withDecideFacts(ms)
 }
 
 // A decision model's window and whether it reads images, as its vendor's
@@ -267,6 +503,15 @@ func decideFactOf(id string) (decideFact, bool) {
 		return decideFact{context: 65_536, images: true}, true
 	case last == BailianDecision:
 		return decideFact{context: 65_536}, true
+	case last == GoogleDecision:
+		// "up to 262,144 tokens" of text, images, video, audio and PDFs
+		// (its model page)
+		return decideFact{context: 262_144, images: true}, true
+	case last == ArkDecision:
+		// its window on System One is not documented; an image in the
+		// request was left unread on 11-01 (a red square asked "is it
+		// red?" came back 0.48, its input tokens as for no image)
+		return decideFact{}, true
 	}
 	return decideFact{}, false
 }
@@ -292,9 +537,24 @@ func withDecideFacts(ms []catalog.Model) []catalog.Model {
 }
 
 func (p Provider) decideListed() []catalog.Model {
+	if p.IsRemoteMagpie() {
+		live, _, _ := catalog.Live(p.ID)
+		// Live returns a filtered copy, so it can be compacted in place.
+		return slices.DeleteFunc(live, func(m catalog.Model) bool { return !m.Decides })
+	}
+	if p.bailianApart() {
+		return p.ownDecideModels()
+	}
+	if p.IsPlugin() {
+		// the plugin's list is the account's, never a guessed Jev alias
+		return p.pluginDecisions()
+	}
 	if p.listsDecisions() && !p.DecideOnly() {
 		if live, _, ok := catalog.Live(decisionsID(p.ID)); ok && len(live) > 0 {
 			return live
+		}
+		if p.serverMarksDecisions() {
+			return nil // none until its server says which
 		}
 		return []catalog.Model{{ID: OpenRouterJev, Name: "Jev"}}
 	}
@@ -355,8 +615,21 @@ func (p Provider) DecideURL(ctx context.Context) (string, error) {
 			}
 		}
 		return api + "/accounts/" + acct + "/ai/run", nil
+	case ViaGoogle:
+		return strings.TrimSuffix(strings.TrimRight(p.Decide, "/"), "/decisions") + "/decisions", nil
 	}
 	return p.Decide + "/systemone", nil
+}
+
+// DecideProtocol is the protocol p's decision API is signed as: Google's
+// as its Gemini API (x-goog-api-key, where a key as a Bearer token is
+// turned away, "Expected OAuth 2 access token"), every other as chat
+// completions.
+func (p Provider) DecideProtocol() Protocol {
+	if p.DecideVia() == ViaGoogle {
+		return Gemini
+	}
+	return Chat
 }
 
 // DecideModelURL is where a question for model is posted: DecideURL, or,
@@ -418,7 +691,7 @@ func (p Provider) cloudflareAccount(ctx context.Context) (string, error) {
 	if err := p.Sign(ctx, req, Chat, nil); err != nil {
 		return "", err
 	}
-	res, err := http.DefaultClient.Do(req)
+	res, err := Keyed(http.DefaultClient).Do(req)
 	if err != nil {
 		return "", fmt.Errorf("%s: %v", p.Name, err)
 	}
@@ -447,20 +720,58 @@ func (p Provider) cloudflareAccount(ctx context.Context) (string, error) {
 }
 
 // Deciders are the models of the decision providers ready now, as a
-// group's classifier names them.
+// group's classifier names them: every one the gateway answers.
 func Deciders() []Entry {
+	return deciders(nil)
+}
+
+// OfferedDeciders are the Deciders a routing group's pickers and templates
+// offer: of a provider whose decision models are listed beside its chat
+// models (OpenRouter's, a plugin's, a remote magpie's), with picks saved,
+// those among the picks alone, as its editor shows the
+// rest unpicked (coeo91 on Discord: two OpenRouter models picked, and a
+// new group's picker listed OpenRouter's twenty-odd decision models after
+// them). With none picked every one is offered, as before. keep, when
+// given, says a decision model a group names already, offered whatever
+// the picks, so a group made of one before reads as it did. A vendor's
+// own one decision model beside its chat models (a Bailian plan's, Ark's
+// pay as you go) is offered whatever the picks.
+func OfferedDeciders(keep func(id string) bool) []Entry {
+	if keep == nil {
+		keep = func(string) bool { return false }
+	}
+	return deciders(keep)
+}
+
+// deciders are Deciders, less the unpicked ones keep doesn't name when
+// keep is given.
+func deciders(keep func(id string) bool) []Entry {
 	var out []Entry
+	s := settings.Load()
+	off := disabledNow()
 	for _, p := range All() {
-		if !p.Decides() || !p.On() {
+		if !p.Decides() || !p.On() || p.ServesNone() && !p.DecideOnly() {
 			continue
 		}
 		ms := p.Exposed()
-		if !p.DecideOnly() && (len(p.Models) == 0 || p.listsDecisions()) {
+		if !p.DecideOnly() && (len(p.Models) == 0 || p.listsDecisions() || p.bailianApart() || p.IsRemoteMagpie() || p.IsPlugin()) {
 			ms = p.decideModels() // the conversation picker's limit does not hide Jev
+			// a vendor's own one decision model (Bailian's, Ark's) is no
+			// list to pick from: its chat models picked, it is offered
+			// still, as nothing in the picks says it isn't wanted
+			if keep != nil && len(p.Models) > 0 && !p.bailianApart() {
+				ms = slices.DeleteFunc(slices.Clone(ms), func(m catalog.Model) bool {
+					return !slices.Contains(p.Models, m.ID) && !keep(p.ID+"/"+m.ID)
+				})
+			}
 		}
 		for _, m := range ms {
-			if p.DecidesModel(m.ID) {
-				out = append(out, Entry{ID: p.ID + "/" + m.ID, Model: m.ID, Name: m.Name, Provider: p})
+			if p.isDecision(m) && !off(p.ID, m.ID) { // a disabled one isn't offered (#1867)
+				if p.IsRemoteMagpie() {
+					out = append(out, sharedEntry(&p, m, s))
+				} else {
+					out = append(out, Entry{ID: p.ID + "/" + m.ID, Model: m.ID, Name: m.Name, Provider: &p})
+				}
 			}
 		}
 	}
@@ -505,7 +816,10 @@ func RouteDecider(model string) (Provider, string, error) {
 		if !p.On() {
 			return Provider{}, "", decideBadRequest("%s is switched off in magpie", p.Name)
 		}
-		return p, p.Jev(), nil
+		if m := p.Jev(); m != "" {
+			return p, m, nil
+		}
+		return Provider{}, "", decideBadRequest("%s lists no decision models", p.Name)
 	}
 	var listed []Provider
 	for _, p := range on {
@@ -603,7 +917,7 @@ func resolveDecideModel(p Provider, name string) (string, bool) {
 			return name, true
 		}
 	}
-	if name == p.Jev() {
+	if name == p.Jev() || p.openRouterVariant(name) {
 		return name, true
 	}
 	// a gateway lists one Jev, named its own way; jev-latest is that model
@@ -631,6 +945,25 @@ func deciderByID(id string) (Provider, bool) {
 // account's Workers AI models, or by finding its account) and Jev is the
 // model.
 func (p Provider) fetchDecide(ctx context.Context) ([]catalog.Model, error) {
+	if p.IsRemoteMagpie() {
+		if _, err := p.fetch(ctx); err != nil {
+			return nil, err
+		}
+		return p.decideModels(), nil
+	}
+	if p.IsPlugin() {
+		// a plugin lists its decision models with its others and answers
+		// no list of its own at the decision base: the first is asked the
+		// smallest question, through its fetch, which is what checks it
+		ms := p.decideModels()
+		if len(ms) == 0 {
+			return nil, fmt.Errorf("%s's plugin lists no decision models", p.Name)
+		}
+		if err := p.AskSystemOne(ctx, ms[0].ID); err != nil {
+			return nil, err
+		}
+		return ms, nil
+	}
 	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 	switch p.DecideVia() {
@@ -663,18 +996,25 @@ func (p Provider) fetchDecide(ctx context.Context) ([]catalog.Model, error) {
 		list, all = u, true
 	} else if u := openRouterDecisions(p.Decide); u != "" {
 		list, all = u, true
-	} else if bailianDecides(p.Decide) {
-		// Bailian lists its chat models only: its decision model is asked
+	} else if p.omlxDecides() {
+		list = omlxDecisions(p.Decide)
+	} else if p.mlxServeDecides() {
+		list = mlxServeDecisions(p.Decide)
+	} else if p.ollamaDecides() {
+		list = ollamaDecisions(p.Decide)
+	} else if _, ok := vendorDecision(p.Decide); ok {
+		// Bailian and Ark list their chat models only: the decision model
+		// is asked
 		return p.decideAsked(ctx)
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, list, nil)
 	if err != nil {
 		return nil, err
 	}
-	if err := p.Sign(ctx, req, Chat, nil); err != nil {
+	if err := p.Sign(ctx, req, p.DecideProtocol(), nil); err != nil {
 		return nil, err
 	}
-	res, err := http.DefaultClient.Do(req)
+	res, err := Keyed(http.DefaultClient).Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -688,6 +1028,30 @@ func (p Provider) fetchDecide(ctx context.Context) ([]catalog.Model, error) {
 			return p.decideAsked(ctx)
 		}
 		return nil, fmt.Errorf("%s: %s", p.Name, APIError(b, res.Status))
+	}
+	if p.omlxDecides() {
+		// none is an answer too: the server has no decision model now
+		ms, err := listedOMLXDecide(b)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %s", p.Name, err)
+		}
+		return ms, catalog.SaveLive(decisionsID(p.ID), p.Decide, ms)
+	}
+	if p.mlxServeDecides() {
+		// none is an answer too: the server has no decision model now
+		ms, err := listedMLXServeDecide(b)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %s", p.Name, err)
+		}
+		return ms, catalog.SaveLive(decisionsID(p.ID), p.Decide, ms)
+	}
+	if p.ollamaDecides() {
+		// none is an answer too: no model of the server's is one
+		ms, err := listedOllamaDecide(p.Decide, b)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %s", p.Name, err)
+		}
+		return ms, catalog.SaveLive(decisionsID(p.ID), p.Decide, ms)
 	}
 	ms, err := listedDecide(b, all)
 	if (err != nil || len(ms) == 0) && own {
@@ -728,6 +1092,11 @@ func (p Provider) decideAsked(ctx context.Context) ([]catalog.Model, error) {
 // AskSystemOne sends model the smallest System One question at p's
 // decision API, and says why it wasn't answered.
 func (p Provider) AskSystemOne(ctx context.Context, model string) error {
+	// the model's own headers
+	ctx = WithModel(ctx, p.ID, model)
+	if pat, off := ModelDisabled(p.ID, model); off { // never asked (#1867)
+		return fmt.Errorf("model %s/%s is disabled in magpie (it matches %q)", p.ID, model, pat)
+	}
 	u, err := p.DecideModelURL(ctx, model)
 	if err != nil {
 		return err
@@ -737,24 +1106,26 @@ func (p Provider) AskSystemOne(ctx context.Context, model string) error {
 		"questions": map[string]any{"ok": map[string]any{"type": "noul", "instructions": "Is this a test?"}}})
 	via := p.DecideVia()
 	body = DecideAsk(via, model, body)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, strings.NewReader(string(body)))
+	req, err := http.NewRequestWithContext(probelog.WithModel(ctx, model), http.MethodPost, u, strings.NewReader(string(body)))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if err := p.Sign(ctx, req, Chat, nil); err != nil {
+	p.DecideHeaders(req.Header)
+	if err := p.Sign(ctx, req, p.DecideProtocol(), nil); err != nil {
 		return err
 	}
-	res, err := http.DefaultClient.Do(req)
+	// a plugin's goes through its fetch (Do), at plugin://<id>/v1/systemone
+	res, err := p.Do(http.DefaultClient, req)
 	if err != nil {
 		return fmt.Errorf("%s: %v", p.Name, err)
 	}
 	defer res.Body.Close()
 	b, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
-	if res.StatusCode != http.StatusOK {
-		return fmt.Errorf("%s: %s", p.Name, APIError(b, res.Status))
+	status, b := DecideResult(via, res.StatusCode, b)
+	if status != http.StatusOK {
+		return fmt.Errorf("%s: %s", p.Name, APIError(b, fmt.Sprintf("%d %s", status, http.StatusText(status))))
 	}
-	b = DecideAnswer(via, b)
 	var out struct {
 		Answers map[string]json.RawMessage `json:"answers"`
 	}
@@ -826,7 +1197,7 @@ type listedFacts struct {
 func (f listedFacts) model(name string) catalog.Model {
 	m := catalog.Model{ID: name, Name: name, Context: cmp.Or(f.ContextLength, f.ContextWindow)}
 	if in := cmp.Or(len(f.Architecture.InputModalities), len(f.Modalities.Input)); in > 0 {
-		images := slices.Contains(f.Architecture.InputModalities, "image") || slices.Contains(f.Modalities.Input, "image")
+		images := slices.Contains(catalog.Kinds(f.Architecture.InputModalities), "image") || slices.Contains(catalog.Kinds(f.Modalities.Input), "image")
 		m.ImageInput, m.Images = &images, images
 	}
 	return m
@@ -854,10 +1225,10 @@ func (p Provider) checkKey(ctx context.Context, u string) error {
 	if err != nil {
 		return err
 	}
-	if err := p.Sign(ctx, req, Chat, nil); err != nil {
+	if err := p.Sign(ctx, req, p.DecideProtocol(), nil); err != nil {
 		return err
 	}
-	res, err := http.DefaultClient.Do(req)
+	res, err := Keyed(http.DefaultClient).Do(req)
 	if err != nil {
 		return fmt.Errorf("%s: %v", p.Name, err)
 	}

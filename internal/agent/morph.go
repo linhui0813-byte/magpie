@@ -36,7 +36,7 @@ func morph(home string) *Agent { return morphIn(here(home)) }
 // morphIn is Mister Morph at a place: this machine's home, or a WSL distro's
 // (see wsl.go), where MISTER_MORPH_CONFIG isn't read.
 func morphIn(at place) *Agent {
-	dir := filepath.Join(at.home, ".morph")
+	dir := at.join(".morph")
 	path := at.getenv("MISTER_MORPH_CONFIG")
 	if path == "" {
 		path = filepath.Join(dir, "config.yaml")
@@ -81,7 +81,7 @@ func morphIn(at place) *Agent {
 	}
 	// window is the context magpie knows ref to take, 0 when unknown
 	window := func(ref string) int {
-		for _, m := range magpieModels("morph") {
+		for _, m := range sharedModels("morph") {
 			if m.ID == ref {
 				return m.Context
 			}
@@ -89,14 +89,14 @@ func morphIn(at place) *Agent {
 		return 0
 	}
 	return &Agent{
-		ID: "morph", Name: "Mister Morph", Icon: "mistermorph-color", Aliases: []string{"mistermorph", "mister-morph"}, Spelled: prefixed,
+		ID: "morph", Name: "Mister Morph", Icon: "mistermorph-color", Aliases: []string{"mistermorph", "mister-morph"}, Spelled: prefixed, NoNames: true,
 		UA: []string{morphUA},
 		// no Bin: morph is other tools' name too; ~/.morph is made by its
 		// first run, `morph install` or the desktop app's setup
 		Dir: dir, Path: path,
 		Notice: func() string {
 			if Running(`(^|/)morph( |$)`, `(^|/)mistermorph( |$)`) {
-				return "Mister Morph's Console uses this for new tasks; restart open morph chats to use it there."
+				return noticeMorph.String()
 			}
 			return ""
 		},
@@ -153,7 +153,7 @@ func morphIn(at place) *Agent {
 				return edit.SetYAML(path, edit.KV{Path: "llm.model", Value: v})
 			},
 			Options: func(cur map[string]string) []Option {
-				return append(ownOptions("", cur["model"]), viaMagpie("morph", magpieID+"/")...)
+				return withVia(ownOptions("", cur["model"]), "morph", magpieID+"/")
 			},
 		}, {
 			// llm.reasoning_effort; unset, morph sends none
@@ -171,3 +171,8 @@ func morphIn(at place) *Agent {
 		}},
 	}
 }
+
+// what morph says after a change (notice.go)
+var (
+	noticeMorph = newNotice("Mister Morph's Console uses this for new tasks; restart open morph chats to use it there.")
+)

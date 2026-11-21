@@ -1,6 +1,8 @@
 package gui
 
 import (
+	"os"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -30,14 +32,14 @@ func TestTrayUsageCells(t *testing.T) {
 	cards := trayCards()
 
 	// the ticked ones in the order ticked; one no longer there is left out
-	picked := trayPick(cards, []string{"codex|x@y.z", "gone|who", "claude|a@b.c"})
+	picked := trayPick(cards, []string{"codex|x@y.z", "gone|who", "claude|a@b.c"}, time.Now())
 	if len(picked) != 2 || picked[0].Provider != "codex" || picked[1].Provider != "claude" {
 		t.Fatalf("picked %+v", picked)
 	}
-	if got := trayPick(cards, nil); got != nil {
+	if got := trayPick(cards, nil, time.Now()); got != nil {
 		t.Fatalf("none ticked: %+v", got)
 	}
-	if got := trayPick(cards, []string{"claude"}); got != nil {
+	if got := trayPick(cards, []string{"claude"}, time.Now()); got != nil {
 		t.Fatalf("the vendor without the account: %+v", got)
 	}
 
@@ -52,7 +54,7 @@ func TestTrayUsageCells(t *testing.T) {
 		{[]string{"claude|a@b.c", "codex|x@y.z", "copilot", "deepseek"},
 			[][]string{{"42%", "18%"}, {"8%", "100%"}, {"63%"}, {"¥12.30"}}, "42% · 18% | 8% · 100% | 63% | ¥12.30"},
 	} {
-		cells, label, tip := trayUsageView(trayPick(cards, tc.ids), now, false)
+		cells, label, tip := trayUsageView(trayPick(cards, tc.ids, now), now, false, false)
 		if label != tc.label {
 			t.Errorf("%v: label %q, want %q", tc.ids, label, tc.label)
 		}
@@ -71,7 +73,7 @@ func TestTrayUsageCells(t *testing.T) {
 
 	// each cell with its logo as the page draws it: its own colours, or a
 	// black glyph to tint; the name's letter always there to fall back on
-	cells, _, _ := trayUsageView(cards, now, false)
+	cells, _, _ := trayUsageView(cards, now, false, false)
 	for i, want := range []struct {
 		mono   bool
 		letter string
@@ -83,7 +85,7 @@ func TestTrayUsageCells(t *testing.T) {
 		}
 	}
 	// what is left, as Settings says
-	if cells, label, _ := trayUsageView(cards[:2], now, true); label != "58% · 82% | 92% · 0%" || !slices.Equal(cells[1].Rows, []string{"92%", "0%"}) {
+	if cells, label, _ := trayUsageView(cards[:2], now, true, false); label != "58% · 82% | 92% · 0%" || !slices.Equal(cells[1].Rows, []string{"92%", "0%"}) {
 		t.Errorf("left: %q %+v", label, cells)
 	}
 
@@ -97,7 +99,7 @@ func TestTrayUsageCells(t *testing.T) {
 		{Provider: "zcode", Name: "ZCode", Icon: "zcode", Windows: []provider.QuotaWindow{{Name: "5 小时", Used: 1}}},
 		{Provider: "x", Name: "", Icon: "../api", Balance: "1"},
 	}
-	cells, label, tip := trayUsageView(odd, now, false)
+	cells, label, tip := trayUsageView(odd, now, false, false)
 	if label != "$3 | 1% | 1" || tip != "Codex: signed out\n\nmy plan · $3\n\nZCode\n5 小时 1% used\n\n · 1" {
 		t.Errorf("odd: %q %q", label, tip)
 	}
@@ -106,11 +108,11 @@ func TestTrayUsageCells(t *testing.T) {
 	}
 	// a balance too long for the bar is cut there, whole in the tooltip
 	long := provider.SubscriptionQuota{Provider: "p", Name: "Plan", Balance: "12,345.67 credits left"}
-	if cells, label, tip := trayUsageView([]provider.SubscriptionQuota{long}, now, false); len(cells) != 1 ||
+	if cells, label, tip := trayUsageView([]provider.SubscriptionQuota{long}, now, false, false); len(cells) != 1 ||
 		!slices.Equal(cells[0].Rows, []string{"12,345.67…"}) || label != long.Balance || !strings.Contains(tip, long.Balance) {
 		t.Errorf("long: %+v %q %q", cells, label, tip)
 	}
-	if cells, label, tip := trayUsageView(odd[:2], now, false); cells != nil || label != "" || tip != "Codex: signed out" {
+	if cells, label, tip := trayUsageView(odd[:2], now, false, false); cells != nil || label != "" || tip != "Codex: signed out" {
 		t.Errorf("nothing to draw: %+v %q %q", cells, label, tip)
 	}
 }
@@ -121,7 +123,7 @@ func TestTrayCellsCards(t *testing.T) {
 	cards := trayCards()
 	cards[0].User = "a\"b\\c@例子.test"
 	cards[1].Error = "signed out"
-	cells, _, _ := trayUsageView(cards, time.Now(), false)
+	cells, _, _ := trayUsageView(cards, time.Now(), false, false)
 	plain := trayPlain(cells)
 	if len(cells) != len(cards)-1 {
 		t.Fatalf("cells: %d", len(cells))
@@ -159,5 +161,39 @@ func TestSVGArcFlags(t *testing.T) {
 	b, _ := trayIconFile("codex-color")
 	if !strings.Contains(string(b), "A 4.496 4.496 0 0 0 0 4.496") {
 		t.Errorf("codex's logo not spaced out: %.300s", b)
+	}
+}
+
+// A card's logo can be a picture the plugin gave (a stored "file:…" one),
+// which the menu bar reads as the page's icons are read, in its own
+// colours; anything else under "file:" is refused and the name's letter
+// drawn in its place.
+func TestTrayIconFileStored(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+
+	png := []byte("\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR")
+	kept, err := provider.StoreIcon(png)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, mono := trayIconFile(kept)
+	if mono || string(b) != string(png) {
+		t.Errorf("trayIconFile(%q) = %d bytes, mono %v", kept, len(b), mono)
+	}
+	// each file a refused name could reach is there, so a refusal is the
+	// name's check and not a missing file
+	dir := provider.IconDir()
+	for _, f := range []string{filepath.Join(dir, "mine.png"), filepath.Join(dir, "..", "providers.json"), filepath.Join(dir, "0123456789abcdef.exe")} {
+		if err := os.WriteFile(f, png, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, bad := range []string{"file:mine.png", "file:../providers.json", "file:", "http://x/y.png", "file:0123456789abcdef.exe"} {
+		if b, mono = trayIconFile(bad); b != nil || mono {
+			t.Errorf("trayIconFile(%q) = %d bytes, mono %v", bad, len(b), mono)
+		}
 	}
 }

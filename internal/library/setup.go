@@ -121,7 +121,7 @@ func Snapshot() (*Setup, error) {
 		return nil, err
 	}
 	s := &Setup{
-		Instructions: SetupInstructions{Set: l.active(), Shared: readText(l.sharedPath()), Agents: slices.Clone(l.Instructions.Agents), Extra: extras()},
+		Instructions: SetupInstructions{Set: l.active(), Shared: setText(l.sharedPath()), Agents: slices.Clone(l.Instructions.Agents), Extra: extras()},
 		MCP:          map[string][]string{},
 		Skills:       map[string][]string{},
 	}
@@ -138,6 +138,52 @@ func Snapshot() (*Setup, error) {
 		s.Skills[x.Name] = append([]string{}, x.Agents...)
 	}
 	return s, nil
+}
+
+// Holds reports whether the library is as s has it: Restore would put back
+// nothing that differs. A server or skill s names that the library no
+// longer has isn't compared, as Restore can't give it either, nor one added
+// since s was taken, which Restore leaves as it is.
+func Holds(s *Setup) bool {
+	mu.Lock()
+	defer mu.Unlock()
+	l, err := load()
+	if err != nil {
+		return false
+	}
+	if l.hasSet(s.Instructions.Set) && l.active() != s.Instructions.Set {
+		return false
+	}
+	if setText(l.sharedPath()) != strings.TrimSpace(s.Instructions.Shared) {
+		return false
+	}
+	for id, text := range extras() {
+		if strings.TrimSpace(text) != strings.TrimSpace(s.Instructions.Extra[id]) {
+			return false
+		}
+	}
+	for id, text := range s.Instructions.Extra {
+		if checkAgent(id) == nil && readText(extraPath(id)) != strings.TrimSpace(text) {
+			return false
+		}
+	}
+	same := func(a, b []string) bool {
+		return slices.Equal(slices.Sorted(slices.Values(a)), slices.Sorted(slices.Values(b)))
+	}
+	if !same(l.Instructions.Agents, s.Instructions.Agents) {
+		return false
+	}
+	for name, agents := range s.MCP {
+		if x := l.server(name); x != nil && !same(x.Agents, agents) {
+			return false
+		}
+	}
+	for name, agents := range s.Skills {
+		if x := l.skill(name); x != nil && !same(x.Agents, agents) {
+			return false
+		}
+	}
+	return true
 }
 
 // Restore gives the servers and skills to the agents s names and puts the
@@ -175,7 +221,7 @@ func Restore(s *Setup) (*Result, error) {
 			if err := b.keep("library", p); err != nil {
 				return err
 			}
-			if err := writeText(p, text); err != nil {
+			if err := l.putText(p, text); err != nil {
 				return err
 			}
 		}
@@ -201,4 +247,27 @@ func Restore(s *Setup) (*Result, error) {
 		res.Missing = missing
 	}
 	return res, err
+}
+
+// InUse counts what the library gives agents: each server, skill, hook
+// and project folder it keeps, and the shared instructions while an agent
+// gets them. The library built-in plugin stays on while it is
+// more than 0. A library.json that can't be read is an error, never 0.
+//
+// It reads without mu: a sync holds mu for as long as it takes (13s and
+// more with many agents and skills), and boot.js, which the window waits
+// on before it paints, asks this through the built-in plugins (#2774: a
+// white window at start on macOS). library.json is only ever replaced
+// whole (save's edit.WriteAtomic), so a read beside a sync sees the file
+// before or after one of its writes, never half of it.
+func InUse() (int, error) {
+	l, err := load()
+	if err != nil {
+		return 0, err
+	}
+	n := len(l.MCP) + len(l.Skills) + len(l.Hooks) + len(l.Projects)
+	if len(l.Instructions.Agents) > 0 {
+		n++
+	}
+	return n, nil
 }

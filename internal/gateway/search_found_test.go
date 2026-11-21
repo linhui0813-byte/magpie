@@ -356,19 +356,30 @@ func TestSearcherFindingNothingGivesWay(t *testing.T) {
 	// another searcher, next in magpie's order, answers before the APIs
 	apis.asked = nil
 	ds2 := newFakeDeepSeek(t)
-	searchesOn(t, provider.Anthropic, ds2.URL)
-	save(t, provider.Provider{ID: "ds2", Name: "DeepSeek 2", Key: "k", Anthropic: ds2.URL + "/anthropic", Models: []string{"deepseek-flash"}})
+	searchesOn(t, provider.Responses, ds2.URL)
+	save(t, provider.Provider{ID: "ds2", Name: "DeepSeek 2", Key: "k", Responses: ds2.URL + "/v1", Models: []string{"deepseek-flash"}})
+	if p, _, _ := searcher(); p.ID != "ds" {
+		t.Fatalf("magpie's searcher is %s", p.ID)
+	}
+	blocks = searchAsClaudeCode(t)
+	if len(apis.asked) != 0 || len(ds2.searches()) != 1 {
+		t.Fatalf("APIs asked %q, the next searcher %q", apis.asked, ds2.searches())
+	}
+	if found, _ = blocks[0]["content"].([]any); len(found) != 1 || found[0].(map[string]any)["url"] != "https://www.weather.com.cn/weather/101020100.shtml" {
+		t.Fatalf("blocks %v", blocks)
+	}
+
+	// one picked in Settings gives way to the APIs only, never to ds2
+	// (Gearclickist on Discord)
+	apis.asked = nil
 	st := settings.Load()
 	st.Searcher = "ds"
 	if err := settings.Save(st); err != nil {
 		t.Fatal(err)
 	}
 	blocks = searchAsClaudeCode(t)
-	if len(apis.asked) != 0 || len(ds2.searches()) != 1 {
+	if strings.Join(apis.asked, "|") != "tavily: 今天上海天气" || len(ds2.searches()) != 1 {
 		t.Fatalf("APIs asked %q, the next searcher %q", apis.asked, ds2.searches())
-	}
-	if found, _ = blocks[0]["content"].([]any); len(found) != 2 {
-		t.Fatalf("blocks %v", blocks)
 	}
 }
 

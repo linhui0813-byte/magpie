@@ -2,9 +2,12 @@ package proc
 
 import (
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
+	"strings"
+
+	"github.com/yetone/magpie/internal/lazyre"
 )
 
 // FindTool is the command-line tool name as a terminal would run it: on
@@ -12,24 +15,71 @@ import (
 // (UserBinDirs), else, on Windows, on the PATH the registry has now, which
 // a magpie started before the tool was installed doesn't have (#839: the
 // Claude sign-in said Claude Code wasn't installed, its installer having
-// put claude.exe in ~/.local/bin after magpie started). "" when none.
+// put claude.exe in ~/.local/bin after magpie started). A version
+// manager's wrapper script found there is given as the program it runs
+// (Unwrap). "" when none. Where it is on PATH is kept while those folders
+// are unchanged (LookPath); Unwrap keeps its own answer by the script's
+// size and time.
 func FindTool(name string) string {
-	if p, err := exec.LookPath(name); err == nil {
-		return p
-	}
-	dirs := UserBinDirs()
-	if runtime.GOOS == "windows" {
-		dirs = append(dirs, LoginPath()...)
-	}
-	return toolIn(name, runtime.GOOS, dirs)
+	return Unwrap(name, looked("find\x00"+name, func() lookAnswer {
+		if p, err := lookPath(name); err == nil {
+			return lookAnswer{path: p}
+		}
+		dirs := findDirs()
+		if !mayBeIn(name, dirs) {
+			return lookAnswer{}
+		}
+		return lookAnswer{path: toolIn(name, runtime.GOOS, dirs)}
+	}).path)
 }
 
+// sandboxVar is testenv.Marker, which proc can't import: the home a test
+// binary's testenv.Isolate made.
+const sandboxVar = "MAGPIE_TEST_SANDBOX"
+
+// Isolated reports whether this is a test binary testenv isolated, where
+// nothing of the machine's own (its folders, its registry) is read.
+func Isolated() bool { return os.Getenv(sandboxVar) != "" }
+
+// SystemDirs are paths of the machine's own, outside any home (Homebrew's
+// /opt/homebrew/bin, /usr/local/bin, an app in /Applications, the
+// registry's PATH), as discovery looks in them: as they are, except in a
+// test binary testenv isolated, where each lies under the test's home
+// instead. A test that empties PATH means a machine without the tool; the
+// host's /opt/homebrew/bin/claude was found anyway, so the tests of the
+// downloaded Claude Code failed on a Mac with Homebrew's (#1525). A test
+// that wants one there writes it under its home at that path.
+func SystemDirs(paths ...string) []string {
+	root := os.Getenv(sandboxVar)
+	if root == "" {
+		return paths
+	}
+	out := make([]string, 0, len(paths))
+	for _, p := range paths {
+		if p == "" {
+			continue
+		}
+		out = append(out, filepath.Join(root, "system", strings.TrimPrefix(p, filepath.VolumeName(p))))
+	}
+	return out
+}
+
+// ToolIn is name's program in the first of dirs that has one, as toolIn
+// finds it on this system.
+func ToolIn(name string, dirs []string) string { return toolIn(name, runtime.GOOS, dirs) }
+
 // toolIn is name's program in the first of dirs that has one: on Windows
-// name.exe, name.cmd or name, as npm's shim or an installer's binary.
+// name.exe or name.cmd, as an installer's binary or npm's shim, else the
+// program npm's sh shim name runs, when that is a Windows program
+// (npmShimExe). A file with no extension is never run on Windows itself:
+// CreateProcess refuses it ("%1 is not a valid Win32 application"), and
+// what npm left of its shims when an install failed partway is that sh
+// one alone (CLJY on Discord: %APPDATA%\npm\claude, 308 bytes, with no
+// claude.cmd beside it, was what magpie ran).
 func toolIn(name, goos string, dirs []string) string {
 	names := []string{name}
 	if goos == "windows" {
-		names = []string{name + ".exe", name + ".cmd", name}
+		names = []string{name + ".exe", name + ".cmd"}
 	}
 	for _, d := range dirs {
 		if d == "" {
@@ -41,6 +91,111 @@ func toolIn(name, goos string, dirs []string) string {
 				return p
 			}
 		}
+		if goos == "windows" {
+			if p := npmShimExe(filepath.Join(d, name)); p != "" {
+				return p
+			}
+		}
 	}
 	return ""
+}
+
+// npmShimLine is the line of npm's sh shim (cmd-shim) that runs a program
+// of its package's directly: exec "$basedir/node_modules/<pkg>/<bin>" "$@".
+// A shim of a node script names node first, and isn't matched.
+var npmShimLine = lazyre.New(`(?m)^\s*exec "\$basedir/([^"$]+\.exe)"\s+"\$@"`)
+
+// npmShimExe is the Windows program the npm sh shim at path runs, where it
+// is: Claude Code's is node_modules\@anthropic-ai\claude-code\bin\claude.exe.
+// "" when path is no such shim or its program is gone.
+func npmShimExe(path string) string {
+	st, err := os.Stat(path)
+	if err != nil || st.IsDir() || st.Size() > wrapperMax {
+		return ""
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	m := npmShimLine.FindSubmatch(b)
+	if m == nil {
+		return ""
+	}
+	rel := filepath.FromSlash(string(m[1]))
+	if !filepath.IsLocal(rel) {
+		return ""
+	}
+	exe := filepath.Join(filepath.Dir(path), rel)
+	if st, err := os.Stat(exe); err != nil || st.IsDir() {
+		return ""
+	}
+	return exe
+}
+
+// bunBin is the folder `bun add -g` puts programs in when BUN_INSTALL says
+// where bun lives (a Windows user's bun is often installed elsewhere than
+// ~\.bun); "" without it, when ~/.bun/bin is the one.
+func bunBin() string {
+	if d := os.Getenv("BUN_INSTALL"); filepath.IsAbs(d) {
+		return filepath.Join(d, "bin")
+	}
+	return ""
+}
+
+// FindTools is every program for the command-line tool name this machine
+// has, in the order FindTool ranks them: each of PATH's folders, then the
+// folders a user's tools are installed in. One program found twice (a
+// link to it in two folders) is given once, where it comes first; a
+// version manager's wrapper script is given as the program it runs
+// (Unwrap). A machine can have two: a Claude Code installed with npm in
+// two Node versions, the first on PATH an old one `claude update` no
+// longer reaches (zi_xiang5806 on X). Kept as FindTool's answer is.
+func FindTools(name string) []string {
+	a := looked("findall\x00"+name, func() lookAnswer {
+		dirs := pathDirs()
+		if hung := hungDirs(dirs); hung != nil {
+			dirs = slices.DeleteFunc(slices.Clone(dirs), func(d string) bool { return hung[d] })
+		}
+		var found []string
+		seen := map[string]bool{}
+		add := func(p string) {
+			if p == "" {
+				return
+			}
+			key := p
+			if r, err := RealPath(p); err == nil {
+				key = r
+			}
+			if !seen[key] {
+				seen[key] = true
+				found = append(found, p)
+			}
+		}
+		if mayBeIn(name, dirs) {
+			for _, d := range dirs {
+				if d == "" || d == "." {
+					continue
+				}
+				if p, err := execLookPath(filepath.Join(d, name)); err == nil {
+					add(p)
+				}
+			}
+		}
+		if more := findDirs(); mayBeIn(name, more) {
+			for _, d := range more {
+				add(toolIn(name, runtime.GOOS, []string{d}))
+			}
+		}
+		return lookAnswer{path: strings.Join(found, "\x00")}
+	})
+	if a.path == "" {
+		return nil
+	}
+	var out []string
+	for _, p := range strings.Split(a.path, "\x00") {
+		if p = Unwrap(name, p); !slices.Contains(out, p) {
+			out = append(out, p)
+		}
+	}
+	return out
 }

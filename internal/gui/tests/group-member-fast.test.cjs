@@ -6,7 +6,11 @@
 // "Fast", and one that has none shows no toggle. Clicking it moves nothing
 // on the page; saved, the members sent fast go as fast, and a member whose
 // reasoning is changed stays fast under its new id, while one taken out
-// leaves it. In English and Chinese, Chromium and WebKit.
+// leaves it. A GPT model on a provider the user added by its address
+// (ownFast, #1615) has the toggle too, off until clicked, and its title says
+// fast is asked of the provider; one OpenAI offers Ultrafast on (ultraOK)
+// goes on to Ultrafast, and its title says that is asked for. A group's
+// card says "· Ultrafast" of a member sent so, not "· fast" (OoopsHh on X). In English and Chinese, Chromium and WebKit.
 const assert = require("node:assert/strict");
 const fs = require("node:fs/promises");
 const path = require("node:path");
@@ -18,17 +22,34 @@ const models = [
   { id: "oa/gpt-6.1-sol", name: "gpt-6.1-sol", providerName: "OpenAI", icon: "generic", efforts: ["low", "medium", "high", "xhigh"], canFast: true },
   { id: "an/claude-opus-5-5", name: "claude-opus-5-5", providerName: "Anthropic", icon: "generic", canFast: true },
   { id: "rl/glm-5", name: "glm-5", providerName: "Relay", icon: "generic" },
+  // a GPT model on a provider the user added by its address (#1615)
+  { id: "rl/o4-mini", name: "o4-mini", providerName: "Relay", icon: "generic", canFast: true, ownFast: true },
+  // one OpenAI offers Ultrafast on (KoiLx0 on X)
+  { id: "rl/gpt-6.2-sol", name: "gpt-6.2-sol", providerName: "Relay", icon: "generic", canFast: true, ownFast: true, ultraOK: true },
+  // #6881's member (paul-tian; ggbdpq's fixture): a Codex account's
+  // GPT-6-Astra set Ultrafast, which the list read as Fast
+  { id: "cx/gpt-6-astra", name: "gpt-6-astra", providerName: "Codex", icon: "generic", canFast: true, ultraOK: true },
 ];
-const members = ["oa/gpt-6.1-sol:high", "an/claude-opus-5-5", "rl/glm-5"];
+const members = ["oa/gpt-6.1-sol:high", "an/claude-opus-5-5", "rl/glm-5", "rl/o4-mini", "rl/gpt-6.2-sol"];
 const groups = () => ({
   models, pools: [],
   groups: [{ id: "sol", name: "Sol", members, fast: ["oa/gpt-6.1-sol:high"], routing: "order", ready: true,
-    memberInfo: members.map((id) => ({ id, ready: true, fast: id === "oa/gpt-6.1-sol:high", canFast: !id.startsWith("rl/") })) }],
+    memberInfo: members.map((id) => ({ id, ready: true, fast: id === "oa/gpt-6.1-sol:high", canFast: id !== "rl/glm-5", ownFast: id.startsWith("rl/") && id !== "rl/glm-5", ultraOK: id === "rl/gpt-6.2-sol" })) },
+  // one sent Ultrafast: its card says Ultrafast, not fast (OoopsHh on X)
+  { id: "astra", name: "Astra", members: ["cx/gpt-6-astra", "rl/gpt-6.2-sol"], fast: ["cx/gpt-6-astra", "rl/gpt-6.2-sol"], ultra: ["cx/gpt-6-astra", "rl/gpt-6.2-sol"], routing: "order", ready: true,
+    memberInfo: [{ id: "cx/gpt-6-astra", ready: true, fast: true, ultra: true, canFast: true, ultraOK: true },
+      { id: "rl/gpt-6.2-sol", ready: true, fast: true, ultra: true, canFast: true, ownFast: true, ultraOK: true }] }],
 });
 
 const words = {
-  en: { edit: "Edit", save: "Save", fast: "Fast", std: "Standard speed", label: "gpt-6.1-sol · high reasoning · fast", remove: "Remove" },
-  zh: { edit: "编辑", save: "保存", fast: "快速", std: "标准速度", label: "gpt-6.1-sol · high 推理强度 · 快速", remove: "移除" },
+  en: { edit: "Edit", save: "Save", fast: "Fast", std: "Standard speed", label: "gpt-6.1-sol · high reasoning · fast", ultraLabel: "gpt-6.2-sol · Ultrafast", codexLabel: "gpt-6-astra · Ultrafast", remove: "Remove",
+    ownOff: 'Sent as the agent asks; click to ask your provider for OpenAI\'s fast mode (service_tier "priority")',
+    ownOn: 'Asked for OpenAI\'s fast mode (service_tier "priority") whatever the agent asks: quicker, at a higher price, where your provider serves it. One that turns it away is asked without it',
+    ultra: "Ultrafast", ownUltra: 'Asked for service_tier "ultrafast" whatever the agent asks, where your provider serves it. One that turns it away is asked without it. Click to send it at the usual speed' },
+  zh: { edit: "编辑", save: "保存", fast: "快速", std: "标准速度", label: "gpt-6.1-sol · high 推理强度 · 快速", ultraLabel: "gpt-6.2-sol · 极速", codexLabel: "gpt-6-astra · 极速", remove: "移除",
+    ownOff: '按代理的请求发送；点击向你的服务商请求 OpenAI 的快速模式（service_tier "priority"）',
+    ownOn: '无论代理怎么请求，都向服务商请求 OpenAI 的快速模式（service_tier "priority"）：服务商支持时更快，价格更高。服务商拒绝这个字段时，会去掉它再请求一次',
+    ultra: "极速", ownUltra: '无论 Agent 要求什么，都向你的服务商请求极速（service_tier "ultrafast"），前提是它支持；不接受的会改为不带该字段重新请求。点一下改回标准速度' },
 };
 
 function serve(lang, posts) {
@@ -72,13 +93,17 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await browser.close();
       });
       page.setDefaultTimeout(5000);
+      page.setDefaultNavigationTimeout(60000);
       const errors = [], posts = [];
       page.on("pageerror", (e) => errors.push(e.message));
       await page.route("**/*", serve(lang, posts));
-      await page.goto("http://magpie.test/?view=routing");
-      const card = page.locator(".rt-group", { hasText: "Sol" });
+      await page.goto("http://magpie.test/?view=groups");
+      const card = page.locator('.rt-group[data-id="sol"]');
       await card.waitFor();
       assert((await card.locator(".mem").textContent()).includes(w.label), "the card says the member is sent fast");
+      const ultraCard = (await page.locator('.rt-group[data-id="astra"]').locator(".mem").textContent());
+      assert(ultraCard.includes(w.ultraLabel), `the card says the member is sent Ultrafast: ${ultraCard}`);
+      assert(ultraCard.includes(w.codexLabel) && !ultraCard.includes(`gpt-6-astra · ${w.label.split(" · ").pop()}`), `the card says #6881's Codex member is sent Ultrafast: ${ultraCard}`);
 
       await card.locator("button", { hasText: w.edit }).click();
       const ed = page.locator(".rt-gedit");
@@ -90,6 +115,11 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       assert.equal(await fast("claude-opus-5-5").textContent(), w.std);
       assert.equal(await fast("claude-opus-5-5").getAttribute("aria-pressed"), "false");
       assert.equal(await fast("glm-5").count(), 0, "no fast mode, no toggle");
+      // on the user's own provider (#1615): off by default, and it says
+      // fast is only asked of the provider
+      assert.equal(await fast("o4-mini").getAttribute("aria-pressed"), "false");
+      assert.equal(await fast("o4-mini").getAttribute("title"), w.ownOff);
+      assert.notEqual(await fast("claude-opus-5-5").getAttribute("title"), w.ownOff);
       const border = await page.evaluate(() => [...document.querySelectorAll(".rt-fast")].map((e) => getComputedStyle(e))
         .filter((c) => c.borderLeftWidth !== c.borderRightWidth || c.borderLeftColor !== c.borderRightColor));
       assert.equal(border.length, 0, "no left-border accent");
@@ -114,6 +144,19 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await row("claude-opus-5-5").locator("button.text", { hasText: w.remove }).click();
       assert.equal(await row("claude-opus-5-5").count(), 0);
 
+      await fast("o4-mini").click();
+      assert.equal(await fast("o4-mini").textContent(), w.fast);
+      assert.equal(await fast("o4-mini").getAttribute("title"), w.ownOn);
+      await fast("o4-mini").click();
+      assert.equal(await fast("o4-mini").textContent(), w.std, "no Ultrafast where OpenAI offers none");
+      await fast("o4-mini").click();
+      // usual -> fast -> Ultrafast on the one OpenAI offers it on
+      await fast("gpt-6.2-sol").click();
+      assert.equal(await fast("gpt-6.2-sol").textContent(), w.fast);
+      await fast("gpt-6.2-sol").click();
+      assert.equal(await fast("gpt-6.2-sol").textContent(), w.ultra);
+      assert.equal(await fast("gpt-6.2-sol").getAttribute("title"), w.ownUltra);
+
       const b = ed.locator("button.primary", { hasText: w.save });
       await page.mouse.move(550, 600);
       for (let i = 0; i < 10 && (await b.boundingBox()).y > 1400 - 160; i++) {
@@ -124,14 +167,21 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await page.mouse.click(bb.x + bb.width / 2, bb.y + bb.height / 2);
       await page.waitForFunction(() => !document.querySelector(".rt-gedit"));
       const sent = posts.find((p) => p.path === "/api/groups/save");
-      assert.deepEqual(sent.body.members, ["oa/gpt-6.1-sol:xhigh", "rl/glm-5"]);
-      assert.deepEqual(sent.body.fast, ["oa/gpt-6.1-sol:xhigh"]);
+      assert.deepEqual(sent.body.members, ["oa/gpt-6.1-sol:xhigh", "rl/glm-5", "rl/o4-mini", "rl/gpt-6.2-sol"]);
+      assert.deepEqual(sent.body.fast, ["oa/gpt-6.1-sol:xhigh", "rl/o4-mini", "rl/gpt-6.2-sol"]);
+      assert.deepEqual(sent.body.ultra, ["rl/gpt-6.2-sol"]);
 
       const missing = await page.evaluate(() => [
-        "fast", "Fast", "Standard speed", "Sent in its vendor's fast mode, as the group says",
+        "fast", "Fast", "Ultrafast", "Standard speed", "Sent in its vendor's fast mode, as the group says",
+        "Sent Ultrafast where the account offers it, as the group says",
         "Sent in its vendor's fast mode whatever the agent asks: quicker, at a higher price",
         "Sent at its vendor's usual speed; click to send it in fast mode",
-      ].filter((k) => !I18N.zh[k]));
+        'Asked for OpenAI\'s fast mode (service_tier "priority") whatever the agent asks: quicker, at a higher price, where your provider serves it. One that turns it away is asked without it',
+        'Sent as the agent asks; click to ask your provider for OpenAI\'s fast mode (service_tier "priority")',
+        'Asked for service_tier "ultrafast" whatever the agent asks, where your provider serves it. One that turns it away is asked without it. Click to send it at the usual speed',
+        "{model} is asked for OpenAI's fast mode for {agent}, where your provider serves it. Click to send it as {agent} asks",
+        'Ask your provider for OpenAI\'s fast mode (service_tier "priority") on {model} for {agent}: quicker, at a higher price, where it serves it',
+      ].filter((k) => !I18N.zh[k] || !I18N["zh-TW"][k] || !I18N.ja[k] || !I18N.de[k]));
       assert.deepEqual(missing, [], "every string has its Chinese");
       assert.deepEqual(errors, []);
     });

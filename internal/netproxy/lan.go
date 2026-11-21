@@ -3,6 +3,7 @@ package netproxy
 import (
 	"context"
 	"net"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -15,7 +16,9 @@ import (
 // Gateway, and its model list never came). A proxy is for reaching
 // vendors; one elsewhere can't reach the user's network, and one on this
 // computer would only go there directly itself. A provider's own proxy
-// (With) is still taken as it is: that one was set for it.
+// (With) is still taken as it is: that one was set for it. The plugin
+// host applies the same rule to plugins' requests (onLAN in
+// internal/plugin/host.js, #1572): a change here is made there too.
 
 // lanLookup resolves a name to its addresses; tests replace it.
 var lanLookup = func(ctx context.Context, host string) ([]net.IPAddr, error) {
@@ -83,4 +86,34 @@ var cgnat = &net.IPNet{IP: net.IPv4(100, 64, 0, 0), Mask: net.CIDRMask(10, 32)}
 
 func lanIP(ip net.IP) bool {
 	return ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLoopback() || cgnat.Contains(ip)
+}
+
+// lanDial is how long a connection to an address on the user's own
+// network is waited for: one there is taken within milliseconds, while
+// one nobody holds any more (a Remote magpie whose computer's router
+// handed it another address, le13ure on X) went unanswered until the
+// system gave up, over a minute on macOS and two on Linux, each try of a
+// request, before its retries, or the look for where it went
+// (provider's SeekMoved), could begin.
+var lanDial = 5 * time.Second
+
+// lanDialCap has t give up on connecting to a private or link-local
+// address after lanDial. A name is left to the system's wait: it may
+// stand for an address outside, and Tailscale's (100.64/10), relayed on
+// its first packets, may take longer.
+func lanDialCap(t *http.Transport) {
+	dial := t.DialContext
+	if dial == nil {
+		dial = (&net.Dialer{}).DialContext
+	}
+	t.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if h, _, err := net.SplitHostPort(addr); err == nil {
+			if ip := net.ParseIP(h); ip != nil && (ip.IsPrivate() || ip.IsLinkLocalUnicast()) {
+				ctx, cancel := context.WithTimeout(ctx, lanDial)
+				defer cancel()
+				return dial(ctx, network, addr)
+			}
+		}
+		return dial(ctx, network, addr)
+	}
 }

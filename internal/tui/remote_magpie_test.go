@@ -73,24 +73,46 @@ func TestTUIAddsARemoteMagpieWithItsAddress(t *testing.T) {
 		t.Fatalf("after w: %q %q key %q", p.Chat, p.Anthropic, p.Key)
 	}
 
-	// a vendor of its own address has none to change
+	// a vendor of its own address has none to change (a provider of the
+	// user's own does: TestTUIEditsACustomProvidersBaseURL)
+	if err := provider.Save(provider.Provider{ID: "deepseek", Name: "DeepSeek", Preset: "deepseek", Key: "kd", Chat: "https://api.deepseek.com/v1"}); err != nil {
+		t.Fatal(err)
+	}
 	m.reloadProviders()
 	for i, q := range m.provs {
-		if q.ID == "a" {
+		if q.ID == "deepseek" {
 			m.prow = i
 		}
 	}
 	m = press(t, m, "w")
 	if m.mode == modeAsk {
-		t.Fatal("w asked a custom provider's address")
+		t.Fatal("w asked a vendor's address")
 	}
 }
 
 // Adding a provider fetches its list and says what came of it — how many
 // models, or why none — and m on the Providers page fetches it again, as
-// the app editor's Refresh does (akic404 on Discord: added from the TUI,
+// the app editor's Fetch models does (akic404 on Discord: added from the TUI,
 // a remote magpie had 0 models, with nothing said and no way to fetch
 // them).
+// The add list says what Remote magpie is, another computer's magpie, and
+// doesn't file it under the relays (Avalon on Discord: "供应商添加中没有
+// Remote magpie 的选项").
+func TestTUIAddListSaysRemoteMagpieIsAnotherComputers(t *testing.T) {
+	home(t)
+	m := press(t, model{w: 120, h: 40}, "2", "a")
+	for _, o := range m.pk.items {
+		if o.Value != provider.RemoteMagpiePreset {
+			continue
+		}
+		if o.Note != "Remote magpie · another computer's magpie, shared on its network" {
+			t.Fatalf("Remote magpie is listed as %q", o.Note)
+		}
+		return
+	}
+	t.Fatal("Remote magpie is not in the add list")
+}
+
 func TestTUIFetchesAProvidersModels(t *testing.T) {
 	home(t)
 	var mu sync.Mutex
@@ -168,5 +190,27 @@ func TestTUIFetchesAProvidersModels(t *testing.T) {
 	wantFlash(t, m, false, "m asks again")
 	if p, _ := provider.Find("remote-magpie"); len(p.Exposed()) != 3 {
 		t.Fatalf("a failed fetch left %d models", len(p.Exposed()))
+	}
+
+	// from the provider's models, where a free list is looked at, ctrl+r
+	// fetches it again and the list open shows it (#2113)
+	set(false, "custom/qwen3.6-max", "custom/glm-5.3", "custom/kimi-k3", "custom/ling-3.1-flash-free")
+	m = at(m, "remote-magpie")
+	m = press(t, m, "enter")
+	if m.mode != modePick || !strings.Contains(m.View(), "ctrl+r") {
+		t.Fatalf("the models view doesn't offer ctrl+r:\n%s", m.View())
+	}
+	if strings.Contains(m.View(), "ling-3.1-flash-free") {
+		t.Fatalf("listed before it was fetched:\n%s", m.View())
+	}
+	m = press(t, m, "ctrl+r")
+	wantFlash(t, m, true, "Remote magpie: 4 models from its list")
+	if m.mode != modePick || !strings.Contains(m.View(), "custom/ling-3.1-flash-free") {
+		t.Fatalf("the models view doesn't list what ctrl+r fetched:\n%s", m.View())
+	}
+	// a key typed is still the filter's
+	m = typeIn(m, "r")
+	if m.pk.input.Value() != "r" {
+		t.Fatalf("filter %q", m.pk.input.Value())
 	}
 }

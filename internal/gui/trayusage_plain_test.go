@@ -10,7 +10,7 @@ import (
 // logos make it look worse): each cell is then its windows alone, with no
 // logo nor letter to draw, the rows as they were.
 func TestTrayPlain(t *testing.T) {
-	cells, _, _ := trayUsageView(trayCards(), time.Now(), false)
+	cells, _, _ := trayUsageView(trayCards(), time.Now(), false, false)
 	plain := trayPlain(cells)
 	if len(plain) != len(cells) {
 		t.Fatalf("%d cells, want %d", len(plain), len(cells))

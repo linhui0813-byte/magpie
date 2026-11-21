@@ -18,12 +18,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"slices"
 	"strings"
 	"time"
 
 	"github.com/yetone/magpie/internal/catalog"
+	"github.com/yetone/magpie/internal/lazyre"
 	"github.com/yetone/magpie/internal/steady"
 	"github.com/yetone/magpie/internal/update"
 )
@@ -42,7 +42,20 @@ type bunState struct {
 	Checked time.Time `json:"checked,omitzero"`
 }
 
-func bunRoot() string { return filepath.Join(filepath.Dir(catalog.CachePath()), "bun") }
+// bunRoot is where magpie keeps its Buns and their state.json. A musl
+// Linux keeps them under bun/musl: one version is a different build there,
+// so a machine whose C library changed under it (a container's image
+// moved from Debian to Alpine, or back) never runs the other one's build,
+// nor takes its state, whose Bad may list versions only the wrong build
+// failed (#1877). Everywhere else they stay in bun itself, where a Bun
+// downloaded before is.
+func bunRoot() string {
+	root := filepath.Join(filepath.Dir(catalog.CachePath()), "bun")
+	if t, err := bunTarget(); err == nil && strings.Contains(t, "-musl") {
+		root = filepath.Join(root, "musl")
+	}
+	return root
+}
 
 func bunDirOf(v string) string { return filepath.Join(bunRoot(), v) }
 
@@ -117,7 +130,7 @@ func inUseLocked() string {
 // envBunVersion is what each $MAGPIE_BUN said it is, asked once.
 var envBunVersion = map[string]string{}
 
-var bunVersionRe = regexp.MustCompile(`^\d+\.\d+\.\d+$`)
+var bunVersionRe = lazyre.New(`^\d+\.\d+\.\d+$`)
 
 // bunReported is the version a bun says it is, "" when it won't say.
 func bunReported(exe string) string {
@@ -132,7 +145,7 @@ func bunReported(exe string) string {
 
 // bunLatest is Bun's newest release and when it was published (tests stub it).
 var bunLatest = func(ctx context.Context) (string, time.Time, error) {
-	b, err := getURL(ctx, "https://api.github.com/repos/oven-sh/bun/releases/latest", 4<<20)
+	b, err := getURL(ctx, githubAPI+"/repos/oven-sh/bun/releases/latest", 4<<20)
 	if err != nil {
 		return "", time.Time{}, err
 	}
@@ -297,11 +310,12 @@ func KeepBunUpdated(ctx context.Context) {
 		case <-t.C:
 		}
 		if len(Load().Plugins) > 0 && HasBun() {
-			cctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
-			if _, err := CheckBun(cctx); err != nil {
+			// no bound on the whole: a slow download still moving
+			// finishes, and one that stops sending is ended by
+			// downloadStall (#5572)
+			if _, err := CheckBun(ctx); err != nil {
 				log.Printf("plugins: looking for a newer Bun: %s", err)
 			}
-			cancel()
 		}
 		t.Reset(bunEvery)
 	}

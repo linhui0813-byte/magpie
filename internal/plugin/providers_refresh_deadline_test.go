@@ -370,12 +370,46 @@ func TestRefreshInvalidationCancelsStaleCall(t *testing.T) {
 	Cached()
 	done := make(chan struct{})
 	go func() { Refreshed(); close(done) }()
+	// a stale listing left uncancelled never ends (this ask waits on its
+	// context alone), so 10s tells that apart and leaves a loaded runner
+	// room for the second ask
 	select {
 	case <-done:
-	case <-time.After(time.Second):
+	case <-time.After(10 * time.Second):
 		t.Fatal("stale listing was not cancelled and followed by the new state")
 	}
 	if asks.Load() != 2 || !refreshCacheGood() || Cached()[0].Name != "Recovered" {
 		t.Fatal(asks.Load(), Cached())
+	}
+}
+
+// settleLooks has a hook told of a change look at the providers, as
+// catalog.Touched's SyncCatalog does, while it is set.
+var settleLooks atomic.Bool
+
+func init() {
+	OnChange(func() {
+		if settleLooks.Load() {
+			Cached()
+		}
+	})
+}
+
+// Settle starts no refresh, through a hook its own restarts tell: one
+// started after its last wait went on once it had returned, and started
+// a host in the test's folder as it was removed, or in the next test's
+// while that one signed in (#2449).
+func TestSettleStartsNoRefresh(t *testing.T) {
+	var asks atomic.Int64
+	refreshSandbox(t, func(context.Context, uint64) error {
+		asks.Add(1)
+		return nil
+	})
+	settleLooks.Store(true)
+	Settle()
+	settleLooks.Store(false)
+	refreshing.Wait()
+	if n := asks.Load(); n != 0 {
+		t.Fatalf("Settle started %d refreshes", n)
 	}
 }

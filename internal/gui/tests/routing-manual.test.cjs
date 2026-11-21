@@ -11,6 +11,7 @@ const fs = require("node:fs/promises");
 const path = require("node:path");
 const { test } = require("node:test");
 const { chromium, webkit } = require("playwright");
+const { settled } = require("./reader.cjs");
 
 const assets = path.resolve(__dirname, "../assets");
 const models = [
@@ -29,11 +30,11 @@ const groups = (pick) => ({ models, pools: [], groups: [
 ] });
 
 const words = {
-  en: { edit: "Edit", save: "Save", routing: "Routing", manual: "Manual", smart: "Smart",
+  en: { edit: "Edit", save: "Save", routing: "Routing", manual: "Manual", smart: "Quota first",
     hint: "Manual: every request goes to the model you pick on the group's card, over its own accounts or keys; the others, and the rules, wait until you pick another — none takes over when it fails.",
     rulesWait: "The rules wait while you pick the model by hand.", group: "Model every request goes to",
     saved: "Hand: every request to luna" },
-  zh: { edit: "编辑", save: "保存", routing: "路由", manual: "手动", smart: "智能",
+  zh: { edit: "编辑", save: "保存", routing: "路由", manual: "手动", smart: "额度优先",
     hint: "手动：所有请求发给在路由组卡片上选中的模型（在其账号或 Key 间路由）；改选前其他模型和规则不生效，失败时也不切换。",
     rulesWait: "手动选择模型时，规则暂不生效。", group: "所有请求发往的模型",
     saved: "Hand：所有请求改发给 luna" },
@@ -77,10 +78,11 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       t.after(() => browser.close());
       const page = await (await browser.newContext({ viewport: { width: 1100, height: 700 } })).newPage();
       page.setDefaultTimeout(5000);
+      page.setDefaultNavigationTimeout(60000);
       const errors = [], posts = [];
       page.on("pageerror", (e) => errors.push(e.message));
       await page.route("**/*", serve(lang, posts));
-      await page.goto("http://magpie.test/?view=routing");
+      await page.goto("http://magpie.test/?view=groups");
       const card = page.locator(".rt-group", { hasText: "Hand" });
       await card.waitFor();
 
@@ -97,8 +99,8 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       // the reader scrolls the card to the middle, then picks luna: saved
       // with the group's other fields as they were, nothing moves, the
       // editor stays shut
-      const view = page.locator("#view-routing");
-      const dy = await card.evaluate((g) => { const v = document.querySelector("#view-routing");
+      const view = page.locator("#view-groups");
+      const dy = await card.evaluate((g) => { const v = document.querySelector("#view-groups");
         return Math.round(g.getBoundingClientRect().top - v.getBoundingClientRect().top - v.clientHeight / 2); });
       await page.mouse.move(550, 400);
       await page.mouse.wheel(0, dy);
@@ -129,7 +131,9 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       // the reader wheels the editor's routing into the middle (code that
       // scrolls is put back: only the reader moves the view)
       const wheelTo = async (x) => {
-        const d = await x.evaluate((e) => { const v = document.querySelector("#view-routing");
+        // the distance is read once the editor has stopped moving
+        await settled(page);
+        const d = await x.evaluate((e) => { const v = document.querySelector("#view-groups");
           return Math.round(e.getBoundingClientRect().top - v.getBoundingClientRect().top - v.clientHeight / 2); });
         await page.mouse.move(550, 400);
         await page.mouse.wheel(0, d);

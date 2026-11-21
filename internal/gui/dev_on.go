@@ -41,6 +41,9 @@ func assetsDir() string {
 
 func staticFS() fs.FS { return os.DirFS(assetsDir()) }
 
+// staticFixed: the UI's files are read from disk, and change under it.
+const staticFixed = false
+
 // stamp is the newest modification time under assets, as a string.
 func stamp() string {
 	var newest time.Time
@@ -197,7 +200,12 @@ func (c remoteWindows) post(op string, form url.Values) string {
 func (c remoteWindows) HidePanel()           { c.do("hide", "") }
 func (c remoteWindows) ShowMain(view string) { c.do("main", view) }
 func (c remoteWindows) Quit()                { c.do("quit", "") }
-func (c remoteWindows) OpenURL(u string)     { c.do("open", u) }
+func (c remoteWindows) OpenURL(u string) error {
+	if s := c.post("open", url.Values{"arg": {u}}); s != "ok" && s != "" {
+		return fmt.Errorf("%s", s)
+	}
+	return nil
+}
 func (c remoteWindows) OpenFolder(path string) error {
 	if s := c.post("reveal", url.Values{"arg": {path}}); s != "ok" {
 		return fmt.Errorf("%s", s)
@@ -240,6 +248,9 @@ func (c remoteWindows) TintTitleBar(rgba [4]uint8, dark bool) bool {
 func (c remoteWindows) SetTextSize(percent int) {
 	c.post("textsize", url.Values{"arg": {strconv.Itoa(percent)}})
 }
+func (c remoteWindows) SetOnTop(on bool) {
+	c.post("ontop", url.Values{"arg": {strconv.FormatBool(on)}})
+}
 
 // backendClient waits out a backend's restart: a request made while the old
 // one is gone connects to the new one once it listens.
@@ -279,7 +290,12 @@ func devShell(h *host) http.Handler {
 		case "quit":
 			h.Quit()
 		case "open":
-			h.OpenURL(arg)
+			if err := h.OpenURL(arg); err != nil {
+				rw.Write([]byte(err.Error()))
+				return
+			}
+			rw.Write([]byte("ok"))
+			return
 		case "reveal":
 			if err := h.OpenFolder(arg); err != nil {
 				rw.Write([]byte(err.Error()))
@@ -305,6 +321,8 @@ func devShell(h *host) http.Handler {
 			if n, g, ok := parseFit(q); ok {
 				h.FitPanel(n, g)
 			}
+		case "ontop":
+			h.SetOnTop(arg == "true")
 		case "textsize":
 			if n, err := strconv.Atoi(arg); err == nil {
 				h.SetTextSize(n)

@@ -1,24 +1,32 @@
 // Run with Node's test runner and Playwright on the module path; see README.md.
 // Settings → Automatic updates turns magpie's own update checks (and the
-// downloads they start) off and on, and Check every picks how often they
+// downloads they start) off and on, and Update check interval picks how often they
 // run: 30 min, 1 h, 6 h (the default, nothing set) or 24 h (#472). Off, the
 // interval stays, dimmed, kept for when it is on again, and the version
 // row, not asked yet, says so and offers Check, which asks the backend.
-// The rows are in Settings' About tab. No click moves the page. English
-// and Chinese; no backend, the API is faked.
+// The rows are in Settings' About tab. No click moves the page. The
+// switch's line says it checks: whether what it finds is downloaded at once
+// is Download updates automatically's (#3893). On hover the switch's
+// card also says why an update can be trusted: its signed checksums and its
+// SLSA build attestation (ArcticLampyrid on X), with a small mark on its
+// name; no section of its own. English and Chinese; no backend, the API is
+// faked.
 const assert = require("node:assert/strict");
 const fs = require("node:fs/promises");
 const path = require("node:path");
 const { test } = require("node:test");
 const { chromium, webkit } = require("playwright");
+const { watchSettingsReads, settingsDrawn, openPart } = require("./reader.cjs");
 
 const assets = path.resolve(__dirname, "../assets");
 
 const words = {
-  en: { auto: "Automatic updates", every: "Check every", off: "Off", on: "On", m30: "30 min", h6: "6 h", h24: "24 h",
-    version: "Version", check: "Check", isOff: "Automatic updates are off", latest: "Up to date", whileOn: "While automatic updates are on", often: "How often magpie looks for a newer version" },
-  zh: { auto: "自动更新", every: "检查间隔", off: "关闭", on: "开启", m30: "30 分钟", h6: "6 小时", h24: "24 小时",
-    version: "版本", check: "检查", isOff: "自动更新已关闭", latest: "已是最新", whileOn: "自动更新开启时生效", often: "magpie 多久检查一次新版本" },
+  en: { auto: "Automatic updates", every: "Update check interval", off: "Off", on: "On", m30: "30 min", h6: "6 h", h24: "24 h",
+    version: "Version", check: "Check", isOff: "Automatic updates are off", latest: "Up to date", whileOn: "While automatic updates are on", often: "How often magpie looks for a newer version",
+    what: "Checks for a newer magpie by itself", signed: "ed25519", attested: "Sigstore" },
+  zh: { auto: "自动更新", every: "检查更新间隔", off: "关闭", on: "开启", m30: "30 分钟", h6: "6 小时", h24: "24 小时",
+    version: "版本", check: "检查", isOff: "自动更新已关闭", latest: "已是最新", whileOn: "自动更新开启时生效", often: "magpie 多久检查一次新版本",
+    what: "自动检查 magpie 新版本", signed: "ed25519", attested: "Sigstore" },
 };
 
 function settingsPayload(lang, ctl) {
@@ -95,12 +103,15 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         const errors = [];
         const page = await (await browser.newContext({ viewport: { width: 900, height: 560 }, reducedMotion: "reduce" })).newPage();
         page.setDefaultTimeout(5000);
-        page.on("pageerror", (e) => errors.push(e.message));
+        page.setDefaultNavigationTimeout(60000);
+        page.on("pageerror", (e) => { if (!/^ResizeObserver loop completed with undelivered notifications/.test(e.message)) errors.push(e.message); });
         await page.route("**/*", server(lang, ctl));
+        await watchSettingsReads(page);
         await page.goto("http://magpie.test/?view=settings");
+        await settingsDrawn(page); // rows found are the ones that stay (#1659)
         // the rows are in Settings' About part
         const aboutTab = async () => {
-          await page.locator("#setTab-about").click();
+          await openPart(page, "about");
           await page.locator("#setPage-about").waitFor({ state: "visible" });
         };
         await aboutTab();
@@ -108,6 +119,21 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         const auto = rowOf(w.auto), every = rowOf(w.every), version = rowOf(w.version);
         await auto.waitFor();
         assert.equal((await auto.locator(".opt.on").innerText()).trim(), w.on);
+        assert.equal((await auto.locator(":scope > .who > .sub").first().innerText()).trim(), w.what, "the switch says it checks, not that it downloads");
+        // why an update can be trusted: two lines in the row's hover card,
+        // out of sight at rest, and a mark on the name
+        const trust = auto.locator(":scope > .who > .sub.update-trust");
+        await page.waitForFunction(() => document.querySelectorAll("#about .update-auto-row .update-trust").length === 2);
+        assert.equal(await trust.first().evaluate((e) => e.getBoundingClientRect().height <= 4), true, "the trust lines show at rest");
+        assert.equal(await auto.locator(":scope > .who > .name .as-tip").count(), 1);
+        await showRow(page, auto);
+        await auto.locator(":scope > .who > .name").hover();
+        const card = page.locator(".set-hint.on");
+        await card.waitFor();
+        const said = await card.textContent();
+        assert.ok(said.includes(w.what) && said.includes(w.signed) && said.includes(w.attested), "the card doesn't say why an update is safe: " + said);
+        await page.mouse.move(1, 1);
+        await page.locator(".set-hint").waitFor({ state: "hidden" });
         assert.equal((await every.locator(".opt.on").innerText()).trim(), w.h6);
         assert.deepEqual((await every.locator(".opt").allInnerTexts()).map((s) => s.trim()), [w.m30, lang === "zh" ? "1 小时" : "1 h", w.h6, w.h24]);
 
@@ -159,6 +185,36 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await page.waitForFunction(() => document.querySelector(".update-every-row .opt.on")?.textContent.startsWith("24"));
         assert.equal(ctl.saves.at(-1).updateEvery, 1440);
         assert.equal(await scrolls(page), before, "the click must not scroll the page");
+        assert.deepEqual(errors, []);
+      });
+
+      // A view at its top stays at its top (#2134): at 420 wide Settings
+      // scrolls, and turning updates off gives the Version row above the
+      // switch its "are off" line once the save answers. That moves the
+      // switch down; it must not scroll the view, then or after the redraw.
+      await t.test(lang + ": 420 wide at the top, Off moves the switch down, not the page", async () => {
+        const ctl = { off: false, every: 0, state: "", checks: 0, saves: [] };
+        const errors = [];
+        const page = await (await browser.newContext({ viewport: { width: 420, height: 640 } })).newPage();
+        page.setDefaultTimeout(5000);
+        page.setDefaultNavigationTimeout(60000);
+        page.on("pageerror", (e) => { if (!/^ResizeObserver loop completed with undelivered notifications/.test(e.message)) errors.push(e.message); });
+        await page.route("**/*", server(lang, ctl));
+        await watchSettingsReads(page);
+        await page.goto("http://magpie.test/?view=settings");
+        await settingsDrawn(page);
+        await openPart(page, "about");
+        await page.locator("#setPage-about").waitFor({ state: "visible" });
+        const auto = page.locator("#about .row.pref", { has: page.locator(".name", { hasText: new RegExp("^" + w.auto + "$") }) });
+        await auto.waitFor();
+        await page.waitForTimeout(300);
+        const view = page.locator("#view-settings");
+        assert.equal(await view.evaluate((v) => v.scrollTop), 0);
+        assert.ok(await view.evaluate((v) => v.scrollHeight > v.clientHeight + 10), "Settings must be able to scroll at 420");
+        await auto.locator(".opt", { hasText: w.off }).click();
+        await page.locator("#about .sub", { hasText: w.isOff }).waitFor();
+        await page.waitForTimeout(600); // past the save's redraw and the switch's play
+        assert.equal(await view.evaluate((v) => v.scrollTop), 0, "a view at its top stays at its top");
         assert.deepEqual(errors, []);
       });
     }

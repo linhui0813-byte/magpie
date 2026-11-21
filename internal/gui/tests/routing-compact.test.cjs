@@ -73,21 +73,24 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
     test(`${engine} ${lang}: a rule for compacting`, async (t) => {
       const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: "chromium" }));
       t.after(() => browser.close());
-      const page = await (await browser.newContext({ viewport: { width: 1100, height: 1400 } })).newPage();
+      const page = await (await browser.newContext({ viewport: { width: 1100, height: 1400 }, reducedMotion: "reduce" })).newPage();
       page.setDefaultTimeout(5000);
+      page.setDefaultNavigationTimeout(60000);
       const errors = [], posts = [];
       page.on("pageerror", (e) => errors.push(e.message));
       await page.route("**/*", serve(lang, posts));
       await page.goto("http://magpie.test/?view=routing");
       const group = page.locator(".rt-group").first();
-      await group.waitFor();
+      await group.waitFor({ state: "attached" });
 
       // the compaction in the trace, told as one
       await page.waitForFunction((s) => document.documentElement.innerText.includes(s), w.story);
       const said = await page.evaluate(() => document.documentElement.innerText);
       assert(said.includes(w.small), "the model passed over is named");
 
-      // the group's rule, in words
+      // the group's rule, in words, on the groups page
+      await page.evaluate(() => window.show("groups"));
+      await group.waitFor();
       const title = await group.evaluate((g) => [...g.querySelectorAll("[title]")].map((e) => e.title).join("\n"));
       assert(title.includes(`1. ${w.cond} →`), `the rule reads as compacting: ${title}`);
 
@@ -111,8 +114,17 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       }
       const ab = await add.boundingBox();
       await page.mouse.click(ab.x + ab.width / 2, ab.y + ab.height / 2);
+      // a new rule asks for an intent: taken off with its ×, and
+      // compacting added from the rule's + menu instead
+      await rows.nth(1).locator('.rt-c[data-k="intent"]').hover();
+      await rows.nth(1).locator('.rt-c[data-k="intent"] .rt-cx').click();
+      await rows.nth(1).locator(".rt-addc").click();
+      await page.locator(".proto-menu .pm-item", { hasText: w.cond }).click();
       const second = rows.nth(1).locator("button.rt-cond", { hasText: w.cond });
       await second.waitFor();
+      assert.equal(await second.getAttribute("class"), "rt-cond on", "added as set");
+      await second.click();
+      assert.equal(await second.getAttribute("class"), "rt-cond");
       const at = () => page.evaluate(() => [...document.querySelectorAll("*")].filter((e) => e.scrollTop).map((e) => [e.id || e.className, e.scrollTop]).join(";") + "|" + Math.round(document.querySelector(".rt-gedit").getBoundingClientRect().top));
       await second.scrollIntoViewIfNeeded(); // by the test, as the reader would
       await page.waitForTimeout(200);

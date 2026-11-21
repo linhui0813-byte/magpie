@@ -11,6 +11,7 @@ const fs = require("node:fs/promises");
 const path = require("node:path");
 const { test } = require("node:test");
 const { chromium, webkit } = require("playwright");
+const { reach } = require("./reader.cjs");
 
 const assets = path.resolve(__dirname, "../assets");
 const HOME = "/Users/me";
@@ -74,6 +75,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await ctx.addInitScript(() => { try { localStorage.setItem("magpie.libTab", "skills"); } catch {} });
         const page = await ctx.newPage();
         page.setDefaultTimeout(5000);
+        page.setDefaultNavigationTimeout(60000);
         const errors = [];
         page.on("pageerror", (e) => errors.push(e.message));
         await page.route("**/*", server(lang, state, posts));
@@ -100,6 +102,9 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await v.locator(".lib-select").click();
         assert.equal((await v.locator(".lib-select").textContent()).trim(), w.done);
         await row("pdf").locator(".lib-pickbox").waitFor();
+        // pdf sits partly under the bar Select brings up (the window's page
+        // beside the sidebar since 18e82adc6): the reader scrolls it out
+        await reach(page, row("pdf").locator(".name"));
         const top = await v.evaluate((x) => x.scrollTop);
         await row("pdf").locator(".name").click();
         assert.equal(await row("pdf").locator(".lib-pickbox").isChecked(), true);

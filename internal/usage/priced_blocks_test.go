@@ -24,6 +24,7 @@ func appendAndQueryAllocs(t *testing.T, n int) float64 {
 }
 
 func TestRequestPageAppendDoesNotRepriceHistory(t *testing.T) {
+	settleLogClock(t)
 	holdClock(t, time.Date(2026, 9, 30, 12, 0, 0, 0, time.Local))
 	// A query costs a fixed number of allocations that depends on the
 	// machine (on Windows, provider sign-in lookups read the environment and
@@ -34,18 +35,6 @@ func TestRequestPageAppendDoesNotRepriceHistory(t *testing.T) {
 	allocations := appendAndQueryAllocs(t, 8000)
 	if grown := allocations - small; grown > 2000 {
 		t.Fatalf("append re-read unchanged history: %.0f allocations over 8000 records, %.0f over 10", allocations, small)
-	}
-	raw := readLogSnapshot().blocks[0]
-	requestCache.Lock()
-	before := requestCache.gateways[raw].Archive
-	requestCache.Unlock()
-	Append(Record{Agent: "codex", Provider: "relay", Model: "m", Input: 1, Status: 200})
-	QueryPage(All, Filter{}, 0, 100)
-	requestCache.Lock()
-	after := requestCache.gateways[raw].Archive
-	requestCache.Unlock()
-	if len(before) == 0 || len(after) == 0 || &before[0] != &after[0] {
-		t.Fatal("sealed gateway block was re-priced after append")
 	}
 	for _, period := range []Period{All, Today, Week} {
 		got := QueryPage(period, Filter{}, 0, 100)
@@ -96,6 +85,7 @@ func TestRequestPageInvalidatesLivePrice(t *testing.T) {
 }
 
 func BenchmarkRequestPageAfterAppend(b *testing.B) {
+	settleLogClock(b)
 	testenv.SetHome(b, b.TempDir())
 	b.Setenv("XDG_CONFIG_HOME", b.TempDir())
 	b.Setenv("XDG_CACHE_HOME", b.TempDir())

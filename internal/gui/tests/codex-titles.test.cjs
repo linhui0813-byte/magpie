@@ -1,15 +1,17 @@
 // Run with Node's test runner and Playwright on the module path; see README.md.
-// Settings' "Codex thread titles" (#705, DuGuaiYA: Codex's thread_title
+// Codex's "Codex thread titles" (#705, DuGuaiYA: Codex's thread_title
 // requests go through its own ChatGPT sign-in even on magpie's models): by
-// default Codex's own (ChatGPT); the app's menu (no native select) offers
+// default the session's model (cybercaius); the app's menu (no native select) offers
 // Off and magpie's models; a pick posts settings/codex-titles on its own,
-// the row says what now happens, and no click scrolls the Settings page.
+// its button shows the choice under a name with no line of its own
+// (1ooogle on X), and no click scrolls the Agents page, where Codex's row holds it.
 // English and Chinese, Chromium and WebKit; no backend, the API is faked here.
 const assert = require("node:assert/strict");
 const fs = require("node:fs/promises");
 const path = require("node:path");
 const { test } = require("node:test");
 const { chromium, webkit } = require("playwright");
+const { watchSettingsReads, wheelTo, agentRow, openAgentSettings } = require("./reader.cjs");
 
 const assets = path.resolve(__dirname, "../assets");
 
@@ -38,7 +40,9 @@ function server(lang, posted) {
     const json = (data) => route.fulfill({ json: data });
     if (url.pathname === "/boot.js") return route.fulfill({ contentType: "text/javascript", body: `window.bootPrefs = {lang:"${lang}",theme:"light",web:false};` });
     if (url.pathname === "/wails/runtime.js") return route.fulfill({ contentType: "text/javascript", body: "export const Window = {};" });
-    if (url.pathname === "/api/state") return json({ agents: [], profiles: [], settings: { lang, theme: "light" }, fx: cur.fx });
+    // agents below Codex, so its opened row is not the list's end: a choice
+    // that rewraps its row at the very bottom must move the list
+    if (url.pathname === "/api/state") return json({ agents: [agentRow("codex", "Codex"), agentRow("claude", "Claude Code"), agentRow("pi", "Pi")], profiles: [], settings: { lang, theme: "light" }, fx: cur.fx });
     if (url.pathname === "/api/settings/codex-titles") {
       const body = req.postDataJSON();
       posted.push(["codex-titles", body]);
@@ -64,18 +68,19 @@ function server(lang, posted) {
 }
 
 const want = {
-  en: { name: "Codex thread titles", own: "Codex’s own (ChatGPT)", off: "Off", subOwn: /through its ChatGPT sign-in/, subOff: /sent nowhere/, subModel: /go to this model/ },
-  zh: { name: "Codex 会话标题", own: "Codex 自带（ChatGPT）", off: "关闭", subOwn: /ChatGPT 登录/, subOff: /不外发/, subModel: /改由此模型/ },
+  en: { name: "Codex thread titles", own: "Same as the session", off: "Off" },
+  zh: { name: "Codex 会话标题", own: "跟随当前会话", off: "关闭" },
 };
-const view = (page) => page.locator("#view-settings").evaluate((v) => v.scrollTop);
+const view = (page) => page.locator("#view-agents").evaluate((v) => v.scrollTop);
 
 for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium", "webkit"])) {
   for (const lang of ["en", "zh"]) {
-    test(`${engine} ${lang}: Codex's title requests go where Settings says`, async (t) => {
+    test(`${engine} ${lang}: Codex's title requests go where Codex's settings say`, async (t) => {
       const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: "chromium" }));
       const context = await browser.newContext({ viewport: { width: 900, height: 480 }, reducedMotion: "reduce" });
       const page = await context.newPage();
       page.setDefaultTimeout(5000);
+      page.setDefaultNavigationTimeout(60000);
       const errors = [], posted = [];
       page.on("pageerror", (e) => errors.push(e.message));
       await page.route("**/*", server(lang, posted));
@@ -86,27 +91,26 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         }
         await browser.close();
       });
-      await page.goto("http://magpie.test/?view=settings");
+      await watchSettingsReads(page);
+      await page.goto("http://magpie.test/?view=agents");
+      await openAgentSettings(page); // on Codex's opened row, not in Settings (the owner, 10-20)
       const row = page.locator("#codexTitlesRow");
       const pick = page.locator("#codexTitlesPick button");
       await pick.waitFor();
       assert.equal(await page.locator("#codexTitlesRow select").count(), 0, "no native select");
       assert.equal((await row.locator(".name").textContent()).trim(), want[lang].name);
-      assert.equal((await pick.textContent()).trim(), want[lang].own, "Codex's own by default");
-      assert.match(await row.locator(".sub").textContent(), want[lang].subOwn);
+      assert.equal((await pick.textContent()).trim(), want[lang].own, "the session's by default (cybercaius)");
+      assert.equal(await row.locator(".sub").count(), 0, "the row says its name alone, its button the choice (1ooogle on X)");
       // the chip's icon is the chip's size, not the row's 18–22px (duanckham on X)
       assert.deepEqual(await pick.locator(".ic").evaluate((e) => [e.offsetWidth, e.offsetHeight]), [14, 14]);
 
       // scrolled by a wheel till the row is mid-view, so a click that
       // moved the page would show
-      const box = await page.locator("#view-settings").boundingBox();
-      await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
-      const top = () => pick.evaluate((e) => e.getBoundingClientRect().top);
-      for (let i = 0; i < 40 && (await top()) > 200; i++) { await page.mouse.wheel(0, 100); await page.waitForTimeout(30); }
+      await wheelTo(page, pick, 200); // each wheel landed before the next (#2370)
       const before = await view(page);
-      assert(before > 0, "the settings list must scroll to the row");
+      assert(before > 0, "the agents list must scroll to the row");
 
-      // the app's menu: Codex's own, Off and magpie's models
+      // the app's menu: the session's, Off and magpie's models
       await pick.click();
       await page.locator("#pop:not([hidden]) #list li").first().waitFor();
       const items = (await page.locator("#list li:not(.group)").allTextContents()).join("|");
@@ -114,7 +118,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await page.locator("#list li:not(.group)").filter({ hasText: want[lang].off }).first().click();
       await page.locator("#codexTitlesPick button", { hasText: want[lang].off }).waitFor();
       assert.deepEqual(posted, [["codex-titles", { model: "off" }]]);
-      assert.match(await row.locator(".sub").textContent(), want[lang].subOff);
+      assert.equal(await row.locator(".sub").count(), 0);
       await page.waitForTimeout(300);
       assert.equal(await view(page), before, "picking Off scrolled the page");
 
@@ -124,9 +128,9 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await page.locator("#list li:not(.group)").filter({ hasText: "DeepSeek V4 Flash" }).first().click();
       await page.locator("#codexTitlesPick button", { hasText: "DeepSeek V4 Flash" }).waitFor();
       assert.deepEqual(posted.at(-1), ["codex-titles", { model: "deepseek/deepseek-v4-flash" }]);
-      assert.match(await row.locator(".sub").textContent(), want[lang].subModel);
+      assert.equal(await row.locator(".sub").count(), 0);
 
-      // and back to Codex's own
+      // and back to the session's
       await pick.click();
       await page.locator("#pop:not([hidden]) #list li").first().waitFor();
       await page.locator("#list li:not(.group)").filter({ hasText: want[lang].own }).first().click();

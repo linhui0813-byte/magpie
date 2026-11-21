@@ -1,7 +1,7 @@
 // Run with Node's test runner and Playwright on the module path; see README.md.
 // A key pasted over a provider's saved one is tried before a Save (the user:
-// Refresh and Test only knew the saved key, and Save closes the editor):
-// Refresh, Test models, a model's own test and the endpoints' Test send the
+// Refresh (now Fetch models) and Test only knew the saved key, and Save closes the editor):
+// Fetch models, Test models, a model's own test and the endpoints' Test send the
 // editor's form with typed: true, the new key with it, and the editor stays
 // open with the key still in its box; nothing is saved by them. And a new
 // key of a provider's: its box focuses the key, the name says it's optional.
@@ -45,18 +45,19 @@ function serve(lang, calls) {
 }
 
 const words = {
-  en: { refresh: "Refresh", all: "Test models", test: "Test", item: "Test this model", addKey: "Add another key", name: "Name (optional), e.g. Team", optional: "optional" },
-  zh: { refresh: "刷新", all: "测试模型", test: "测试", item: "测试此模型", addKey: "添加另一个密钥", name: "名称（可选），例如 团队", optional: "可选" },
+  en: { refresh: "Fetch models", all: "Test models", test: "Test", item: "Test this model", addKey: "Add another key", name: "Name (optional), e.g. Team", optional: "optional" },
+  zh: { refresh: "获取模型", all: "测试模型", test: "测试", item: "测试此模型", addKey: "添加另一个密钥", name: "名称（可选），例如 团队", optional: "可选" },
 };
 
 for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium", "webkit"])) {
   for (const lang of ["en", "zh"]) {
     const w = words[lang];
-    test(`${engine} ${lang}: Refresh and Test try the key just pasted`, async (t) => {
+    test(`${engine} ${lang}: Fetch models and Test try the key just pasted`, async (t) => {
       const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: "chromium" }));
       t.after(() => browser.close());
       const page = await (await browser.newContext({ viewport: { width: 900, height: 900 }, reducedMotion: "reduce" })).newPage();
       page.setDefaultTimeout(5000);
+      page.setDefaultNavigationTimeout(60000);
       const errors = [];
       page.on("pageerror", (e) => errors.push(e.message));
       const calls = [];
@@ -75,7 +76,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await ed.locator(".mfoot").getByRole("button", { name: w.refresh, exact: true }).click();
       await wait(1);
       assert.equal(calls[0][0], "models");
-      assert.deepEqual(form(calls[0][1]), want, "Refresh asks with the form");
+      assert.deepEqual(form(calls[0][1]), want, "Fetch models asks with the form");
       await page.waitForTimeout(200);
       assert.ok(await ed.isVisible(), "the editor stays open");
       assert.equal(await ed.locator('input[type="password"]').first().inputValue(), "sk-new-typed", "the key stays typed");

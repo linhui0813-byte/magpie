@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/settings"
@@ -93,7 +94,7 @@ func TestModelName(t *testing.T) {
 	if b.Name != "Sol" || b.Default != "" || b.Label() != "Sol · B" {
 		t.Fatalf("%+v %q", b, b.Label())
 	}
-	if g := entry(t, "group/auto-sol"); g.Name != "Sol" {
+	if g := entry(t, "auto/sol"); g.Name != "Sol" {
 		t.Fatalf("the group took a provider's name: %+v", g)
 	}
 	if p, m, ok := Resolve("a/sol"); !ok || p.ID != "a" || m != "sol" {
@@ -169,7 +170,7 @@ func TestModelEfforts(t *testing.T) {
 	if got := entry(t, "b/sol").Efforts; !slices.Equal(got, []string{"low", "medium", "high", "max"}) {
 		t.Fatal(got)
 	}
-	if got := entry(t, "group/auto-sol").Efforts; !slices.Equal(got, []string{"low", "high"}) {
+	if got := entry(t, "auto/sol").Efforts; !slices.Equal(got, []string{"low", "high"}) {
 		t.Fatal(got)
 	}
 	// the vendor is still asked at any level it has
@@ -361,28 +362,23 @@ func TestSetUpstreamNameRefusesAModelNotServed(t *testing.T) {
 // these and still takes a name.
 func TestSetUpstreamNameRefusesAnAccountBackend(t *testing.T) {
 	prefsHome(t)
-	// a Kiro account with a saved key is one magpie reaches through Kiro's
-	// own backend; the live list is the model it serves
-	if err := Save(Provider{ID: "kiro", Name: "Kiro", Key: "k"}); err != nil {
-		t.Fatal(err)
-	}
-	if err := catalog.SaveLive("kiro", "", []catalog.Model{{ID: "auto", Name: "Auto"}}); err != nil {
-		t.Fatal(err)
-	}
-	p, err := Find("kiro")
+	// a Claude account is one magpie reaches through Claude's own backend
+	claudeSignIn(t, os.Getenv("HOME"), time.Now().Add(time.Hour))
+	forgetClaudeCredential()
+	p, err := Find("claude")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if p.Account == nil || p.Account.Agent != "kiro" {
+	if p.Account == nil || p.Account.Agent != "claude" {
 		t.Fatalf("the provider is not the account the test set up: %+v", p.Account)
 	}
 	if !p.asksOwnBackend() {
 		t.Fatal("a signed-in account backend is not recognised as one")
 	}
-	if err := SetUpstreamName("kiro/auto", "vendor-c/auto"); err == nil {
-		t.Error("a name for an account backend's model was accepted")
+	if err := SetUpstreamName("claude/*", "vendor-c/auto"); err == nil || !strings.Contains(err.Error(), "own account") {
+		t.Errorf("a name for an account backend's models was not refused as one: %v", err)
 	}
-	if _, ok := settings.Load().ModelWires["kiro/auto"]; ok {
+	if _, ok := settings.Load().ModelWires["claude/*"]; ok {
 		t.Error("a refused account-backend name was stored anyway")
 	}
 	// Codex is not an account backend for this purpose: it is served by the
@@ -745,6 +741,7 @@ func TestUpstreamNameAsGivesAModelTheNameItWasGiven(t *testing.T) {
 // really went out — read against the family, every level of it reads as
 // another model answering.
 func TestSentNameInAsksForTheVariantTheEffortPicks(t *testing.T) {
+	t.Cleanup(AntigravityBuiltinForTest()) // the retired built-in route
 	prefsHome(t)
 	// Antigravity's ids of one model at three levels, as its fetch left them
 	if err := os.MkdirAll(filepath.Dir(catalog.LivePath("antigravity")), 0o755); err != nil {
@@ -789,6 +786,7 @@ func TestSentNameInAsksForTheVariantTheEffortPicks(t *testing.T) {
 // built by (codeAssistID) and the rule a ledger reads a record back against
 // are one rule, and these are the two ends of it.
 func TestSentNameInAsksAVariantIdForWhatTheEffortPicks(t *testing.T) {
+	t.Cleanup(AntigravityBuiltinForTest()) // the retired built-in route
 	prefsHome(t)
 	// one model at three levels, and one at two, so a family's default is
 	// the top of it in one case and not the other
@@ -845,6 +843,7 @@ func TestSentNameInAsksAVariantIdForWhatTheEffortPicks(t *testing.T) {
 // magpie knows, which is what the gateway's own dispatch (codeAssistID) reads
 // the same way.
 func TestSentNameIsJudgedByTheAccountAndNotByTheProviderId(t *testing.T) {
+	t.Cleanup(AntigravityBuiltinForTest()) // the retired built-in route
 	prefsHome(t)
 	if err := os.MkdirAll(filepath.Dir(catalog.LivePath("antigravity")), 0o755); err != nil {
 		t.Fatal(err)
@@ -997,7 +996,7 @@ func (d *dispatch) servesItself(ifs *ast.IfStmt) bool {
 				return true
 			}
 			if sel, ok := call.Fun.(*ast.SelectorExpr); ok {
-				if name := sel.Sel.Name; len(name) > len("serve") && name[len("serve")] >= 'A' && name[len("serve")] <= 'Z' {
+				if name := sel.Sel.Name; strings.HasPrefix(name, "serve") && len(name) > len("serve") && name[len("serve")] >= 'A' && name[len("serve")] <= 'Z' {
 					own = true
 				}
 			}

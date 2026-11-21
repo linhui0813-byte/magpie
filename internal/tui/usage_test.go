@@ -79,6 +79,9 @@ func TestQuotaLines(t *testing.T) {
 // — never touching a vendor's own balance string (that's quotaLines above).
 func TestFmtCostShowsChosenCurrency(t *testing.T) {
 	home(t)
+	// a currency read in the last second (an earlier run's ¥, -count) is
+	// kept; read this home's
+	costAt = time.Time{}
 
 	if got := fmtCost(usage.Totals{Cost: 1.23}); got != "≈$1.23" {
 		t.Fatalf("default currency: %q", got)
@@ -108,6 +111,36 @@ func TestFmtCostShowsChosenCurrency(t *testing.T) {
 	if got := fmtCost(usage.Totals{Cost: 0, Unpriced: 1}); got != "no price" {
 		t.Fatalf("unpriced: %q", got)
 	}
+
+	// By provider (onkashiko on X): DeepSeek's row in yuan, OpenAI's in
+	// dollars, a total in the currency picked for totals
+	for _, p := range []provider.Provider{
+		{ID: "deepseek", Name: "DeepSeek", Preset: "deepseek", Key: "k", Chat: "https://api.deepseek.com/v1"},
+		{ID: "openai", Name: "OpenAI", Preset: "openai", Key: "k", Chat: "https://api.openai.com/v1"},
+	} {
+		if err := provider.Save(p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := settings.Save(settings.Settings{Currency: settings.CurrencyByProvider, TotalCurrency: "usd"}); err != nil {
+		t.Fatal(err)
+	}
+	costAt = time.Time{}
+	for _, c := range []struct{ id, want string }{{"deepseek", "≈¥8.86"}, {"openai", "≈$1.23"}, {"", "≈$1.23"}, {usage.UnknownProvider, "≈$1.23"}} {
+		if got := fmtCostOf(usage.Totals{Cost: 1.23}, c.id); got != c.want {
+			t.Errorf("by provider, %q: %q, want %q", c.id, got, c.want)
+		}
+	}
+	if err := settings.Save(settings.Settings{Currency: settings.CurrencyByProvider, TotalCurrency: "cny"}); err != nil {
+		t.Fatal(err)
+	}
+	costAt = time.Time{}
+	if got := fmtCost(usage.Totals{Cost: 1.23}); got != "≈¥8.86" {
+		t.Errorf("by provider, the total in cny: %q", got)
+	}
+	if got := fmtCostOf(usage.Totals{Cost: 1.23}, "openai"); got != "≈$1.23" {
+		t.Errorf("by provider, openai with totals in cny: %q", got)
+	}
 }
 
 func TestUnlimitedQuotaCell(t *testing.T) {
@@ -115,6 +148,17 @@ func TestUnlimitedQuotaCell(t *testing.T) {
 		got := quotaCell(provider.QuotaWindow{Name: "Chat", Unlimited: true}, left, time.Now())
 		if !strings.Contains(got, "Unlimited") || strings.Contains(got, "%") || strings.Contains(got, "░") {
 			t.Fatalf("unlimited: %q", got)
+		}
+	}
+}
+
+// A plugin's row of text alone (AutoClaw's 积分余额) reads as its text: no
+// meter and no share after it, where its used 0 read "100% left".
+func TestTextQuotaCell(t *testing.T) {
+	for _, left := range []bool{false, true} {
+		got := quotaCell(provider.QuotaWindow{Name: "积分余额", Display: "1,234 积分", Text: true}, left, time.Now())
+		if !strings.Contains(got, "1,234 积分") || strings.Contains(got, "%") || strings.Contains(got, "░") {
+			t.Fatalf("text: %q", got)
 		}
 	}
 }
@@ -201,5 +245,56 @@ func TestQuotaLinesCreditsNotSpent(t *testing.T) {
 	}
 	if got := strings.Join(quotaLines(qs, true, false, 200, now), "\n"); !strings.Contains(got, "1.2K credits left · not spent") {
 		t.Errorf("set not to:\n%s", got)
+	}
+}
+
+// The Usage page's headline says how many calls its cost leaves out for
+// having no known price (#1856), not only a "+" after the sum.
+func TestUsagePageSaysCallsUnpriced(t *testing.T) {
+	home(t)
+	now := time.Date(2026, 9, 30, 12, 0, 0, 0, time.Local)
+	oldClock := usage.Clock
+	usage.Clock = func() time.Time { return now }
+	t.Cleanup(func() { usage.Clock = oldClock })
+	old := usage.LogCalls
+	usage.LogCalls = func(time.Time) []sessions.Call { return nil }
+	t.Cleanup(func() { usage.LogCalls = old })
+	for i := range 3 {
+		usage.Append(usage.Record{Time: now.Add(-time.Duration(i+1) * time.Minute), Agent: "claude", Provider: "relay", Model: "kimi-k3-auto", Input: 500, Output: 50, Status: 200})
+	}
+	m := press(t, model{w: 160, h: 60, page: pageUsage}, "t")
+	if v := m.viewUsage(); !strings.Contains(v, "(3 calls unpriced)") {
+		t.Fatal(v)
+	}
+}
+
+// u on the Usage page shows a window by how much of it is left rather than
+// used, as the app's toggle does, and that choice is Settings' QuotaLeft
+// where the app keeps it: the app and the tray panel change it there, so the
+// TUI starts from it (#122).
+func TestQleftSeededFromSettings(t *testing.T) {
+	home(t)
+	if err := settings.Save(settings.Settings{QuotaLeft: true}); err != nil {
+		t.Fatal(err)
+	}
+	if m := newModel(); !m.qleft {
+		t.Fatal("Settings say left, and the TUI starts showing used")
+	}
+}
+
+// u writes what it picked to Settings, so the pick survives the next start
+// and the app's own toggle and the menu bar follow it.
+func TestQleftWritesBack(t *testing.T) {
+	home(t)
+	if settings.Load().QuotaLeft {
+		t.Fatal("the sandbox's settings start with left chosen")
+	}
+	m := press(t, model{w: 120, h: 40, page: pageUsage}, "u")
+	if !m.qleft || !settings.Load().QuotaLeft {
+		t.Fatalf("after u: qleft %v, Settings %v", m.qleft, settings.Load().QuotaLeft)
+	}
+	m = press(t, m, "u")
+	if m.qleft || settings.Load().QuotaLeft {
+		t.Fatalf("after the second u: qleft %v, Settings %v", m.qleft, settings.Load().QuotaLeft)
 	}
 }

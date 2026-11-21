@@ -62,7 +62,9 @@ function serve(lang, copied) {
     if (url.pathname === "/wails/runtime.js") return route.fulfill({ contentType: "text/javascript", body: "export const Window = {};" });
     if (url.pathname === "/api/copy") { copied.push(JSON.parse(route.request().postData()).text); return json({}); }
     if (url.pathname === "/api/state") return json({ agents: [], profiles: [], settings: { lang, theme: "light" } });
-    if (url.pathname === "/api/providers") return json(providers);
+    // the list leaves the bodies out, and an opened row asks for its own by id (#1521)
+    if (url.pathname === "/api/providers") return json({ ...providers, gateway: { ...providers.gateway, calls: providers.gateway.calls.map(({ requestBody, responseBody, ...c }, i) => ({ id: i + 1, ...c })) } });
+    if (url.pathname === "/api/gateway/call") return json(providers.gateway.calls[Number(url.searchParams.get("id")) - 1]);
     if (url.pathname === "/api/groups") return json({ groups: [] });
     if (url.pathname === "/api/plugins") return json({ plugins: [] });
     if (url.pathname === "/api/gateway/trace") {
@@ -95,6 +97,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         const context = await browser.newContext({ viewport: { width, height: 760 }, reducedMotion: "reduce" });
         const page = await context.newPage();
         page.setDefaultTimeout(5000);
+        page.setDefaultNavigationTimeout(60000);
         const errors = [];
         page.on("pageerror", (e) => errors.push(e.message));
         await page.route("**/*", serve(lang, copied));
@@ -107,7 +110,6 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         });
 
         await page.goto("http://magpie.test/?view=gateway");
-        await page.locator("#foldConnect").click(); // Connect away, the calls in view
         const rows = page.locator("#activity .call-item");
         await rows.first().waitFor();
         // what is clicked is brought into view by the wheel, as the reader

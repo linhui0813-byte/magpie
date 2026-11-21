@@ -32,3 +32,39 @@ func TestPanelOptionsCaptionButtons(t *testing.T) {
 		}
 	}
 }
+
+// #1803: on Linux a see-through panel (an RGBA GTK window under a
+// transparent webview) left a fainter copy of the old scroll position's
+// paint behind; the panel is a solid window there, as the main window is.
+// The Mac and Windows keep their translucent panel.
+func TestPanelSolidOnLinux(t *testing.T) {
+	if o := panelOptions("linux", ""); o.BackgroundType != application.BackgroundTypeSolid || !o.Frameless || !o.AlwaysOnTop {
+		t.Errorf("linux panel = background %v frameless %v on top %v, want a solid, frameless, on-top window", o.BackgroundType, o.Frameless, o.AlwaysOnTop)
+	}
+	for _, goos := range []string{"darwin", "windows"} {
+		if o := panelOptions(goos, ""); o.BackgroundType != application.BackgroundTypeTranslucent {
+			t.Errorf("%s panel background = %v, want translucent", goos, o.BackgroundType)
+		}
+	}
+}
+
+// #2141: over a full-screen app the menu bar icon showed the quick panel on
+// the desktop Space it was first shown on. On the Mac the panel is on every
+// Space, full-screen ones among them, as a menu bar extra's panel is, and
+// doesn't also move to the active Space (AppKit refuses the two together).
+func TestPanelOnEverySpaceOnMac(t *testing.T) {
+	b := panelOptions("darwin", "").Mac.CollectionBehavior
+	want := application.MacWindowCollectionBehaviorCanJoinAllSpaces | application.MacWindowCollectionBehaviorFullScreenAuxiliary
+	if b&want != want {
+		t.Errorf("panel collection behaviour %d is not on every Space and over full-screen ones", b)
+	}
+	if b&(application.MacWindowCollectionBehaviorMoveToActiveSpace|application.MacWindowCollectionBehaviorFullScreenPrimary) != 0 {
+		t.Errorf("panel collection behaviour %d moves to the active Space or goes full screen itself", b)
+	}
+	// shown without activating magpie: activated, the Mac took the user to
+	// the Space of magpie's other windows, off the full-screen app's
+	mac := panelOptions("darwin", "").Mac
+	if mac.WindowClass != application.MacWindowClassPanel || !mac.PanelPreferences.NonActivating {
+		t.Errorf("the panel is window class %d, non-activating %v; want a non-activating panel", mac.WindowClass, mac.PanelPreferences.NonActivating)
+	}
+}

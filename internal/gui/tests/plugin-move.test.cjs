@@ -4,8 +4,8 @@
 // editor says which runs it, and "Move to the plugin" says what it is doing
 // on the button. A move that fails says why right under it, in the
 // reader's language, and the button becomes "Try again"; one that goes
-// through turns the field over in the editor, still open where it was, and
-// "Use the built-in again" posts provider/moveback. The add sheet no longer
+// through turns the field over in the editor, still open where it was, with
+// no way back: magpie's built-in is retired. The add sheet no longer
 // offers the built-in Zed once it runs on its plugin, and its editor shows
 // no plugin:// endpoints to test. The Plugins tab, opened as the page
 // (?view=plugins), shows its market and offers Zed's accounts on the
@@ -72,12 +72,12 @@ function serve(lang, posts) {
 
 const L = {
   en: { runs: "Runs on", line: "Zed's built-in subscription is deprecated", look: "Review the move",
-    move: "Move to the plugin", busy: "Installing the plugin and checking each account…", again: "Try again", back: "Use the built-in again",
+    move: "Move to the plugin", busy: "Installing the plugin and checking each account…", again: "Try again", retired: "magpie's built-in is retired, so this subscription stays on its plugin.",
     failed: "It stays built-in: magpie couldn't reach npm to install the plugin. Check the network or proxy, then try again.",
     onPlugin: "The community Zed plugin", builtin: "magpie's built-in · or the community Zed plugin", done: "Zed now runs on its plugin — 2 accounts, 1 model.",
     subs: "Subscriptions", card: "Move", own: "Zed itself stays signed in as it is." },
   zh: { runs: "运行方式", line: "Zed 的内置订阅已弃用", look: "查看迁移",
-    move: "迁移到插件", busy: "正在安装插件并逐个检查账号…", again: "重试", back: "改回内置",
+    move: "迁移到插件", busy: "正在安装插件并逐个检查账号…", again: "重试", retired: "magpie 的内置已下线，此订阅一直由插件运行。",
     failed: "仍使用内置：无法连接 npm 安装插件，请检查网络或代理后重试。",
     onPlugin: "社区 Zed 插件", builtin: "magpie 内置 · 也可改用社区 Zed 插件", done: "Zed 已改由插件运行：2 个账号，1 个模型。",
     subs: "订阅", card: "迁移", own: "Zed 本身的登录不变。" },
@@ -87,12 +87,13 @@ const launch = (engine) => engine === "webkit" ? webkit.launch() : chromium.laun
 
 for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium", "webkit"])) {
   for (const lang of ["en", "zh"]) {
-    test(`${engine} ${lang}: a built-in subscription moves to its plugin and back`, async (t) => {
+    test(`${engine} ${lang}: a built-in subscription moves to its plugin for good`, async (t) => {
       const w = L[lang];
       const browser = await launch(engine);
       t.after(() => browser.close());
       const page = await (await browser.newContext({ viewport: { width: 900, height: 700 }, reducedMotion: "reduce" })).newPage();
       page.setDefaultTimeout(5000);
+      page.setDefaultNavigationTimeout(60000);
       const errors = [], posts = [];
       page.on("pageerror", (e) => errors.push(e.message));
       await page.route("**/*", serve(lang, posts));
@@ -116,6 +117,11 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       assert.ok(!text.includes(pkg), "names the npm package in the sentence");
       assert.ok(text.includes(w.own), "doesn't say Zed stays signed in");
 
+      // the reader opened Advanced (so the editor runs on past the field)
+      // and scrolled to the field: nothing the move does moves it, and the
+      // fold stays as they left it though the move starts a new draft
+      await ed.locator("details.advanced > summary").click();
+      assert.equal(await ed.locator("details.advanced").evaluate((d) => d.open), true);
       // the reader scrolled to the field: nothing the move does moves it.
       // A wheel, as a reader's scroll (a script's scrollTop is put back), and
       // only so far that the button stays in sight: a click on a button out
@@ -129,7 +135,16 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await page.waitForTimeout(80);
         if (await at() === was) break;
       }
-      const top = await at();
+      // WebKit can still be applying the last wheel when the loop ends
+      // (367, then 397 a moment later): the place the reader left is
+      // where the scroll settles, two reads 150ms apart agreeing
+      let top = await at();
+      for (let i = 0; i < 40; i++) {
+        await page.waitForTimeout(150);
+        const now = await at();
+        if (now === top) break;
+        top = now;
+      }
       assert.ok(top > 0, "the editor doesn't scroll: the test proves nothing about keeping its place");
       // a press where the button is, as the reader's mouse does
       const press = async () => {
@@ -141,6 +156,12 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await press();
       await page.waitForFunction((busy) => [...document.querySelectorAll("#modal .move button")].some((b) => b.textContent === busy), w.busy, { timeout: 300 });
       assert.equal(await btn.isDisabled(), true, "the button can be pressed again mid-move");
+      // an account's allowance landing mid-move redraws the editor
+      // (loginUsageOf): the move is still said to run, and its end is said
+      // in the field drawn now
+      await page.evaluate(() => renderProviders());
+      assert.equal(await btn.innerText(), w.busy, "a redraw mid-move forgot the move");
+      assert.equal(await btn.isDisabled(), true, "a redraw mid-move lets the button be pressed again");
 
       // it fails: said under the button, the editor open where it was
       const why = ed.locator(".move-why");
@@ -149,18 +170,22 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       assert.equal(await btn.innerText(), w.again);
       assert.equal(await btn.isDisabled(), false);
       assert.equal(await body.evaluate((e) => e.scrollTop), top, "the failure moved the editor");
+      await page.evaluate(() => renderProviders());
+      assert.equal(await why.innerText(), w.failed, "a redraw forgot why the move failed");
+      assert.equal(await btn.innerText(), w.again);
       if (process.env.ARTIFACT_DIR) await ed.screenshot({ path: path.join(process.env.ARTIFACT_DIR, `plugin-move-failed-${engine}-${lang}.png`) });
 
       // tried again, it goes through: the same editor, turned over
       await press();
-      const back = ed.locator(".move button", { hasText: w.back });
-      await back.waitFor();
+      await ed.locator(".hint", { hasText: w.retired }).waitFor();
+      assert.equal(await ed.locator(".move button").count(), 0, "a moved subscription still offers a way back");
       assert.equal(await page.locator("#modal .editor").count(), 1, "the editor closed");
       assert.ok((await ed.innerText()).includes(w.onPlugin), "doesn't say the plugin runs it");
       // as the built-in said: the agent's own sign-in is where it was
       assert.ok((await ed.innerText()).includes(w.own), "the moved Zed no longer says Zed stays signed in");
-      assert.equal(await why.count() && await why.isVisible(), false, "the failure is still said");
+      assert.ok(!(await why.count()) || !(await why.isVisible()), "the failure is still said");
       assert.equal(await body.evaluate((e) => e.scrollTop), top, "the move moved the editor");
+      assert.equal(await ed.locator("details.advanced").evaluate((d) => d.open), true, "the move shut Advanced");
       assert.ok((await page.locator("#status").innerText()).startsWith(w.done), "no toast saying what moved");
       assert.deepEqual(posts.map((p) => [p.path, p.body.id]), [["/api/provider/move", "zed"], ["/api/provider/move", "zed"]]);
       // its plugin:// URLs are magpie's own: no Endpoints, no Test
@@ -176,10 +201,6 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       assert.equal(await sheet.locator('.tile[data-pick="Zed"]').count(), 1);
       await page.keyboard.press("Escape");
 
-      await page.locator(".row.provider", { hasText: "Zed" }).click();
-      await back.click();
-      for (let i = 0; i < 50 && posts.length < 3; i++) await page.waitForTimeout(50);
-      assert.deepEqual(posts.map((p) => p.path), ["/api/provider/move", "/api/provider/move", "/api/provider/moveback"]);
       assert.deepEqual(errors, []);
     });
 
@@ -189,6 +210,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       t.after(() => browser.close());
       const page = await (await browser.newContext({ viewport: { width: 980, height: 820 } })).newPage();
       page.setDefaultTimeout(5000);
+      page.setDefaultNavigationTimeout(60000);
       const errors = [], posts = [];
       page.on("pageerror", (e) => errors.push(e.message));
       await page.route("**/*", serve(lang, posts));

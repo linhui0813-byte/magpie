@@ -2,23 +2,20 @@ package provider
 
 import (
 	"context"
-	"os/exec"
 	"path/filepath"
 	"reflect"
 	"testing"
 	"time"
 
 	"github.com/yetone/magpie/internal/plugin"
+	"github.com/yetone/magpie/internal/testenv"
 )
 
 // A plugin provider's accounts are arranged like a built-in's: the page
 // names them by the provider's id, magpie keeps them as plugin:<id>, and
 // the gateway tries them in the order dragged.
 func TestAccountOrderPluginAccounts(t *testing.T) {
-	bun, err := exec.LookPath("bun")
-	if err != nil {
-		t.Skip("no bun on PATH")
-	}
+	bun := testenv.Bun(t)
 	claudeHome(t)
 	t.Setenv("MAGPIE_BUN", bun)
 	t.Cleanup(plugin.Settle)

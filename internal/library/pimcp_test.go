@@ -9,6 +9,7 @@ import (
 
 	"github.com/tidwall/jsonc"
 
+	"github.com/yetone/magpie/internal/agent"
 	"github.com/yetone/magpie/internal/testenv"
 )
 
@@ -103,9 +104,19 @@ func TestPiMCPGlobalAdapterMerge(t *testing.T) {
 	}
 }
 
-// Listed but not found (a git or odd install): taken as the current 3.
+// setPiVersion makes v the version of the Pi on PATH.
+func setPiVersion(t *testing.T, v string) {
+	t.Helper()
+	was := piVersion
+	piVersion = func(*agent.Agent) string { return v }
+	t.Cleanup(func() { piVersion = was })
+}
+
+// Listed but not found (a git or odd install): taken as the current one,
+// which on a Pi before 0.99 reads mcp-adapter.json only.
 func TestPiMCPAdapterListed(t *testing.T) {
 	h := sandbox(t)
+	setPiVersion(t, "0.98.2")
 	d := filepath.Join(h, ".pi/agent")
 	write(t, filepath.Join(d, "settings.json"), `{"packages": [{"source": "npm:pi-mcp-adapter"}]}`)
 	write(t, filepath.Join(d, "mcp.json"), `{"mcpServers": {"mine": {"command": "x", "lifecycle": "eager"}}}`)
@@ -163,11 +174,12 @@ func TestPiMCPBoth(t *testing.T) {
 }
 
 // pi-mcp-extension alone reads its home's ~/.pi/agent/mcp.json, whatever
-// PI_CODING_AGENT_DIR says; with nothing installed, mcp-adapter.json.
+// PI_CODING_AGENT_DIR says; with nothing installed and Pi's version not
+// known, Pi's own mcp.json: only Pi's own MCP could read a server then.
 func TestPiMCPExtension(t *testing.T) {
 	h := sandbox(t)
-	if tg := targetByID("pi"); tg.MCP.Path != filepath.Join(h, ".pi/agent/mcp-adapter.json") {
-		t.Errorf("nothing installed: %s", tg.MCP.Path)
+	if tg := targetByID("pi"); tg.MCP.Path != filepath.Join(h, ".pi/agent/mcp.json") || tg.MCP.Format != fmtPiNative {
+		t.Errorf("nothing installed: %+v", tg.MCP)
 	}
 	d := filepath.Join(h, "pi-dir")
 	t.Setenv("PI_CODING_AGENT_DIR", d)
@@ -314,14 +326,13 @@ func TestPiNativeVersions(t *testing.T) {
 	}
 }
 
-// heliar-k on #1097: the adapter found, mcp.json was moved whole to
-// mcp-adapter.json with no backup, the servers the user added with
-// `pi mcp add` leaving the file Pi reads. Whatever moves it, the user's
-// mcp.json is copied aside first, byte for byte, and its servers survive.
+// #1097: when pi-mcp-adapter 4 is loaded and mcp.json is moved whole to
+// mcp-adapter.json, the user's mcp.json is copied aside first, byte for
+// byte, and its servers survive.
 func TestPiMCPWholeMoveKeepsABackup(t *testing.T) {
 	h := sandbox(t)
 	d := filepath.Join(h, ".pi/agent")
-	write(t, filepath.Join(d, "settings.json"), `{ "quietStartup": false, "packages": [] }`)
+	write(t, filepath.Join(d, "settings.json"), `{ "quietStartup": false, "packages": ["npm:pi-mcp-adapter"] }`)
 	write(t, filepath.Join(d, "npm/node_modules/pi-mcp-adapter/package.json"), `{"name": "pi-mcp-adapter", "version": "4.0.0"}`)
 	old, adapter := filepath.Join(d, "mcp.json"), filepath.Join(d, "mcp-adapter.json")
 	mine := `{ "mcpServers": { "demo": { "url": "https://mcp.exa.ai/mcp" } } }
@@ -341,5 +352,117 @@ func TestPiMCPWholeMoveKeepsABackup(t *testing.T) {
 		}
 	} else if piServers(t, adapter)["demo"] == nil {
 		t.Errorf("demo neither in mcp.json nor in mcp-adapter.json: %s", read(t, adapter))
+	}
+}
+
+// sydney on Discord, heliar-k on #1097: Pi 1.0 with a pi-mcp-adapter left
+// in npm/node_modules that settings.json doesn't list, so Pi doesn't load
+// it (core/package-manager.js resolve). Pi's own MCP reads mcp.json, and
+// the Library's servers go there, not to mcp-adapter.json; the user's
+// mcp.json stays where it is, and what an earlier magpie moved into
+// mcp-adapter.json comes back, both files backed up first.
+func TestPiMCPUnloadedAdapter(t *testing.T) {
+	for _, v := range []string{"1.0.3", ""} {
+		t.Run("pi "+v, func(t *testing.T) {
+			h := sandbox(t)
+			setPiVersion(t, v)
+			d := filepath.Join(h, ".pi/agent")
+			native, adapter := filepath.Join(d, "mcp.json"), filepath.Join(d, "mcp-adapter.json")
+			write(t, filepath.Join(d, "settings.json"), `{ "quietStartup": false, "packages": [] }`)
+			write(t, filepath.Join(d, "npm/node_modules/pi-mcp-adapter/package.json"), `{"name": "pi-mcp-adapter", "version": "4.0.0"}`)
+			write(t, native, `{ "mcpServers": { "demo": { "url": "https://mcp.exa.ai/mcp" } } }`)
+			write(t, adapter, `{"mcpServers": {"moved": {"command": "npx", "args": ["-y", "moved"]}}}`)
+			tg := targetByID("pi")
+			if tg.MCP.Path != native || tg.MCP.Format != fmtPiNative || tg.MCPVia != "" {
+				t.Fatalf("target: %+v via %q", tg.MCP, tg.MCPVia)
+			}
+			got := piServers(t, native)
+			if got["demo"]["url"] != "https://mcp.exa.ai/mcp" || got["moved"]["command"] != "npx" {
+				t.Errorf("mcp.json: %s", read(t, native))
+			}
+			for _, f := range []string{"mcp.json", "mcp-adapter.json"} {
+				if bs, _ := filepath.Glob(filepath.Join(BackupDir(), "*", "pi", f)); len(bs) != 1 {
+					t.Errorf("backups of %s: %v", f, bs)
+				}
+			}
+			ok(t)(SaveServer("", Server{Name: "fs", Transport: "stdio", Command: "npx", Args: []string{"-y", "fs"}, Agents: []string{"pi"}}))
+			if s := piServers(t, native)["fs"]; s["command"] != "npx" || s["transport"] != nil {
+				t.Errorf("fs: %v", s)
+			}
+			if exists(adapter) && piServers(t, adapter)["fs"] != nil {
+				t.Errorf("fs written to mcp-adapter.json: %s", read(t, adapter))
+			}
+		})
+	}
+}
+
+// Pi loads a listed package unless its extensions are filtered to none,
+// and its extensions folder unless an entry turns that off.
+func TestPiDetectLoaded(t *testing.T) {
+	h := sandbox(t)
+	d := filepath.Join(h, ".pi/agent")
+	write(t, filepath.Join(d, "npm/node_modules/pi-mcp-adapter/package.json"), `{"name": "pi-mcp-adapter", "version": "5.2.0"}`)
+	write(t, filepath.Join(d, "npm/node_modules/pi-mcp-extension/package.json"), `{"name": "pi-mcp-extension", "version": "1.5.0"}`)
+	for settings, want := range map[string]piPlugins{
+		`{}`:                                     {},
+		`{"packages": []}`:                       {},
+		`{"packages": ["npm:pi-mcp-adapter"]}`:   {adapter: true, major: 5},
+		`{"packages": ["npm:pi-mcp-extension"]}`: {ext: true},
+		`{"packages": [{"source": "npm:pi-mcp-adapter", "extensions": []}]}`:                              {},
+		`{"packages": [{"source": "npm:pi-mcp-adapter", "skills": []}]}`:                                  {adapter: true, major: 5},
+		`{"packages": [{"source": "npm:pi-mcp-adapter", "autoload": false}]}`:                             {},
+		`{"packages": [{"source": "npm:pi-mcp-adapter", "autoload": false, "extensions": []}]}`:           {},
+		`{"packages": [{"source": "npm:pi-mcp-adapter", "autoload": false, "extensions": ["index.ts"]}]}`: {adapter: true, major: 5},
+		`{"packages": [{"source": "npm:pi-mcp-adapter", "autoload": true}]}`:                              {adapter: true, major: 5},
+		`{"extensions": ["+npm/node_modules/pi-mcp-adapter"]}`:                                            {},
+		`{"packages": ["npm:pi-mcp-adapter"], "extensions": ["-builtin:mcp"]}`:                            {adapter: true, major: 5, noBuiltin: true},
+	} {
+		write(t, filepath.Join(d, "settings.json"), settings)
+		if got := piDetect(d); got != want {
+			t.Errorf("%s: %+v, want %+v", settings, got, want)
+		}
+	}
+	write(t, filepath.Join(d, "extensions/pi-mcp-adapter/package.json"), `{"name": "pi-mcp-adapter", "version": "3.1.0"}`)
+	write(t, filepath.Join(d, "settings.json"), `{}`)
+	if got := piDetect(d); !got.adapter || got.major != 3 {
+		t.Errorf("extensions folder: %+v", got)
+	}
+	write(t, filepath.Join(d, "settings.json"), `{"extensions": ["-extensions/pi-mcp-adapter"]}`)
+	if got := piDetect(d); got.adapter {
+		t.Errorf("turned off: %+v", got)
+	}
+}
+
+// pi-mcp-adapter 5 on Pi 0.99 or later reads Pi's mcp.json too, below
+// mcp-adapter.json, and `pi mcp` reads only mcp.json: the servers go in the
+// adapter's file, and mcp.json isn't moved away.
+func TestPiMCPAdapter5KeepsPiFile(t *testing.T) {
+	h := sandbox(t)
+	setPiVersion(t, "1.0.4")
+	d := filepath.Join(h, ".pi/agent")
+	native, adapter := filepath.Join(d, "mcp.json"), filepath.Join(d, "mcp-adapter.json")
+	write(t, filepath.Join(d, "settings.json"), `{"packages": ["npm:pi-mcp-adapter"], "extensions": ["-builtin:mcp"]}`)
+	write(t, filepath.Join(d, "npm/node_modules/pi-mcp-adapter/package.json"), `{"name": "pi-mcp-adapter", "version": "5.2.0"}`)
+	mine := `{"mcpServers": {"demo": {"url": "https://mcp.exa.ai/mcp"}}}`
+	write(t, native, mine)
+	tg := targetByID("pi")
+	if tg.MCP.Path != adapter || tg.MCPVia != "pi-mcp-adapter" {
+		t.Fatalf("target: %+v via %q", tg.MCP, tg.MCPVia)
+	}
+	if read(t, native) != mine {
+		t.Errorf("mcp.json changed: %s", read(t, native))
+	}
+	if len(tg.MCP.Extra) != 1 || tg.MCP.Extra[0] != native {
+		t.Errorf("extra: %v", tg.MCP.Extra)
+	}
+	ok(t)(SaveServer("", Server{Name: "ev", Transport: "sse", URL: "https://example.com/sse", Agents: []string{"pi"}}))
+	if piServers(t, adapter)["ev"] == nil || read(t, native) != mine {
+		t.Errorf("mcp-adapter.json %s, mcp.json %s", read(t, adapter), read(t, native))
+	}
+	// the same adapter on a Pi before 0.99 reads only its own file
+	setPiVersion(t, "0.98.2")
+	targetByID("pi")
+	if exists(native) || piServers(t, adapter)["demo"] == nil {
+		t.Errorf("0.98: mcp.json not moved: %s", read(t, adapter))
 	}
 }

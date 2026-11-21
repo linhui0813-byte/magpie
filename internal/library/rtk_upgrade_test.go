@@ -42,12 +42,8 @@ func latestServer(t *testing.T, tag string) {
 	t.Cleanup(forgetChannels)
 }
 
-// forgetChannels forgets what winget and Homebrew were found to have.
-func forgetChannels() {
-	rtkChannels.Lock()
-	clear(rtkChannels.m)
-	rtkChannels.Unlock()
-}
+// forgetChannels is in rtk_channel_background_test.go: it clears the answers
+// and any ask marked in flight.
 
 // asJSON is the view as the page gets it.
 func asJSON(t *testing.T, v *RTKView) map[string]any {
@@ -59,6 +55,27 @@ func asJSON(t *testing.T, v *RTKView) map[string]any {
 	var m map[string]any
 	json.Unmarshal(b, &m)
 	return m
+}
+
+// An answer cut off on the way is said so, not shown as a version that
+// couldn't be read (#3045).
+func TestLatestRTKCutAnswer(t *testing.T) {
+	sandbox(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "1000")
+		w.Write([]byte(`{"tag_name": "v0.`))
+		w.(http.Flusher).Flush() // the answer's head arrives, its body doesn't
+		panic(http.ErrAbortHandler)
+	}))
+	defer srv.Close()
+	old, oldAPI := rtkReleases, rtkReleasesAPI
+	rtkReleases, rtkReleasesAPI = srv.URL+"/latest", srv.URL
+	t.Cleanup(func() { rtkReleases, rtkReleasesAPI = old, oldAPI })
+	if _, err := latestRTK(); err == nil {
+		t.Error("a cut-short answer wasn't noticed")
+	} else if !strings.Contains(err.Error(), "couldn't read GitHub's answer") {
+		t.Errorf("said: %v", err)
+	}
 }
 
 // Homebrew's rtk is upgraded with brew; the days it saved come with the
@@ -232,8 +249,14 @@ esac
 		return []string{"winget", "upgrade", "--id", "rtk-ai.rtk", "--exact", "--silent", "--accept-package-agreements", "--accept-source-agreements", "--disable-interactivity"}
 	}
 	t.Cleanup(func() { upgraderOf = up })
+	// what the tab does with the read it draws: it takes what the package
+	// manager said last, and asks it in the background for the next time
+	// (asking it takes seconds — `winget show` refreshes its sources — which
+	// is what #1025's note must not hold the tab up for)
 	card := func() map[string]any {
 		v := ReadRTK()
+		v.CheckLatest()
+		CheckChannel(v)
 		v.CheckLatest()
 		return asJSON(t, v)
 	}
@@ -302,5 +325,37 @@ func TestRTKChannelVersion(t *testing.T) {
 		if got != c.want || (err == nil) != (c.want != "") {
 			t.Errorf("%s %q: %q, %v", c.tool, c.out, got, err)
 		}
+	}
+}
+
+// An rtk cargo put in ~/.cargo/bin is upgraded with cargo, naming the
+// package: rtk-ai/rtk has rtk-proxy beside rtk, and cargo install --git
+// refuses to choose between them (#2328, #2092). And the branch: rtk's
+// default branch, develop, has an older rtk than the release, built from
+// master (新v学员). The fake cargo answers as cargo does.
+func TestRTKUpgradeCargoNamesThePackage(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the fakes are shell scripts")
+	}
+	h := sandbox(t)
+	latestServer(t, "v0.50.0")
+	dir := filepath.Join(h, ".cargo", "bin")
+	testenv.Program(t, filepath.Join(dir, "rtk"), strings.ReplaceAll(versionedRTK, "VERSION", filepath.Join(dir, "VERSION")))
+	write(t, filepath.Join(dir, "VERSION"), "0.40.1")
+	testenv.Program(t, filepath.Join(dir, "cargo"), `#!/bin/sh
+[ "$*" = "install --git https://github.com/rtk-ai/rtk --branch master rtk --force" ] || exit 2
+case " $* " in
+*" rtk "*) echo 0.50.0 > "`+filepath.Join(dir, "VERSION")+`" ;;
+*) echo "error: multiple packages with binaries found: rtk, rtk-proxy." >&2; exit 101 ;;
+esac
+`)
+	t.Setenv("PATH", dir)
+
+	v := ReadRTK()
+	if v.Path != filepath.Join(dir, "rtk") || !strings.HasPrefix(v.Upgrade, "cargo install") {
+		t.Fatalf("view: %+v", v)
+	}
+	if v, err := UpgradeRTK(); err != nil || v.Version != "0.50.0" {
+		t.Fatalf("after: %+v, %v", v, err)
 	}
 }

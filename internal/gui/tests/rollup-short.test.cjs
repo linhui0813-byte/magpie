@@ -1,6 +1,7 @@
 // Run with Node's test runner and Playwright on the module path; see README.md.
 // "Show less" under a list that, rolled up, is shorter than the window
-// (#355): 24 agents, 5 in use and 19 folded (4 hidden by hand), in a tall
+// (#355): 24 agents, 5 in use and 19 folded (4 hidden by hand, behind a
+// line of their own, so the button counts 15), in a tall
 // window. "Show {n} more" takes the button to the view's top; "Show less"
 // then leaves it there, room kept at the view's foot for it, on every frame
 // that is painted. The room was worked out from scrollHeight, which is never
@@ -47,8 +48,8 @@ function serve(lang) {
 }
 
 const words = {
-  en: { more: "Show 19 more (4 hidden)", less: "Show less" },
-  zh: { more: "显示其余 19 个（含 4 个已隐藏）", less: "收起" },
+  en: { more: "Show 15 more", less: "Show less" },
+  zh: { more: "显示其余 15 个", less: "收起" },
 };
 
 // where the button is on each frame as it was painted: read after the
@@ -85,6 +86,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await t.test(`${lang}, reduced motion: ${motion}`, async () => {
           const page = await (await browser.newContext({ viewport: { width: 1240, height: 800 }, reducedMotion: motion })).newPage();
           page.setDefaultTimeout(5000);
+          page.setDefaultNavigationTimeout(60000);
           page.on("pageerror", (e) => errors.push(e.message));
           await page.route("**/*", serve(lang));
           await page.goto("http://magpie.test/");

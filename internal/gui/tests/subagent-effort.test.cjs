@@ -68,8 +68,8 @@ const W = {
     title: "subagent effort", def: "default", high: "high", set: "subagent effort: high", follows: "subagents: same as model",
   },
   zh: {
-    unset: "子 agent 推理强度：默认\n跟随会话的推理强度，或子 agent 模型的默认强度",
-    title: "子 agent 推理强度", def: "默认", high: "高", set: "子 agent 推理强度：高", follows: "子 agent：同主模型",
+    unset: "子代理推理强度：默认\n跟随会话的推理强度，或子代理模型的默认强度",
+    title: "子代理推理强度", def: "默认", high: "高", set: "子代理推理强度：高", follows: "子代理：同主模型",
   },
 };
 
@@ -82,6 +82,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: "chromium" }));
       const page = await browser.newPage({ viewport: { width: 1100, height: 700 } });
       page.setDefaultTimeout(5000);
+      page.setDefaultNavigationTimeout(60000);
       const errors = [], sets = [];
       page.on("pageerror", (e) => errors.push(e.message));
       await page.route("**/*", server(lang, sets));

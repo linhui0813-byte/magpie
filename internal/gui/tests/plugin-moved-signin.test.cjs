@@ -28,7 +28,9 @@ function server(lang, asked) {
       account: { agent: "cursor", agentName: "Cursor", agentIcon: "cursor", user: "a@c", logins: [{ user: "a@c", active: true, on: true }, { user: "b@c", on: true }] } }],
     presets: [], excluded: [], gateway: { running: true, window: true }, plugins, onPlugins: ["zcode", "factory", "cursor"],
   });
-  let polls = 0;
+  // the provider being signed in to: kept apart from asked, which the test
+  // empties while the last sign-in's poll may still be on its way (#1440)
+  let polls = 0, signing = "";
   return async (route) => {
     const url = new URL(route.request().url());
     const json = (data) => route.fulfill({ json: data });
@@ -44,11 +46,12 @@ function server(lang, asked) {
       const b = body();
       asked.push(["signin", b]);
       polls = 0;
+      signing = b.provider;
       return json({ id: "s1", agent: b.provider, state: "waiting", url: "https://fake.test/device", code: b.provider === "factory" ? "ABCD-EFGH" : "", instructions: "Confirm the code ABCD-EFGH on Factory's page" });
     }
     if (url.pathname === "/api/signin/s1") {
       // ZCode's fails on the second look, to be tried again
-      const p = asked.filter(([k]) => k === "signin").at(-1)[1].provider;
+      const p = signing;
       if (++polls < 2 || p !== "zcode") return json({ id: "s1", agent: p, state: "waiting", url: "https://fake.test/device", code: p === "factory" ? "ABCD-EFGH" : "" });
       return json({ id: "s1", agent: "zcode", state: "failed", error: "the sign-in page expired" });
     }
@@ -60,8 +63,8 @@ function server(lang, asked) {
 }
 
 const L = {
-  en: { subs: "Subscriptions", plugins: "From plugins", anyway: "Sign in anyway", again: "Try again", single: "keeps one account", signedIn: "Signed in ·" },
-  zh: { subs: "订阅", plugins: "来自插件", anyway: "仍然登录", again: "重试", single: "只保存一个账号", signedIn: "已登录 ·" },
+  en: { subs: "Subscriptions", plugins: "From plugins", anyway: "Sign in anyway", key: "Use an API key instead…", again: "Try again", single: "keeps one account", signedIn: "Signed in ·" },
+  zh: { subs: "订阅", plugins: "来自插件", anyway: "仍然登录", key: "改用 API Key…", again: "重试", single: "只保存一个账号", signedIn: "已登录 ·" },
 };
 
 for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium", "webkit"])) {
@@ -73,6 +76,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         const w = L[lang];
         const page = await (await browser.newContext({ viewport: { width: 900, height: 800 } })).newPage();
         page.setDefaultTimeout(5000);
+        page.setDefaultNavigationTimeout(60000);
         const errors = [], asked = [];
         page.on("pageerror", (e) => errors.push(e.message));
         await page.route("**/*", server(lang, asked));
@@ -113,6 +117,8 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         // Factory: warned, its one way, the code to copy
         asked.length = 0;
         await sheet.locator('.tile[data-pick="Factory"]').click();
+        // and its API keys, which its plugin keeps (factory_key.go)
+        await box.locator("button", { hasText: w.key }).waitFor();
         await box.locator("button", { hasText: w.anyway }).click();
         await box.locator(".devcode code", { hasText: "ABCD-EFGH" }).waitFor();
         if (process.env.ARTIFACT_DIR) await box.screenshot({ path: path.join(process.env.ARTIFACT_DIR, `plugin-moved-code-${engine}-${lang}.png`) });

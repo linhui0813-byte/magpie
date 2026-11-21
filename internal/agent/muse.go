@@ -34,13 +34,13 @@ func muse(cfg string) *Agent { return museAt(here(""), cfg) }
 
 // museIn is Muse Code in a WSL distro (see wsl.go): ~/.config/muse, as
 // XDG_CONFIG_HOME there isn't read.
-func museIn(at place) *Agent { return museAt(at, filepath.Join(at.home, ".config")) }
+func museIn(at place) *Agent { return museAt(at, at.join(".config")) }
 
 // museAt is Muse Code with its config under cfg, reaching the gateway as
 // at does.
 func museAt(at place, cfg string) *Agent {
 	gatewayV1 := at.v1
-	dir := filepath.Join(cfg, "muse")
+	dir := at.open(filepath.Join(cfg, "muse"))
 	path := filepath.Join(dir, "settings.json")
 	keyTransport := "muse:" + path + ":" + museTransport
 	keyModel := "muse:" + path + ":" + museModel
@@ -82,7 +82,7 @@ func museAt(at place, cfg string) *Agent {
 		Bin: "muse", Dir: dir, Path: path,
 		Notice: func() string {
 			if Running(`(^|/)muse( |$)`) {
-				return "Muse Code reads its settings at start-up — restart open muse sessions to use this."
+				return noticeMuse.String()
 			}
 			return ""
 		},
@@ -153,7 +153,7 @@ func museAt(at place, cfg string) *Agent {
 				if c := cur["model"]; c != "" && !usesMagpie(c) {
 					own = append(own, Option{Value: c, Icon: museIcon(c)})
 				}
-				return append(group("Muse Code", own), viaMagpie("muse", magpieID+"/")...)
+				return withVia(group("Muse Code", own), "muse", magpieID+"/")
 			},
 		}},
 	}, path)
@@ -167,3 +167,8 @@ func museIcon(id string) string {
 	}
 	return modelIcon("", id)
 }
+
+// what muse says after a change (notice.go)
+var (
+	noticeMuse = newNotice("Muse Code reads its settings at start-up — restart open muse sessions to use this.")
+)

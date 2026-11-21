@@ -4,16 +4,15 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -123,95 +122,12 @@ func TestGrokInstallWithoutShellFails(t *testing.T) {
 	}
 }
 
-// Command Code's Studio posts the new key to the callback on 127.0.0.1 in
-// the background, so in Docker the browser ends on a page that won't load
-// and whose address has nothing in it. As Command Code's CLI takes one
-// ("Authorize in browser, or paste API key here"), a key made on Studio's
-// keys page and pasted finishes the sign-in.
-func TestCommandCodeSignInPastedKey(t *testing.T) {
-	signIn(t)
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		key := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-		if key != "made-key" {
-			w.WriteHeader(401)
-			return
-		}
-		switch r.URL.Path {
-		case "/alpha/whoami":
-			_ = json.NewEncoder(w).Encode(map[string]any{"user": map[string]any{"id": "u9", "userName": "pasted", "email": "p@example.com"}})
-		case "/alpha/billing/subscriptions":
-			_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "data": map[string]any{"planId": "individual-pro-monthly", "status": "active"}})
-		default:
-			w.WriteHeader(404)
-		}
-	}))
-	defer srv.Close()
-	oldAPI := cmdAPI
-	cmdAPI = srv.URL
-	defer func() { cmdAPI = oldAPI }()
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	st, err := StartSignIn(CommandCodePlanID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !st.PasteKey || st.KeysURL != "https://commandcode.ai/settings/keys" {
-		t.Fatalf("started %+v", st)
-	}
-	u, _ := url.Parse(st.URL)
-	// the address the browser ended on carries nothing: said so, and the
-	// sign-in still waits for a key
-	if err := SubmitSignInCallback(st.ID, u.Query().Get("callback")); err == nil || !strings.Contains(err.Error(), "keys page") {
-		t.Fatalf("an address pasted: %v", err)
-	}
-	if err := SubmitSignInCallback(st.ID, "  "); err == nil {
-		t.Fatal("nothing pasted was taken")
-	}
-	if st, _ := SignInStatus(st.ID); st.State != "waiting" {
-		t.Fatalf("after a wrong paste %+v", st)
-	}
-	if err := SubmitSignInCallback(st.ID, " made-key\n"); err != nil {
-		t.Fatal(err)
-	}
-	st, _ = WaitSignIn(ctx, st.ID)
-	if st.State != "done" || st.User != "pasted" || st.Plan != "Pro" {
-		t.Fatalf("finished %+v", st)
-	}
-	found := false
-	for _, l := range cmdLogins() {
-		if l.User == "pasted" && l.auth.APIKey == "made-key" {
-			found = true
-		}
-	}
-	if !found {
-		t.Fatalf("the key isn't kept: %+v", cmdLogins())
-	}
-	// Studio's post coming after it is turned away: the sign-in is over
-	res, err := http.PostForm(u.Query().Get("callback"), url.Values{"apiKey": {"made-key"}, "state": {u.Query().Get("state")}})
-	if err == nil {
-		res.Body.Close()
-	}
-	if n := len(cmdLogins()); n != 1 {
-		t.Fatalf("%d accounts after a late post", n)
-	}
-
-	// a key Command Code turns down fails the sign-in, as Studio's would
-	st, _ = StartSignIn(CommandCodePlanID)
-	if err := SubmitSignInCallback(st.ID, "wrong-key"); err == nil || !strings.Contains(err.Error(), "didn't take") {
-		t.Fatalf("a wrong key: %v", err)
-	}
-}
-
 // The community Grok plugin installed beside the built-in (not moved onto)
 // runs `grok login` itself, and said "install Grok Build first: curl … |
 // bash" in Docker, where there's no shell to run it: the CLI is installed
 // first, as it is for a moved one.
 func TestGrokPluginSignInInstallsCLI(t *testing.T) {
-	bun, err := exec.LookPath("bun")
-	if err != nil {
-		t.Skip("no bun on PATH")
-	}
+	bun := testenv.Bun(t)
 	home := claudeHome(t)
 	t.Setenv("MAGPIE_BUN", bun)
 	t.Cleanup(plugin.Settle)
@@ -264,8 +180,15 @@ export const P = async () => ({
 	}
 	t.Cleanup(func() { GrokExecutable = oldExe })
 	var ran string
+	// the install waits for the test to see it under way: a fake that
+	// finished at once let the sign-in reach "waiting" before
+	// StartPluginSignIn read its own state back
+	seen := make(chan struct{})
+	release := sync.OnceFunc(func() { close(seen) })
+	t.Cleanup(release)
 	oldRun := runInstaller
 	runInstaller = func(ctx context.Context, c agentCLI) ([]byte, error) {
+		<-seen
 		ran = c.Name
 		os.MkdirAll(filepath.Dir(exe), 0o755)
 		return nil, testenv.WriteProgram(exe, "#!/bin/sh\n")
@@ -279,11 +202,57 @@ export const P = async () => ({
 	if st.State != "installing" || st.Installing != "Grok Build" {
 		t.Fatalf("started %+v", st)
 	}
+	release()
 	st = waitPast(t, st.ID, "installing")
 	if st.State == "waiting" {
 		st = waitPast(t, st.ID, "waiting")
 	}
 	if st.State != "done" || st.User != "me@grok" || ran != "Grok Build" {
 		t.Fatalf("finished %+v (installer %q)", st, ran)
+	}
+}
+
+// The command line's plugin sign-in (`magpie plugin login grok`) installs
+// Grok Build through InstallPluginCLI, as the window's does; it said
+// "install Grok Build first: curl … | bash" in Docker, which has no curl
+// (#2223, evier12345). Only a plugin that signs in with a vendor's CLI
+// gets one.
+func TestInstallPluginCLIInstallsGrokBuild(t *testing.T) {
+	home := claudeHome(t)
+	exe := filepath.Join(home, ".grok", "bin", "grok")
+	oldExe := GrokExecutable
+	GrokExecutable = func() string {
+		if isFile(exe) {
+			return exe
+		}
+		return ""
+	}
+	t.Cleanup(func() { GrokExecutable = oldExe })
+	var ran []string
+	oldRun := runInstaller
+	runInstaller = func(ctx context.Context, c agentCLI) ([]byte, error) {
+		ran = append(ran, c.Name)
+		os.MkdirAll(filepath.Dir(exe), 0o755)
+		return nil, testenv.WriteProgram(exe, "#!/bin/sh\n")
+	}
+	t.Cleanup(func() { runInstaller = oldRun })
+
+	if got := PluginCLIMissing("fakeco"); got != "" {
+		t.Fatalf("a plugin that runs no CLI needs %q", got)
+	}
+	if err := InstallPluginCLI(context.Background(), "fakeco"); err != nil || len(ran) != 0 {
+		t.Fatalf("a plugin that runs no CLI: %v, installed %v", err, ran)
+	}
+	if got := PluginCLIMissing("grok"); got != "Grok Build" {
+		t.Fatalf("Grok's plugin without Grok Build needs %q", got)
+	}
+	if err := InstallPluginCLI(context.Background(), "grok"); err != nil {
+		t.Fatal(err)
+	}
+	if len(ran) != 1 || ran[0] != "Grok Build" || !isFile(exe) {
+		t.Fatalf("installed %v", ran)
+	}
+	if got := PluginCLIMissing("grok"); got != "" {
+		t.Fatalf("with Grok Build there, still missing %q", got)
 	}
 }

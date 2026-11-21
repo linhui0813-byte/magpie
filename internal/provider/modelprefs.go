@@ -1,6 +1,7 @@
 package provider
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
 	"maps"
@@ -44,7 +45,7 @@ func modelNameIn(names map[string]string, pid, model string) (string, bool) {
 // and the model.
 func splitRef(ref string) (*Provider, string, error) {
 	r := strings.TrimPrefix(strings.TrimSpace(ref), "magpie/")
-	if strings.HasPrefix(r, GroupPrefix) {
+	if IsGroupRef(r) {
 		return nil, "", errors.New("that is a routing group, not a provider's model")
 	}
 	pid, model, ok := strings.Cut(r, "/")
@@ -180,7 +181,7 @@ func PriceKey(pid, model string) (string, bool) {
 		return AnyPriceKey(model), false
 	}
 	key := pid + "/" + model
-	if _, under := settings.Load().ModelPrices[key]; under {
+	if _, under := settings.Shared().ModelPrices[key]; under {
 		_, there := byIDOrWas(pid)
 		return key, there
 	}
@@ -212,7 +213,7 @@ func PriceKey(pid, model string) (string, bool) {
 // reset` over a price still in the file would have the user believe it gone.
 func DropModelPrice(key string) (bool, error) {
 	key = strings.TrimPrefix(strings.TrimSpace(key), "magpie/")
-	if strings.HasPrefix(key, GroupPrefix) {
+	if IsGroupRef(key) {
 		return false, errors.New("that is a routing group, not a provider's model")
 	}
 	pid, model, ok := strings.Cut(key, "/")
@@ -238,7 +239,17 @@ var Levels = []string{"none", "minimal", "low", "medium", "high", "xhigh", "max"
 // levels aren't known, any of Levels, which it is given; none takes them
 // away.
 func SetModelEfforts(ref string, efforts []string) error {
-	return touchedIf(setModelEfforts(ref, efforts))
+	_, err := ChangeModelEfforts(ref, efforts)
+	return err
+}
+
+// ChangeModelEfforts is SetModelEfforts, saying whether anything changed:
+// levels already kept, or every level a model offers already, change
+// nothing, which the caller says rather than a tick over nothing saved
+// (@czhhcz on X).
+func ChangeModelEfforts(ref string, efforts []string) (bool, error) {
+	changed, err := setModelEfforts(ref, efforts)
+	return changed, touchedIf(changed, err)
 }
 
 func setModelEfforts(ref string, efforts []string) (bool, error) {
@@ -246,30 +257,17 @@ func setModelEfforts(ref string, efforts []string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	all := p.Known(model)
-	var keep []string
-	for _, e := range efforts {
-		e = strings.ToLower(strings.TrimSpace(e))
-		if e == "" {
-			continue
-		}
-		if len(all) == 0 && !slices.Contains(Levels, e) {
-			return false, fmt.Errorf("%q is not a reasoning level (they are %s)", e, strings.Join(Levels, ", "))
-		}
-		if len(all) > 0 && !slices.Contains(all, e) {
-			return false, fmt.Errorf("%s/%s has no reasoning level %q (it has %s)", p.ID, model, e, strings.Join(all, ", "))
-		}
-		if !slices.Contains(keep, e) {
-			keep = append(keep, e)
-		}
-	}
-	keep = effortsKept(all, keep) // in the vendor's order
-	if len(keep) == len(all) {
-		keep = nil
+	keep, err := keptEfforts(p, model, efforts)
+	if err != nil {
+		return false, err
 	}
 	s := settings.Load()
 	key := p.ID + "/" + model
-	if slices.Equal(s.ModelEfforts[key], keep) {
+	// levels given, or all of them again, take back a word that it takes
+	// no reasoning ask (SetModelReasonless)
+	reasonless := s.ModelReasonless[key]
+	delete(s.ModelReasonless, key)
+	if slices.Equal(s.ModelEfforts[key], keep) && !reasonless {
 		return false, nil
 	}
 	if len(keep) == 0 {
@@ -286,13 +284,86 @@ func setModelEfforts(ref string, efforts []string) (bool, error) {
 	return true, nil
 }
 
+// keptEfforts is the levels a user keeps of p's model as ModelEfforts
+// holds them: those given, checked against the model's own (or Levels, for
+// a model with none known), in the vendor's order, and none when they are
+// all of them.
+func keptEfforts(p *Provider, model string, efforts []string) ([]string, error) {
+	all := p.Known(model)
+	var keep []string
+	for _, e := range efforts {
+		e = strings.ToLower(strings.TrimSpace(e))
+		if e == "" {
+			continue
+		}
+		if len(all) == 0 && !slices.Contains(Levels, e) {
+			return nil, fmt.Errorf("%q is not a reasoning level (they are %s)", e, strings.Join(Levels, ", "))
+		}
+		if len(all) > 0 && !slices.Contains(all, e) {
+			return nil, fmt.Errorf("%s/%s has no reasoning level %q (it has %s)", p.ID, model, e, strings.Join(all, ", "))
+		}
+		if !slices.Contains(keep, e) {
+			keep = append(keep, e)
+		}
+	}
+	keep = effortsKept(all, keep) // in the vendor's order
+	if len(keep) == len(all) {
+		keep = nil
+	}
+	return keep, nil
+}
+
+// SetModelReasonless says whether a provider's model, spelt
+// "provider/model", takes no reasoning ask, whatever its list says: on,
+// it offers no levels (Efforts, the agents' lists, a group's) and the
+// gateway sends it no reasoning field on any API — Chat's
+// reasoning_effort, Responses' reasoning, Anthropic's thinking and
+// output_config effort — as it does a model known not to think
+// (yuexian7 on Discord: models.dev lists a model with reasoning, and the
+// vendor answers reasoning_effort with 422 while the request without it
+// works). Off gives it the levels it had again.
+func SetModelReasonless(ref string, on bool) error {
+	return touchedIf(setModelReasonless(ref, on))
+}
+
+func setModelReasonless(ref string, on bool) (bool, error) {
+	p, model, err := splitRef(ref)
+	if err != nil {
+		return false, err
+	}
+	s := settings.Load()
+	key := p.ID + "/" + model
+	if s.ModelReasonless[key] == on {
+		return false, nil
+	}
+	if on {
+		if s.ModelReasonless == nil {
+			s.ModelReasonless = map[string]bool{}
+		}
+		s.ModelReasonless[key] = true
+		delete(s.ModelEfforts, key) // none kept of none offered
+	} else {
+		delete(s.ModelReasonless, key)
+	}
+	if err := settings.Save(s); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// Reasonless reports whether the user said pid's model takes no reasoning
+// ask (SetModelReasonless).
+func Reasonless(pid, model string) bool {
+	return heldSettings().ModelReasonless[pid+"/"+model]
+}
+
 // ModelEfforts are the reasoning levels the user kept of the provider's
 // models, by model id.
 func (p Provider) ModelEfforts() map[string][]string {
 	out := map[string][]string{}
-	for k, es := range settings.Load().ModelEfforts {
+	for k, es := range settings.Shared().ModelEfforts {
 		if m, ok := strings.CutPrefix(k, p.ID+"/"); ok && len(es) > 0 {
-			out[m] = es
+			out[m] = slices.Clone(es) // the shared settings' own
 		}
 	}
 	return out
@@ -358,7 +429,7 @@ func setModelImage(ref string, images *bool) (bool, error) {
 }
 
 // SetModelAPI says which one of a provider's APIs a model is asked on —
-// chat, responses or anthropic — for a relay whose one key serves some of
+// chat, responses, anthropic or gemini — for a relay whose one key serves some of
 // its models on one and others on another (01huadalang on Discord: 有的供应商
 // 一个 api 里有很多模型但是不同协议); "" leaves it to the vendor's list and
 // the URLs the provider has, as before. It must be an API the provider has
@@ -376,9 +447,16 @@ func setModelAPI(ref, api string) (bool, error) {
 		return false, err
 	}
 	proto := Protocol(strings.TrimSpace(api))
-	if proto != "" {
-		if !slices.Contains(Protocols, proto) {
-			return false, fmt.Errorf("a model's API is chat, responses or anthropic, not %q", api)
+	if proto == DecideAPI {
+		if !p.TakesDecideAPI() {
+			return false, fmt.Errorf("%s has no System One URL beside a conversation one to ask %s on: add it under More endpoints first", p.ID, model)
+		}
+		if !p.serves(model) {
+			return false, fmt.Errorf("%s has no model %s (magpie provider %s lists them)", p.ID, model, p.ID)
+		}
+	} else if proto != "" {
+		if !modelAPI(proto) {
+			return false, fmt.Errorf("a model's API is chat, responses, anthropic, gemini or decide (System One), not %q", api)
 		}
 		if p.Base(proto) == "" {
 			return false, fmt.Errorf("%s has no %s URL to ask %s on: add it under More endpoints first", p.ID, proto, model)
@@ -408,33 +486,138 @@ func setModelAPI(ref, api string) (bool, error) {
 
 // ModelAPI is the API the user said p's model is asked on, when p has a
 // URL for it still.
+//
+// The Providers page asks it of each model of every provider's list, and
+// most have no API set: that is looked up first, and the protocols p
+// speaks are counted, not listed (a list made for each model was 12 MB of
+// what forty polls allocated with real accounts).
 func (p Provider) ModelAPI(model string) (Protocol, bool) {
-	if len(p.Speaks()) < 2 {
+	proto, ok := p.apiSet(model)
+	if !ok {
 		return "", false
 	}
+	if proto == DecideAPI {
+		return proto, p.TakesDecideAPI()
+	}
+	n := 0
+	for range p.speaking {
+		if n++; n == 2 {
+			break
+		}
+	}
+	return p.modelAPIAmong(n, proto)
+}
+
+// DecideAPI is the API a model is set to be asked on (SetModelAPI) when it
+// is a decision model at its provider's System One URL (axelburks on
+// Discord: a relay that serves its chat models and its own decision model
+// under one key, the decision model named as the relay names it). Such a
+// model is a decision model (DecidesModel): a routing group can ask it as
+// a turn begins, and it is refused for a conversation, as Jev is.
+const DecideAPI Protocol = "decide"
+
+// TakesDecideAPI reports whether p's models can be set to be asked on its
+// System One URL: a key's provider with one beside a conversation URL. A
+// provider with a System One URL alone asks every model there already; a
+// signed-in account, a plugin and a remote magpie say which of theirs
+// decide themselves.
+func (p Provider) TakesDecideAPI() bool {
+	return p.Decides() && !p.DecideOnly() && p.DecideAPIKind()
+}
+
+// DecideAPIKind reports whether p is a provider whose models could be set
+// to be asked on System One once it has a URL for it there.
+func (p Provider) DecideAPIKind() bool {
+	return p.Account == nil && !p.IsRemoteMagpie() && !p.IsVertex()
+}
+
+// decideSet reports whether the user set p's model to be asked on System
+// One, and p takes it.
+func (p Provider) decideSet(model string) bool {
+	proto, ok := p.apiSet(model)
+	return ok && proto == DecideAPI && p.TakesDecideAPI()
+}
+
+// decideSetModels are p's models the user set to be asked on System One,
+// in id order.
+func (p Provider) decideSetModels() []catalog.Model {
+	if !p.TakesDecideAPI() {
+		return nil
+	}
+	var out []catalog.Model
+	for k, v := range heldSettings().ModelAPIs {
+		if m, ok := strings.CutPrefix(k, p.ID+"/"); ok && Protocol(v) == DecideAPI {
+			out = append(out, catalog.Model{ID: m})
+		}
+	}
+	slices.SortFunc(out, func(a, b catalog.Model) int { return strings.Compare(a.ID, b.ID) })
+	return out
+}
+
+// apiSet is the API the user set model to be asked on, false with
+// none.
+func (p Provider) apiSet(model string) (Protocol, bool) {
 	proto := Protocol(heldSettings().ModelAPIs[p.ID+"/"+model])
-	if proto == "" || !slices.Contains(Protocols, proto) || p.Base(proto) == "" {
+	return proto, proto != ""
+}
+
+// modelAPIAmong is ModelAPI with the number of protocols p speaks (up to
+// two) and the one set found already.
+func (p Provider) modelAPIAmong(speaks int, proto Protocol) (Protocol, bool) {
+	// Vertex AI's model id says its one API (ListedAPIs)
+	if speaks < 2 || p.IsVertex() {
+		return "", false
+	}
+	if !modelAPI(proto) || p.Base(proto) == "" {
 		return "", false
 	}
 	return proto, true
 }
 
-// ModelPref is what the provider editor's Names & levels changed of one
+// modelAPI is whether proto is one a model can be set to be asked on: the
+// three magpie translates between, and a Gemini URL's generateContent
+// (Kayphoon on Discord: a custom provider's Gemini format, which a model's
+// own choice didn't offer)
+func modelAPI(proto Protocol) bool {
+	return slices.Contains(Protocols, proto) || proto == Gemini
+}
+
+// ModelPref is what the provider editor's Model settings changed of one
 // model, sent with its Save: each part left nil is as it was. Name "" gives
 // the model its own name back, Efforts [] all its levels, OwnImages the
 // vendor's answer for whether it sees images, API "" every API the
 // provider has for it, Same "" its own id to merge it with other
-// vendors' by (see setModelSame), and OwnPrice its list price again in
-// place of Price, what the user said it costs (SetModelPrice, #819).
+// vendors' by (see setModelSame), OwnPrice its list price again in
+// place of Price, what the user said it costs (SetModelPrice, #819), and
+// Kind "" what its vendor's list says it makes (SetModelKind, #1399).
 type ModelPref struct {
-	Name      *string        `json:"name,omitempty"`
-	Efforts   *[]string      `json:"efforts,omitempty"`
-	Images    *bool          `json:"images,omitempty"`
-	OwnImages bool           `json:"ownImages,omitempty"`
-	API       *string        `json:"api,omitempty"`
-	Same      *string        `json:"same,omitempty"`
-	Price     *catalog.Price `json:"price,omitempty"`
-	OwnPrice  bool           `json:"ownPrice,omitempty"`
+	Name    *string   `json:"name,omitempty"`
+	Efforts *[]string `json:"efforts,omitempty"`
+	// Reasonless, set, is SetModelReasonless's word: true for no
+	// reasoning ask, false to take that back
+	Reasonless *bool          `json:"reasonless,omitempty"`
+	Images     *bool          `json:"images,omitempty"`
+	OwnImages  bool           `json:"ownImages,omitempty"`
+	API        *string        `json:"api,omitempty"`
+	Same       *string        `json:"same,omitempty"`
+	Price      *catalog.Price `json:"price,omitempty"`
+	OwnPrice   bool           `json:"ownPrice,omitempty"`
+	// Kind is what the model makes, as SetModelKind takes it: "image",
+	// "video", or "" for what its vendor's list and name say (#1399)
+	Kind *string `json:"kind,omitempty"`
+	// ID is the id the model is listed by at its provider, as SetModelID
+	// takes it: "" for the provider's own. It is applied after every
+	// other change of the save, so those go with the model to its id.
+	ID *string `json:"id,omitempty"`
+	// Headers are the model's own request headers, as SetModelHeaders
+	// takes them, in place of those it had: none takes them away
+	Headers *map[string]string `json:"headers,omitempty"`
+	// System is the model's own system prompt, as SetModelSystemPrompt
+	// takes it, in place of the one it had: "" takes it away
+	System *string `json:"system,omitempty"`
+	// Tier is the model's own speed, as SetModelTier: "" usual, "priority"
+	// or "ultrafast".
+	Tier *string `json:"tier,omitempty"`
 }
 
 // SetModelPrefs makes the changes to a provider's models, by model id, as
@@ -461,6 +644,11 @@ func SetModelPrefs(pid string, prefs map[string]ModelPref) error {
 					return err
 				}
 			}
+			if m.Reasonless != nil {
+				if err := set(setModelReasonless(ref, *m.Reasonless)); err != nil {
+					return err
+				}
+			}
 			if m.Images != nil || m.OwnImages {
 				images := m.Images
 				if m.OwnImages {
@@ -480,6 +668,32 @@ func SetModelPrefs(pid string, prefs map[string]ModelPref) error {
 					return err
 				}
 			}
+			// nor are a model's headers, which go on its requests alone
+			if m.Headers != nil {
+				if _, err := setModelHeaders(ref, *m.Headers); err != nil {
+					return err
+				}
+			}
+			// nor is its own system prompt, which the gateway adds to
+			// its requests
+			if m.System != nil {
+				if _, err := setModelSystemPrompt(ref, *m.System); err != nil {
+					return err
+				}
+			}
+			// nor is its speed, which the gateway reads for each request
+			if m.Tier != nil {
+				if _, err := setModelTier(ref, *m.Tier); err != nil {
+					return err
+				}
+			}
+			// nor is what a model makes: its chat list stays as it was,
+			// and the gateway reads it for each request (#1399)
+			if m.Kind != nil {
+				if _, err := setModelKind(ref, *m.Kind); err != nil {
+					return err
+				}
+			}
 			// a price isn't what an agent picks a model by: the agents
 			// aren't told of it
 			if m.Price != nil || m.OwnPrice {
@@ -492,15 +706,51 @@ func SetModelPrefs(pid string, prefs map[string]ModelPref) error {
 				}
 			}
 		}
-		return nil
+		return setModelIDs(pid, prefs, set)
 	}()
 	return touchedIf(changed, err)
+}
+
+// setModelIDs gives the models of one save the ids it lists them by
+// (ModelPref.ID), after everything else it changed. Two of them given one
+// id are refused before either is: one id is one model of a provider.
+func setModelIDs(pid string, prefs map[string]ModelPref, set func(bool, error) error) error {
+	to := map[string]string{}
+	for _, model := range slices.Sorted(maps.Keys(prefs)) {
+		id := prefs[model].ID
+		if id == nil {
+			continue
+		}
+		want := strings.TrimSpace(*id)
+		if want == "" {
+			continue
+		}
+		if other, ok := to[want]; ok {
+			return fmt.Errorf("%s and %s can't both be listed as %s: one id is one model of a provider", other, model, want)
+		}
+		to[want] = model
+	}
+	for want, model := range to {
+		if other := prefs[want].ID; other != nil && want != model && strings.TrimSpace(*other) != want {
+			return fmt.Errorf("%s is listed as another id in the same save that gives its id to %s: save one, then the other", want, model)
+		}
+	}
+	for _, model := range slices.Sorted(maps.Keys(prefs)) {
+		if id := prefs[model].ID; id != nil {
+			if _, c, err := setModelID(pid+"/"+model, *id); set(c, err) != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // setModelSame says which model a provider's model, spelt "provider/model",
 // is the same as, for one a vendor names its own way (Volcengine Ark's
 // dated ids, kyzhouxu on #583): the routing groups magpie finds merge it
-// with that model from every other provider (autoGroups). The name is a
+// with that model from every other provider (autoGroups), and a call to
+// it no list prices is costed at that model's maker's price (SamePriceIn,
+// #2344). The name is a
 // model's id as any vendor spells it ("deepseek-v4.1-flash", or with a
 // vendor's prefix); "" — or a name that is the model's own however spelt —
 // merges it by its own id again.
@@ -543,7 +793,7 @@ func setModelSame(ref, same string) (bool, error) {
 
 // ImageOverride is the user's answer for whether pid's model takes images.
 func ImageOverride(pid, model string) (bool, bool) {
-	return ImageOverrideIn(settings.Load(), pid, model)
+	return ImageOverrideIn(settings.Shared(), pid, model)
 }
 
 // ImageOverrideIn is ImageOverride from settings s already read: a list of
@@ -589,9 +839,10 @@ func renameModelPrefs(s *settings.Settings, from, to string) bool {
 	// the models a user has hidden from a picker are keyed by provider as
 	// well, and are not one of the per-model preference maps: they say
 	// which models are shown, not what a model is called or costs
-	// (and so is the order they are listed in, and the ones sent fast)
+	// (and so is the order they are listed in, the ones picked for an agent
+	// shown only its picks, and the ones sent fast or Ultrafast)
 	hidden := false
-	for _, m := range []map[string][]string{s.HiddenModels, s.OrderedModels, s.FastPicks} {
+	for _, m := range []map[string][]string{s.HiddenModels, s.PickedModels, s.OrderedModels, s.FastPicks, s.UltraPicks} {
 		for _, ids := range m {
 			for i, id := range ids {
 				if rest, ok := strings.CutPrefix(id, from+"/"); ok {
@@ -607,46 +858,139 @@ func renameModelPrefs(s *settings.Settings, from, to string) bool {
 // when they gave one, else the vendor's) with its provider's after it, or
 // "routing group" for a group's — dropped only when a name of the user's
 // own already carries the provider's, so it isn't said twice.
+//
+// A Remote magpie's model, with its upstream names on (UpstreamProviders), is
+// named by its name there alone and the provider serving it there after
+// this one's: "Claude Sonnet 5 · Office › RelayA" (lcc580 on X).
 func (e Entry) Label() string {
-	by := e.Provider.Name
+	by, name := e.Provider.Name, e.Name
 	if e.Group != "" {
 		by = "routing group"
+	} else if up := e.upstream(); up != "" {
+		by = e.Provider.Name + " › " + up
+		if e.Default == "" {
+			name = e.PlainName()
+		}
 	}
-	if e.Default != "" && strings.Contains(strings.ToLower(e.Name), strings.ToLower(by)) {
-		return e.Name
+	if e.Default != "" && strings.Contains(strings.ToLower(name), strings.ToLower(by)) {
+		return name
 	}
-	return e.Name + " · " + by
+	return name + " · " + by
+}
+
+// upstream is the provider a Remote magpie's model is served by there,
+// when its upstream names are on and that magpie's list said which; ""
+// otherwise (a magpie from before magpie_by says none).
+func (e Entry) upstream() string {
+	if e.Group != "" || !e.Provider.UpstreamProviders || !e.Provider.IsRemoteMagpie() {
+		return ""
+	}
+	return e.By
+}
+
+// ServedBy is the provider this magpie's list tells another magpie serves
+// the entry (magpie_by): its own provider, or, for a model it has from a
+// magpie further on, the one there, the first in the chain; "routing
+// group" for a group's.
+func (e Entry) ServedBy() string {
+	switch {
+	case e.Group != "":
+		return "routing group"
+	case e.Provider.IsRemoteMagpie() && e.By != "":
+		return e.By
+	}
+	return e.Provider.Name
 }
 
 // Labels are how an agent's list names each of es, in order: as Label, or,
 // when the user wants names plain (settings' PlainNames, #335), by the
-// name alone — but for two or more the list would call the same, as a
-// routing group found for a model is called with that model left in the
-// list, which keep their provider's after it to tell them apart. With
+// name alone — but for two or more models the list would call the same,
+// which keep their provider's after it to tell them apart, and a routing
+// group named as anything else in the list (the group found for a model,
+// with that model left in it), which keeps "· routing group" while the
+// model it is named as stays plain. With
 // their own names plain (PlainOwnNames, #92), a name the user gave — a
 // model's, or a routing group's they made (#868: "· routing group" was
 // what an agent's narrow menu cut off) — is that name just as they wrote
 // it, but for two the list would call the same, and the rest keep Label's.
-func Labels(es []Entry) []string {
+func Labels(es []Entry) []string { return LabelsFor("", es) }
+
+// LabelsFor is Labels as the agent of that id's lists name es: by its own
+// Provider in model names (settings.AgentSuffix, KillTry27355 on X: one
+// agent's narrow menu wants names plain while another's wants the
+// provider), else by the one for every agent. "" is every agent's.
+func LabelsFor(agent string, es []Entry) []string {
 	out := make([]string, len(es))
-	s := heldSettings()
-	plain := s.PlainNames
-	own := !plain && s.PlainOwnNames
-	same := map[string]int{}
+	mode := suffixModeOf(heldSettings(), agent)
+	plain := mode == SuffixOff
+	own := mode == SuffixOwn
+	// models and groups by name: a group is told apart by its "· routing
+	// group", so a model it shares a name with stays plain (nb5p on
+	// Discord: one relay's GPT-6.1 Terra kept "· MyGateway" beside the
+	// group found for it while its GPT-6.1 Sol had none)
+	models, groups := map[string]int{}, map[string]int{}
 	if plain || own {
 		for _, e := range es {
-			same[strings.ToLower(e.Name)]++
+			if e.Group == "" {
+				models[strings.ToLower(e.PlainName())]++
+			} else {
+				groups[strings.ToLower(e.PlainName())]++
+			}
 		}
 	}
 	for i, e := range es {
 		out[i] = e.Label()
 		mine := own && (e.Default != "" || e.Named)
-		if (plain || mine) && e.Name != "" && same[strings.ToLower(e.Name)] == 1 {
-			out[i] = e.Name
+		name := e.PlainName()
+		if !(plain || mine) || name == "" {
+			continue
+		}
+		// a Remote magpie's model named by its provider there keeps it
+		// under Off too: the user turned that on for this one (lcc580)
+		if e.upstream() != "" && !mine {
+			continue
+		}
+		k := strings.ToLower(name)
+		if e.Group == "" && models[k] == 1 || e.Group != "" && models[k] == 0 && groups[k] == 1 {
+			out[i] = name
 		}
 	}
 	return out
 }
+
+// AgentNamed is the catalog id of the one model the agent of that id's
+// list names name (LabelsFor), for an agent that asks for a model by the
+// name its list shows: WorkBuddy shows a model's id after its name
+// ("GLM-5.3:workbuddy/glm-5.3", elis_pina on X), so with the provider left
+// out of the names it is given the name as the id too. false when no model
+// shown, or more than one, is named so.
+func AgentNamed(agent, name string) (string, bool) {
+	if name == "" {
+		return "", false
+	}
+	shown := catalogKept(agent).shown
+	id, n := "", 0
+	for i, l := range LabelsFor(agent, shown) {
+		if l == name {
+			id, n = shown[i].ID, n+1
+		}
+	}
+	return id, n == 1
+}
+
+// PlainName is the entry's name alone: a remote magpie's model's without
+// the provider its list put after it by that magpie's own setting, which
+// this one's Provider in model names Off leaves out as well (ARNO on
+// Discord: "· Relay A" and "· routing group" stayed under Off).
+func (e Entry) PlainName() string { return cmp.Or(e.Plain, e.Name) }
+
+// Thinks is whether the model thinks, as /v1/models says it and every
+// agent's list is told it: a model with levels, or one marked Reasoning
+// with a thinking switch alone. An export that read the levels alone
+// marked Trae CN's kimi-k3-max, which always thinks and has no levels
+// magpie knows, not reasoning for Pi, and `magpie pi effort high` was
+// clamped to off (#2380).
+func (e Entry) Thinks() bool { return e.Reasoning || len(e.Efforts) > 0 }
 
 // The ways the agents' lists name models (SuffixMode): every name with its
 // provider's after it, as by default; all but the names the user gave
@@ -659,8 +1003,33 @@ const (
 
 // SuffixMode is how the agents' lists name models: SuffixOn, SuffixOwn or
 // SuffixOff.
-func SuffixMode() string {
-	s := settings.Load()
+func SuffixMode() string { return suffixModeOf(settings.Load(), "") }
+
+// SuffixModeFor is how the lists of the agent of that id name models: its
+// own mode (AgentSuffix), else SuffixMode.
+func SuffixModeFor(agent string) string { return suffixModeOf(settings.Load(), agent) }
+
+// AgentSuffix is the agent's own mode, "" when it follows every agent's.
+func AgentSuffix(agent string) string {
+	return settings.Shared().AgentSuffix[suffixKey(agent)]
+}
+
+// suffixKey is the id an agent's own mode is kept by: a WSL copy and a
+// named profile (omp#work) keep their lists by the agent's, as
+// Agent.ListsFor does
+func suffixKey(agent string) string {
+	id, _, _ := strings.Cut(strings.ToLower(strings.TrimSpace(agent)), "@wsl:")
+	id, _, _ = strings.Cut(id, "#")
+	return id
+}
+
+func suffixModeOf(s settings.Settings, agent string) string {
+	if agent != "" {
+		switch m := s.AgentSuffix[suffixKey(agent)]; m {
+		case SuffixOn, SuffixOwn, SuffixOff:
+			return m
+		}
+	}
 	switch {
 	case s.PlainNames:
 		return SuffixOff
@@ -668,6 +1037,40 @@ func SuffixMode() string {
 		return SuffixOwn
 	}
 	return SuffixOn
+}
+
+// SetAgentSuffix gives the agent of that id a Provider in model names of
+// its own, mode (SuffixOn, SuffixOwn or SuffixOff), over the one for every
+// agent; "" takes it away, and the agent follows that one again. The
+// agents are told when it changes.
+func SetAgentSuffix(agent, mode string) error {
+	agent = suffixKey(agent)
+	if agent == "" {
+		return errors.New("no agent")
+	}
+	switch mode {
+	case "", SuffixOn, SuffixOwn, SuffixOff:
+	default:
+		return fmt.Errorf("provider in model names: on, own, off or \"\" for every agent's, not %q", mode)
+	}
+	s := settings.Load()
+	if s.AgentSuffix[agent] == mode {
+		return nil
+	}
+	s.AgentSuffix = maps.Clone(s.AgentSuffix)
+	if mode == "" {
+		delete(s.AgentSuffix, agent)
+	} else {
+		if s.AgentSuffix == nil {
+			s.AgentSuffix = map[string]string{}
+		}
+		s.AgentSuffix[agent] = mode
+	}
+	if err := settings.Save(s); err != nil {
+		return err
+	}
+	catalog.Touched()
+	return nil
 }
 
 // SetSuffixMode has the agents' model lists name models as mode says (see
@@ -726,6 +1129,25 @@ func SetCodexAutoReview(id string) error {
 	return nil
 }
 
+// SetCodexAsyncCompact sets Codex's background compaction
+// (settings.CodexAsyncCompact) and the share of a model's window it starts
+// at, 1–100 or 0 for Codex's own, and has Codex's config written again.
+func SetCodexAsyncCompact(on bool, percent int) error {
+	if percent < 0 || percent > 100 {
+		return fmt.Errorf("Codex compacts in the background past 1 to 100%% of a model's window, not %d%%", percent)
+	}
+	s := settings.Load()
+	if s.CodexAsyncCompact == on && s.CodexAsyncCompactPercent == percent {
+		return nil
+	}
+	s.CodexAsyncCompact, s.CodexAsyncCompactPercent = on, percent
+	if err := settings.Save(s); err != nil {
+		return err
+	}
+	catalog.Touched()
+	return nil
+}
+
 // SetFullContext turns settings.FullContext on or off: Codex and Claude
 // Code are told a model's whole window, or the working one, again.
 func SetFullContext(on bool) error {
@@ -753,7 +1175,7 @@ func SetPlainNames(on bool) error {
 // ModelNames are the names the user gave the provider's models, by model id.
 func (p Provider) ModelNames() map[string]string {
 	out := map[string]string{}
-	for k, n := range settings.Load().ModelNames {
+	for k, n := range settings.Shared().ModelNames {
 		if m, ok := strings.CutPrefix(k, p.ID+"/"); ok && n != "" {
 			out[m] = n
 		}
@@ -798,8 +1220,13 @@ func ServesModel(p Provider, model string) bool { return p.serves(model) }
 // vendor's name, and what a reply says answered is compared with it, so a
 // model asked for by the name the vendor serves it under is not read as
 // another one.
+//
+// A relay's effort family offered as one model (effort_variants.go) is
+// asked for by the id of its default effort, as a request with no effort
+// is (Provider.SentIDAt): the Test button and the key check try the id the
+// relay lists.
 func UpstreamName(p Provider, model string) string {
-	return UpstreamNameIn(settings.Load().ModelWires, p.ID, model)
+	return UpstreamNameAsIn(settings.Load().Wires(), p.ID, model, p.SentIDAt(model, ""))
 }
 
 // UpstreamNameIn is UpstreamName over a settings' ModelWires already read,
@@ -829,7 +1256,7 @@ func UpstreamNameIn(wires map[string]string, pid, model string) string {
 // asks for gemini-3.7-flash-high and gemini-3.7-flash-low each by its own,
 // rather than for the one id whatever level the effort picked.
 func UpstreamNameAs(p Provider, model, sent string) string {
-	return UpstreamNameAsIn(settings.Load().ModelWires, p.ID, model, sent)
+	return UpstreamNameAsIn(settings.Load().Wires(), p.ID, model, sent)
 }
 
 // UpstreamNameAsIn is UpstreamNameAs over a settings' ModelWires already
@@ -888,6 +1315,19 @@ func SentNameIn(wires map[string]string, pid, model, effort string) string {
 // the route, which is holding the provider, asks about the account and lets
 // the gateway's dispatch (codeAssistID, on the same agent) be the one rule.
 func SentNameOnIn(wires map[string]string, pid, account, model, effort string) string {
+	if account == "antigravity" {
+		// a family the user lists by an id of theirs (SetModelID) goes
+		// out as the variant of its own id the effort picks, as the
+		// gateway's envelope does (codeAssistBody)
+		if own := modelIDsOf(pid).ownOf(model); own != model {
+			return UpstreamNameAsIn(wires, pid, own, antigravitySentID(account, own, effort))
+		}
+	}
+	if account != "antigravity" {
+		// a relay's effort family goes out as the id of the effort sent
+		// (effort_variants.go), as the gateway asked for it
+		return UpstreamNameAsIn(wires, pid, model, SentIDOf(pid, model, effort))
+	}
 	return UpstreamNameAsIn(wires, pid, model, antigravitySentID(account, model, effort))
 }
 
@@ -1054,7 +1494,7 @@ func SetUpstreamName(ref, name string) error {
 // now.
 func DropUpstreamName(key string) (bool, error) {
 	key = strings.TrimPrefix(strings.TrimSpace(key), "magpie/")
-	if strings.HasPrefix(key, GroupPrefix) {
+	if IsGroupRef(key) {
 		return false, errors.New("that is a routing group, not a provider's model")
 	}
 	pid, model, ok := strings.Cut(key, "/")
@@ -1087,7 +1527,7 @@ func DropUpstreamName(key string) (bool, error) {
 // already (splitModelRef), so nothing depends on it yet.
 func HasUpstreamName(key string) bool {
 	key = strings.TrimPrefix(strings.TrimSpace(key), "magpie/")
-	_, ok := settings.Load().ModelWires[key]
+	_, ok := settings.Shared().ModelWires[key]
 	return ok
 }
 
@@ -1119,7 +1559,7 @@ func wireKey(wires map[string]string, pid, model string) string {
 	return key
 }
 
-// UpstreamNames are the names the user gave the provider's models, by model
+// UpstreamProviders are the names the user gave the provider's models, by model
 // id, with the one given for all of them under "*" — each as it will be sent,
 // trimmed, "*" and all, which is what a list of them shows. A name that is
 // only whitespace is none, and is not listed.
@@ -1153,13 +1593,8 @@ func (p Provider) asksOwnBackend() bool {
 		return false
 	}
 	switch p.Account.Agent {
-	case "claude", "cursor", "devin", "kiro", "zed", CommandCodePlanID:
+	case "claude":
 		return true
 	}
-	// Qoder is one backend however many sites it is signed in to, and the
-	// gateway's dispatch covers the whole family rather than the site the
-	// account was made on, so the family is asked of rather than one id of
-	// it: a name refused for the one subscription has to be refused for
-	// the other too, which is as much magpie's own there.
-	return slices.Contains(qoderAgents, p.Account.Agent)
+	return false
 }

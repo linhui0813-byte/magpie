@@ -107,55 +107,155 @@ func TestSettingsSaveKeepsWhatItDoesNotSend(t *testing.T) {
 	}
 	one, two := 1.0, 2.0
 	was := settings.Settings{
-		AgentOrder:          []string{"codex"},
-		AgentsHidden:        []string{"goose"},
-		AgentsShown:         []string{"pi"},
-		Visible:             map[string][]string{"claude": {"anthropic"}},
-		HiddenModels:        map[string][]string{"claude": {"p/m"}, "codex": {"p/n", "group/g"}},
-		OrderedModels:       map[string][]string{"codex": {"group/g", "p/n"}},
-		FastPicks:           map[string][]string{"codex": {"p/n"}},
-		AgentEfforts:        map[string]string{"cursor-local": "high"},
-		PluginCheckins:      map[string]bool{"fakeco": true},
-		ModelNames:          map[string]string{"p/m": "Mine"},
-		ModelEfforts:        map[string][]string{"p/m": {"low"}},
-		ModelImages:         map[string]bool{"p/m": true},
-		ModelOutputs:        map[string]int{"p/m": 131072},
-		ModelCompacts:       map[string]int{"p/*": 500000},
-		CompactAt:           400000,
-		ModelPrices:         map[string]settings.ModelPrice{"p/m": {Input: &one, Output: &two}},
-		ModelWires:          map[string]string{"p/m": "vendor-c/m"},
-		ModelAPIs:           map[string]string{"p/m": "anthropic"},
-		ModelSameAs:         map[string]string{"p/m": "deepseek-v4.1-flash"},
-		RedactRules:         []redact.Rule{{Kind: "prefix", Prefix: "oc_sk_"}},
-		LAN:                 true,
-		LANKey:              "sk-lan",
-		LANKeyID:            "lan-key-id",
-		Port:                3591,
-		CORSOrigins:         []string{"http://localhost:3000"},
-		GitHubToken:         "ghp_kept",
-		RequestArchive:      true,
-		RequestArchiveMaxMB: 64,
-		QuotaLeft:           true,
-		UsageOrder:          []string{"kimi", "codex"},
-		PanelUsageHidden:    []string{"deepseek"},
-		PlainNames:          true,
-		PlainOwnNames:       true,
-		CodexAgentsV1:       true,
-		CodexTitles:         "off",
-		CodexAutoReview:     "fake/m1",
-		ChinaMirror:         true,
-		CodexAutoReset:      []string{"me@example.com"},
-		CodexNoCredits:      []string{"me@example.com"},
-		CodexWarmAtOf:       map[string]string{"me@example.com": "09:00"},
-		TextSize:            125,
-		UpdateSkip:          "0.1.500",
-		UpdateMirror:        "https://mirror.example/",
-		Window:              []int{900, 700},
-		WindowMaximised:     true,
-		FullContext:         true,
-		GatewayMode:         "off",
+		AgentOrder:           []string{"codex"},
+		AgentsHidden:         []string{"goose"},
+		AgentsShown:          []string{"pi"},
+		AgentsHere:           []string{"codex"},
+		Visible:              map[string][]string{"claude": {"anthropic"}},
+		HiddenModels:         map[string][]string{"claude": {"p/m"}, "codex": {"p/n", "group/g"}},
+		DisabledModels:       []string{"*fable*", "p/m"},
+		PickedModels:         map[string][]string{"opencode": {"p/m"}},
+		OwnModelsHidden:      []string{"dsh"},
+		OrderedModels:        map[string][]string{"codex": {"group/g", "p/n"}},
+		FastPicks:            map[string][]string{"codex": {"p/n"}},
+		UltraPicks:           map[string][]string{"codex": {"p/n"}},
+		AgentEfforts:         map[string]string{"cursor-local": "high"},
+		PluginCheckins:       map[string]bool{"fakeco": true},
+		PluginOptions:        map[string]map[string]bool{"fakeco": {"auto": true}},
+		CheckinOff:           []string{"workbuddy|u1"},
+		ModelNames:           map[string]string{"p/m": "Mine"},
+		ModelEfforts:         map[string][]string{"p/m": {"low"}},
+		ModelReasonless:      map[string]bool{"p/n": true},
+		ModelImages:          map[string]bool{"p/m": true},
+		ModelOutputs:         map[string]int{"p/m": 131072},
+		ModelCompacts:        map[string]int{"p/*": 500000},
+		CompactAt:            400000,
+		AgentCompacts:        map[string]settings.AgentCompact{"claude": {At: 600000}},
+		AgentContexts:        map[string]map[string]int{"dsh": {"p/m": 400000}},
+		ModelPrices:          map[string]settings.ModelPrice{"p/m": {Input: &one, Output: &two}},
+		ModelWires:           map[string]string{"p/m": "vendor-c/m"},
+		ModelAPIs:            map[string]string{"p/m": "anthropic"},
+		ModelSameAs:          map[string]string{"p/m": "deepseek-v4.1-flash"},
+		ModelIDs:             map[string]string{"p/flash": "deepseek-v4.1-flash-1017"},
+		UsageAliases:         map[string]string{"deepseek-v4.1-flash": "deepseek-flash"},
+		UsageCleared:         []settings.UsageClear{{Provider: "p", Model: "m", At: 1761600000000}},
+		ModelKinds:           map[string]string{"p/m": "video"},
+		ModelHeaders:         map[string]map[string]string{"p/m": {"X-Endpoint": "ep-1"}},
+		ModelSystemPrompts:   map[string]string{"p/m": "Answer in Chinese."},
+		ModelTiers:           map[string]string{"p/m": "ultrafast"},
+		RedactRules:          []redact.Rule{{Kind: "prefix", Prefix: "oc_sk_"}},
+		RedactActions:        map[string]string{"API_KEY": "block", "EMAIL": "warn"},
+		RedactAllow:          []string{"team@kelvarn.io"},
+		LAN:                  true,
+		LANKey:               "sk-lan",
+		LANKeyID:             "lan-key-id",
+		Port:                 3591,
+		CORSOrigins:          []string{"http://localhost:3000"},
+		AllowIPs:             []string{"203.0.113.7"},
+		FetchPrivate:         []string{"nas.lan"},
+		GitHubToken:          "ghp_kept",
+		RequestArchive:       true,
+		RequestArchiveMaxMB:  64,
+		RequestArchiveMB:     2048,
+		GatewayConversations: true,
+		QuotaLeft:            true,
+		UsageOrder:           []string{"kimi", "codex"},
+		PluginPageOrder:      []string{"plugin-b", "plugin-a"},
+		PanelUsageHidden:     []string{"deepseek"},
+		UsageAgentsHidden:    []string{"curl"},
+		UsageCardsHidden:     []string{"stepfun|balance"},
+		UsageWindowsHidden:   []string{"antigravity|Claude & GPT"},
+		ClientAgents:         map[string]string{"hermes-codex-thread-bridge": "codex"},
+		PlainNames:           true,
+		PlainOwnNames:        true,
+		AgentSuffix:          map[string]string{"pi": "off"},
+		BareModelIDs:         true,
+		CodexAgentsV1:        true,
+		CodexTitles:          "off",
+		CodexDescriptions:    "fake/m1",
+		CodexPredictions:     "off",
+		CodexSuggestions:     "fake/m1",
+		CodexAutoReview:      "fake/m1",
+		CodexSubagentModel:   "codex/gpt-6-astra",
+		CodexServiceTier:     "priority",
+		CodexClient:          "desktop",
+		CodexOpen:            "terminal",
+		DesktopSubagentModel: "fake/m2",
+		DesktopGateway:       "https://192.168.1.20:3425",
+		DshCompactModel:      "fake/m1",
+		CodexCompactModel:    "fake/m1",
+		ChinaMirror:          true,
+		NPMRegistry:          "https://npm.corp.example",
+		CodexAutoReset:       []string{"me@example.com"},
+		CodexAutoResetOnly:   map[string]string{"me@example.com": "expiring"},
+		CodexResetLead:       180,
+		CodexNoCredits:       []string{"me@example.com"},
+		CodexCreditsLast:     []string{"two@example.com"},
+		CodexCreditsFirst:    []string{"three@example.com"},
+		CodexWarmAtOf:        map[string]string{"me@example.com": "09:00"},
+		TextSize:             125,
+		UpdateSkip:           "0.1.500",
+		UpdateMirror:         "https://mirror.example/",
+		Window:               []int{900, 700},
+		WindowMaximised:      true,
+		WindowAt:             []int{-1440, 120},
+		FullContext:          true,
+		DesktopLongest:       true,
+		DesktopIsolated:      true,
+		GuideHidden:          true,
+		GatewayMode:          "off",
+		QuotaReads:           "asked",
+		SearchAll:            true,
+		SearchCount:          9,
+		NoAccountDiscovery:   true,
+		AgentTelemetryOff:    true,
+		RedactModel:          true,
+		RedactModelName:      "astrlink-guard",
+		RedactModelScore:     map[string]float64{"astrlink-guard": 0.9},
+		RedactRouteTo:        "fake/m1",
 	}
+	was.RedactModelOff, was.RedactModelAuto = true, true
+	was.DesktopSubagentEffort = "high"
+	was.DesktopIsolatedClaude, was.DesktopIsolatedClaudeChosen = true, true
+	was.ReplyModel = settings.ReplyMember // memberModel, its mirror, is kept with it
+	was.CodexAsyncCompact, was.CodexAsyncCompactPercent = true, 70
+	was.ClaudeRunsMost = 3
+	was.RequestArchiveLocal, was.RequestArchiveLocalMB = true, 256
+	was.ProxyCustom = "http://me:secret@proxy.example:8080"
+	was.PluginProxyCustom = "http://me:secret@plugins.example:8080"
+	was.UpdateProxyCustom = "http://me:secret@updates.example:8080"
+	was.PanelShortcut = "Ctrl+Alt+K"
+	was.Proxies = []settings.NamedProxy{{ID: "p1", Name: "Office", URL: "http://proxy.example:8080"}} // their own routes, /api/proxies/*
+	was.ProxyNames = map[string]string{"p1": "Office"}
+	was.ContextCap = 200000                           // its own route, POST /api/settings/context-cap
+	was.ContextCapAll = true                          // its own route, POST /api/settings/context-cap-mode
+	was.BareModelIDsOnly = true                       // its own route, POST /api/settings/bare-ids
+	was.SearcherThen = []string{"fake/m1", "fake/m2"} // set in its own row
+	was.RouterNote = "Los Angeles"                    // the Library's servers/hub-note
+	was.RouterAllTools = true                         // the Library's servers/hub-tools
+	was.RouterNoCode = true                           // the Library's servers/hub-code
+	was.BusyLoad = 150                                // the Routing page's busy-load
+	was.MTLS = true                                   // Network and sharing's settings/mtls
+	was.Wallpaper = 1700000000000                     // Settings > General's Background image, appearance/wallpaper
+	was.HTTPS = true                                  // Network and sharing's settings/https
+	was.OnTop = true                                  // the title bar's pin, window/ontop
+	was.ImageResolution = "4K"                        // Settings > Images' Resolution row, sent by that row alone
+	was.RedactModelDir = "/Volumes/models"            // Privacy's Advanced › models folder, moved by its own route
+	was.Name = "Tokyo box"                            // Network and sharing's Advanced › Name, sent by its own row alone
+	// Settings > Usage's Bark row has its own route (settings/bark)
+	was.BarkServer, was.BarkKey, was.BarkDaily = "https://bark.example.com", "kept", "21:30"
+	// the Routing groups page's defaults for every group (groups/defaults)
+	was.GroupSink, was.GroupFirstToken, was.GroupPatience = true, 30, 120
 	if err := settings.Save(was); err != nil {
+		t.Fatal(err)
+	}
+	if err := settings.SetGatewayConversations(true); err != nil {
+		t.Fatal(err)
+	}
+	// only SetSessionReads writes the agents whose sessions are read
+	if err := settings.SetSessionReads(func(*settings.SessionReads) *settings.SessionReads {
+		return &settings.SessionReads{Asked: true, Agents: map[string]bool{"claude": true, "codex": false}}
+	}); err != nil {
 		t.Fatal(err)
 	}
 	was = settings.Load()

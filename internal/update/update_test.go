@@ -14,6 +14,21 @@ func TestNewer(t *testing.T) {
 		{"1.0.0", "1.0.0-rc.1", true},
 		{"1.0.0-rc.1", "1.0.0", false},
 		{"1.0.0-rc.2", "1.0.0-rc.1", true},
+		// semver §11: identifiers that are numbers compare as numbers, a
+		// number comes before a word, and a shorter list before a longer one
+		{"1.0.0-beta.10", "1.0.0-beta.9", true},
+		{"1.0.0-beta.9", "1.0.0-beta.10", false},
+		{"1.6.0-10", "1.6.0-9", true},
+		{"1.0.0-alpha.beta", "1.0.0-alpha.1", true},
+		{"1.0.0-alpha.1", "1.0.0-alpha", true},
+		{"1.0.0-alpha", "1.0.0-alpha.1", false},
+		{"1.0.0-rc.1", "1.0.0-beta.11", true},
+		{"2.0.0", "2.0.0-beta.1", true},
+		// build metadata plays no part
+		{"1.0.0+build.2", "1.0.0", false},
+		{"1.0.0", "1.0.0+build.2", false},
+		{"1.0.1+build.1", "1.0.0", true},
+		{"1.0.0-rc.2+b", "1.0.0-rc.1", true},
 		{"0.2.0", "dev", false},
 		{"0.2.0", "0bcb2cc-dirty", false},
 	} {

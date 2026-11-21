@@ -18,11 +18,11 @@ import (
 // GetJSONItem returns the raw JSON of the first element of the file's
 // top-level array that has every member of where.
 func GetJSONItem(path string, where map[string]string) (string, bool) {
-	raw, err := Read(path)
+	raw, err := jsonHeld(path)
 	if err != nil || len(bytes.TrimSpace(raw)) == 0 {
 		return "", false
 	}
-	r, ok := findItem(jsonc.ToJSONInPlace(raw), where)
+	r, ok := findItem(raw, where)
 	if !ok {
 		return "", false
 	}
@@ -41,20 +41,30 @@ func SetJSONItem(path string, where map[string]string, value any) error {
 		v, _ := json.MarshalIndent(value, "\t", "\t")
 		return WriteAtomic(path, []byte("[\n\t"+string(v)+"\n]\n"))
 	}
+	write := func(out []byte) error {
+		out, err := checkJSONC(out, raw)
+		if err != nil {
+			return fmt.Errorf("%s: %w", path, err)
+		}
+		return WriteAtomic(path, out)
+	}
 	stripped := jsonc.ToJSONInPlace(append([]byte(nil), raw...))
+	if !json.Valid(stripped) {
+		return fmt.Errorf("%s: invalid JSON/JSONC", path)
+	}
 	root, open, close := topArray(stripped)
 	if close < 0 {
 		return fmt.Errorf("%s: top level is not a JSON array", path)
 	}
 	if r, ok := findItem(stripped, where); ok {
 		out, _ := splice(raw, r.Index, len(r.Raw), marshalAt(raw, r.Index, value))
-		return WriteAtomic(path, keepCRLF(out, raw))
+		return write(keepCRLF(out, raw))
 	}
 	items := root.Array()
 	if len(items) == 0 {
 		v, _ := json.MarshalIndent(value, "\t", "\t")
 		out, _ := splice(raw, open, close-open+1, []byte("[\n\t"+string(v)+"\n]"))
-		return WriteAtomic(path, keepCRLF(out, raw))
+		return write(keepCRLF(out, raw))
 	}
 	last := items[len(items)-1]
 	at := last.Index + len(last.Raw)
@@ -67,12 +77,12 @@ func SetJSONItem(path string, where map[string]string, value any) error {
 	if bytes.IndexByte(raw, '\n') < 0 {
 		v, _ := json.Marshal(value)
 		out, _ := splice(raw, at, 0, []byte(sep+string(v)))
-		return WriteAtomic(path, out)
+		return write(out)
 	}
 	indent := lineIndent(raw, last.Index)
 	v := marshalAt(raw, last.Index, value)
 	out, _ := splice(raw, at, 0, []byte(sep+"\n"+indent+string(v)))
-	return WriteAtomic(path, keepCRLF(out, raw))
+	return write(keepCRLF(out, raw))
 }
 
 // DelJSONItem removes every element of the file's top-level array that has
@@ -82,9 +92,13 @@ func DelJSONItem(path string, where map[string]string) error {
 	if err != nil || len(bytes.TrimSpace(raw)) == 0 {
 		return err
 	}
+	orig := raw
 	changed := false
 	for {
 		stripped := jsonc.ToJSONInPlace(append([]byte(nil), raw...))
+		if !json.Valid(stripped) {
+			return fmt.Errorf("%s: invalid JSON/JSONC", path)
+		}
 		r, ok := findItem(stripped, where)
 		if !ok {
 			break
@@ -94,7 +108,11 @@ func DelJSONItem(path string, where map[string]string) error {
 	if !changed {
 		return nil
 	}
-	return WriteAtomic(path, raw)
+	out, err := checkJSONC(raw, orig)
+	if err != nil {
+		return fmt.Errorf("%s: %w", path, err)
+	}
+	return WriteAtomic(path, out)
 }
 
 // topArray is stripped's top-level array, with the offsets of its brackets
@@ -180,7 +198,10 @@ func findItem(stripped []byte, where map[string]string) (gjson.Result, bool) {
 func delItem(raw, stripped []byte, r gjson.Result) []byte {
 	a, b := r.Index, r.Index+len(r.Raw)
 	ls := bytes.LastIndexByte(raw[:a], '\n') + 1
-	alone := len(bytes.TrimSpace(stripped[ls:a])) == 0
+	// a comment before the element on its line is not alone: read from raw,
+	// where the comment is still there (stripped has it blanked), as
+	// delJSONBytes does, so the comment stays when the element goes.
+	alone := len(bytes.TrimSpace(raw[ls:a])) == 0
 	j := b
 	for j < len(stripped) && isSpace(stripped[j]) {
 		j++
@@ -191,9 +212,7 @@ func delItem(raw, stripped []byte, r gjson.Result) []byte {
 		to = j + 1
 		if alone {
 			from = ls
-			if to < len(raw) && raw[to] == '\n' {
-				to++
-			}
+			to = pastLineEnd(raw, to)
 		}
 		out, _ := splice(raw, from, to-from, nil)
 		return out
@@ -204,9 +223,7 @@ func delItem(raw, stripped []byte, r gjson.Result) []byte {
 	}
 	if alone {
 		from = ls
-		if to < len(raw) && raw[to] == '\n' {
-			to++
-		}
+		to = pastLineEnd(raw, to)
 	}
 	out, _ := splice(raw, from, to-from, nil)
 	k := a

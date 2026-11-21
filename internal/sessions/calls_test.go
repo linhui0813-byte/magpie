@@ -4,11 +4,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/yetone/magpie/internal/agentenv"
+	"github.com/yetone/magpie/internal/desktopdir"
 )
 
 var callT0 = time.Date(2026, 9, 20, 10, 0, 0, 0, time.UTC)
@@ -16,7 +18,7 @@ var callT0 = time.Date(2026, 9, 20, 10, 0, 0, 0, time.UTC)
 // callDirs are the folders a test's calls are read from.
 type callDirs struct{ claude, codex, desktop string }
 
-func setupCalls(t *testing.T) callDirs {
+func setupCalls(t testing.TB) callDirs {
 	t.Helper()
 	dir := t.TempDir()
 	d := callDirs{filepath.Join(dir, "claude"), filepath.Join(dir, "codex"), filepath.Join(dir, "desktop")}
@@ -211,13 +213,13 @@ func TestCallsCodex(t *testing.T) {
 
 	cs := Calls(time.Time{})
 	want := []Call{
-		{Time: callT0.Add(200 * time.Second), Agent: "codex", Session: "0190cccc-1111-7222-8333-444455556666", Tokens: Tokens{6, 3, 4, 0, 0}},
-		{Time: callT0.Add(103 * time.Second), Agent: "codex", Session: "thread-2", Model: "gpt-6-astra", Tokens: Tokens{500, 20, 0, 0, 0}, Reasoning: 5, Effort: "medium", Cwd: "/work/it", Millis: 1000},
-		{Time: callT0.Add(102 * time.Second), Agent: "codex", Session: "thread-2", Model: "gpt-6-astra", Tokens: Tokens{100, 100, 3900, 0, 0}, Reasoning: 30, Effort: "medium", Cwd: "/work/it", Millis: 1000},
+		{Time: callT0.Add(200 * time.Second), Agent: "codex", Session: "0190cccc-1111-7222-8333-444455556666", ThreadID: "0190cccc-1111-7222-8333-444455556666", Tokens: Tokens{6, 3, 4, 0, 0}},
+		{Time: callT0.Add(103 * time.Second), Agent: "codex", Session: "thread-2", ThreadID: "thread-2", Model: "gpt-6-astra", Tokens: Tokens{500, 20, 0, 0, 0}, Reasoning: 5, Effort: "medium", Cwd: "/work/it", Millis: 1000},
+		{Time: callT0.Add(102 * time.Second), Agent: "codex", Session: "thread-2", ThreadID: "thread-2", Model: "gpt-6-astra", Tokens: Tokens{100, 100, 3900, 0, 0}, Reasoning: 30, Effort: "medium", Cwd: "/work/it", Millis: 1000},
 		// input_tokens holds the cache write as well as the read (#589): 2500 - 2000 - 300
-		{Time: callT0.Add(12 * time.Second), Agent: "codex", Session: "sess-x", Model: "gpt-6-luna", Tokens: Tokens{200, 150, 2000, 300, 0}, Reasoning: 40, Effort: "low", Cwd: "/work/it", Millis: 1000},
-		{Time: callT0.Add(11 * time.Second), Agent: "codex", Session: "sess-x", Model: "gpt-6-luna", Tokens: Tokens{1000, 100, 1000, 0, 0}, Reasoning: 40, Effort: "low", Cwd: "/work/it", Millis: 1000},
-		{Time: callT0.Add(2 * time.Second), Agent: "codex", Session: "sess-x", Model: "gpt-6-astra", Tokens: Tokens{400, 50, 600, 0, 0}, Reasoning: 20, Effort: "high", Cwd: "/work/it", TTFT: 700, Millis: 5000},
+		{Time: callT0.Add(12 * time.Second), Agent: "codex", Session: "sess-x", ThreadID: "thread-id", Model: "gpt-6-luna", Tokens: Tokens{200, 150, 2000, 300, 0}, Reasoning: 40, Effort: "low", Cwd: "/work/it", Millis: 1000},
+		{Time: callT0.Add(11 * time.Second), Agent: "codex", Session: "sess-x", ThreadID: "thread-id", Model: "gpt-6-luna", Tokens: Tokens{1000, 100, 1000, 0, 0}, Reasoning: 40, Effort: "low", Cwd: "/work/it", Millis: 1000},
+		{Time: callT0.Add(2 * time.Second), Agent: "codex", Session: "sess-x", ThreadID: "thread-id", Model: "gpt-6-astra", Tokens: Tokens{400, 50, 600, 0, 0}, Reasoning: 20, Effort: "high", Cwd: "/work/it", TTFT: 700, Millis: 5000},
 	}
 	if len(cs) != len(want) {
 		t.Fatalf("want %d calls, got %d: %+v", len(want), len(cs), cs)
@@ -436,10 +438,23 @@ func TestDesktopDataDirs(t *testing.T) {
 	t.Setenv("HOME", "/home/u")
 	t.Setenv("USERPROFILE", "/home/u")
 	t.Setenv("XDG_CONFIG_HOME", "")
-	t.Setenv("LOCALAPPDATA", filepath.Join(t.TempDir(), "Local"))
+	dir := t.TempDir()
+	t.Setenv("LOCALAPPDATA", filepath.Join(dir, "Local"))
+	t.Setenv("APPDATA", filepath.Join(dir, "Roaming"))
 	ds := desktopDataDirs()
-	if len(ds) != 2 || filepath.Base(ds[0]) != "Claude" || filepath.Base(ds[1]) != "Claude-3p" {
+	// on Windows Desktop's own data is %APPDATA%\Claude, beside
+	// %LOCALAPPDATA%'s Claude and Claude-3p
+	want := []string{"Claude", "Claude-3p"}
+	if runtime.GOOS == "windows" {
+		want = []string{filepath.Join("Roaming", "Claude"), filepath.Join("Local", "Claude"), filepath.Join("Local", "Claude-3p")}
+	}
+	if len(ds) != len(want) {
 		t.Fatalf("dirs: %v", ds)
+	}
+	for i, w := range want {
+		if !strings.HasSuffix(ds[i], string(filepath.Separator)+w) {
+			t.Fatalf("dirs: %v, want %v", ds, want)
+		}
 	}
 }
 
@@ -540,6 +555,171 @@ func TestCallsCodexTook(t *testing.T) {
 	}
 }
 
+// An older rollout writes a call's token_count after its own tool's output
+// (shape from a real 2026-09-06 rollout, content stripped). Each call of a
+// turn of several is timed from what the model had last been given before
+// its first output item to its last, never from its own tool's output, which
+// read as 1 ms windows (Fallmonkey on Discord). A tool call over the read
+// buffer (a large patch) is read by its head.
+func TestCallsCodexTimedFromTheAsk(t *testing.T) {
+	d := setupCalls(t)
+	rollout := filepath.Join(d.codex, "sessions", "2026", "09", "20", "rollout-2026-09-20T10-00-00-0190aaaa-1111-7222-8333-444455556666.jsonl")
+	item := func(sec int, typ, extra string) string {
+		return fmt.Sprintf(`{"timestamp":"%s","type":"response_item","payload":{"type":"%s","id":"x"%s}}`, stamp(sec), typ, extra)
+	}
+	msg := func(sec int, role string) string { return item(sec, "message", `,"role":"`+role+`"`) }
+	big := `,"input":"` + strings.Repeat("x", 1200<<10) + `"`
+	lines := cxTurnLines(0, "t1", "gpt-6-sol", "high")
+	lines = append(lines,
+		msg(3, "developer"), msg(3, "user"),
+		item(10, "reasoning", ""), msg(11, "assistant"), item(12, "custom_tool_call", `,"call_id":"c1"`),
+		item(13, "custom_tool_call_output", `,"call_id":"c1"`),
+		tokenCountLine(13, cxUse(1000, 0, 0, 300, 100), cxUse(1000, 0, 0, 300, 100)), // asked at 3, answered by 12: 9 s
+		item(19, "reasoning", ""), item(21, "custom_tool_call", `,"call_id":"c2"`),
+		item(22, "custom_tool_call_output", `,"call_id":"c2"`),
+		tokenCountLine(22, cxUse(2500, 1000, 0, 500, 150), cxUse(1500, 1000, 0, 200, 50)), // from 13 to 21: 8 s
+		item(31, "reasoning", ""), item(51, "custom_tool_call", `,"call_id":"c3"`+big),
+		item(83, "custom_tool_call_output", `,"call_id":"c3"`),                               // the tool ran 32 s
+		tokenCountLine(83, cxUse(4000, 2500, 0, 1715, 450), cxUse(1500, 1500, 0, 1215, 300)), // from 22 to 51: 29 s
+		item(97, "reasoning", ""), msg(98, "assistant"),
+		tokenCountLine(98, cxUse(5600, 4000, 0, 1903, 500), cxUse(1600, 1500, 0, 188, 50)), // no tool: from 83 to its line, 15 s
+		cxDoneLine(98, "t1", 98000, 10000),
+	)
+	writeLines(t, rollout, lines...)
+	var took []int64
+	for _, c := range Calls(time.Time{}) {
+		took = append(took, c.Millis)
+	}
+	if fmt.Sprint(took) != "[15000 29000 8000 9000]" {
+		t.Fatalf("took %v", took)
+	}
+}
+
+// A Claude Code compaction is no call of the file's, but its compact_boundary
+// line says how long it took (shape from a real 2026-10 transcript): the
+// first call after it carries that, an API error between them does not take
+// it, and a call with no compaction before it carries none.
+func TestCallsClaudeCompactTook(t *testing.T) {
+	d := setupCalls(t)
+	boundary := func(sec, ms int) string {
+		return fmt.Sprintf(`{"parentUuid":null,"logicalParentUuid":"p","isSidechain":false,"type":"system","subtype":"compact_boundary","content":"Conversation compacted","isMeta":false,"timestamp":"%s","uuid":"b%d","level":"info","compactMetadata":{"trigger":"auto","preTokens":169492,"postTokens":7669,"durationMs":%d},"sessionId":"sess1","cwd":"/work/app"}`, stamp(sec), sec, ms)
+	}
+	summary := func(sec int) string {
+		return fmt.Sprintf(`{"type":"user","timestamp":"%s","message":{"role":"user","content":"This session is being continued"},"isCompactSummary":true,"sessionId":"sess1"}`, stamp(sec))
+	}
+	writeLines(t, filepath.Join(d.claude, "projects", "-work-app", "sess1.jsonl"),
+		claudeMsg("a", "claude-opus-5-5", 1, 1, 160000, 0, 10),
+		boundary(60, 48913),
+		summary(60),
+		claudeSynthetic("API Error: overloaded", 61, `,"isApiErrorMessage":true`),
+		claudeMsg("b", "claude-opus-5-5", 1, 1, 0, 9000, 70),
+		claudeMsg("c", "claude-opus-5-5", 1, 1, 9000, 0, 80),
+	)
+	got := map[string]int64{}
+	check := func() {
+		t.Helper()
+		clear(got)
+		for _, c := range Calls(time.Time{}) {
+			got[c.RequestID+c.Error] += c.Compact
+		}
+		if got["req_a"] != 0 || got["req_b"] != 48913 || got["req_c"] != 0 || got["unknown"] != 0 {
+			t.Fatalf("compact: %v", got)
+		}
+	}
+	check()
+	Reset() // read again from the call cache
+	check()
+}
+
+// Codex compacts by a call of its own (a token_usage_record the compacted
+// line names): that call's time is the compaction's (real fixture: asked at
+// task_started 01:41:35.120, answered 01:44:20.576). Other calls carry none.
+func TestCallsCodexCompactTook(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("testdata", "codex-native-compaction.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	codexUsageLog(t, strings.Split(strings.TrimSpace(string(data)), "\n"))
+	check := func() {
+		t.Helper()
+		got := map[string]int64{}
+		for _, c := range Calls(time.Time{}) {
+			got[c.ResponseID] = c.Compact
+		}
+		for id, ms := range got {
+			if want := map[bool]int64{true: 165456}[id == "resp_4"]; ms != want {
+				t.Fatalf("compact %v", got)
+			}
+		}
+		if _, ok := got["resp_4"]; !ok {
+			t.Fatalf("no compaction call: %v", got)
+		}
+	}
+	check()
+	Reset()
+	check()
+}
+
+func TestCallsCodexLateCompactionMarkerPatchesZeroDuration(t *testing.T) {
+	u := cxUse(100, 40, 0, 10, 2)
+	lines := append(cxTurnLines(0, "t1", "gpt-6-astra", "high"), cxRecordLine(0, "resp-zero", u, u))
+	path := codexUsageLog(t, lines)
+	find := func(want bool) Call {
+		t.Helper()
+		for _, call := range Calls(time.Time{}) {
+			if call.ResponseID == "resp-zero" {
+				if call.Compaction != want {
+					t.Fatalf("compaction marker %v; want %v: %+v", call.Compaction, want, call)
+				}
+				return call
+			}
+		}
+		t.Fatalf("compaction response missing: %+v", Calls(time.Time{}))
+		return Call{}
+	}
+	if call := find(false); call.Compact != 0 || call.Millis != 0 {
+		t.Fatalf("initial call has unexpected timing: %+v", call)
+	}
+	appendText(t, path, cxCompactionLine(0, "resp-zero", u, u)+"\n")
+	if call := find(true); call.Compact != 0 || call.Millis != 0 {
+		t.Fatalf("late marker changed zero duration: %+v", call)
+	}
+	Reset()
+	if call := find(true); call.Compact != 0 || call.Millis != 0 {
+		t.Fatalf("cached marker lost zero duration: %+v", call)
+	}
+}
+
+func TestCallsCodexOldCacheWithoutCompactionMarkerIsIgnored(t *testing.T) {
+	u := cxUse(100, 40, 0, 10, 2)
+	lines := append(cxTurnLines(0, "t1", "gpt-6-astra", "high"), cxRecordLine(0, "resp-old-cache", u, u), cxCompactionLine(0, "resp-old-cache", u, u))
+	path := codexUsageLog(t, lines)
+	if calls := Calls(time.Time{}); len(calls) != 1 || !calls[0].Compaction {
+		t.Fatalf("native compaction: %+v", calls)
+	}
+	st := loadCalls(file{path: path, agent: "codex"})
+	if st == nil || len(st.Calls) != 1 {
+		t.Fatal("could not load the cached call")
+	}
+	st.Calls[0].Compaction = false // an older cache has no marker field
+	writeCalls(st, 0, false)
+	old := filepath.Join(filepath.Dir(CachePath()), "calls-v14", hashHead(path)+".gob")
+	if err := os.MkdirAll(filepath.Dir(old), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(callCachePath(path), old); err != nil {
+		t.Fatal(err)
+	}
+	Reset()
+	calls := Calls(time.Time{})
+	if len(calls) != 1 || !calls[0].Compaction {
+		t.Fatalf("old cache hid the native compaction marker: %+v", calls)
+	}
+	if _, err := os.Stat(old); !os.IsNotExist(err) {
+		t.Fatalf("old call cache still exists: %v", err)
+	}
+}
+
 // bare is a call without where it is in its file, which a test of what the
 // calls are has no want of.
 func bare(c Call) Call {
@@ -573,5 +753,53 @@ func TestCallsWorkflowAgents(t *testing.T) {
 		if bare(cs[i]) != want[i] {
 			t.Errorf("call %d:\n got %+v\nwant %+v", i, bare(cs[i]), want[i])
 		}
+	}
+}
+
+// Kilig on Discord: an MSIX Claude Desktop (Windows 10 LTSC) keeps Cowork's
+// sessions in its package's LocalCache\Roaming\Claude, nothing in
+// %APPDATA%\Claude; their calls are read from there.
+func TestCallsCoworkMSIX(t *testing.T) {
+	d := setupCalls(t)
+	old := desktopdir.OS
+	desktopdir.OS = "windows"
+	callDesktopDirs = desktopDataDirs
+	t.Cleanup(func() { desktopdir.OS = old })
+	home := filepath.Join(t.TempDir(), "home")
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	local, roaming := filepath.Join(home, "AppData", "Local"), filepath.Join(home, "AppData", "Roaming")
+	t.Setenv("LOCALAPPDATA", local)
+	t.Setenv("APPDATA", roaming)
+	os.MkdirAll(roaming, 0o755)
+	data := filepath.Join(local, "Packages", "Claude_pzs8sxrjxfjjc", "LocalCache", "Roaming", "Claude")
+	writeLines(t, filepath.Join(data, "Local State"), `{}`)
+
+	// the package's first, then the real ones a newer packaged Desktop
+	// (2.31226) keeps its 3p mode in
+	if ds := desktopDataDirs(); len(ds) != 6 || ds[0] != data || ds[5] != filepath.Join(local, "Claude-3p") {
+		t.Fatalf("dirs: %v", ds)
+	}
+	cw := filepath.Join(data, "local-agent-mode-sessions", "acct", "org", "local_abc", ".claude", "projects", "-sessions-x")
+	writeLines(t, filepath.Join(cw, "cw1.jsonl"), swap(claudeMsg("c1", "claude-sonnet-5-5", 5, 6, 7, 8, 3), `"entrypoint":"cli"`, `"entrypoint":"local-agent"`))
+	writeLines(t, filepath.Join(d.claude, "projects", "-p", "sess1.jsonl"), claudeMsg("m1", "claude-opus-5-5", 1, 2, 3, 4, 1))
+	Reset()
+	cs := Calls(time.Time{})
+	if len(cs) != 2 || cs[0].Agent != "claude-desktop" || cs[0].Tokens != (Tokens{5, 6, 7, 8, 0}) || cs[1].Agent != "claude" {
+		t.Fatalf("calls: %+v", cs)
+	}
+}
+
+// Desktop's Code tab in its third-party inference mode, the one a gateway
+// is set in, writes "claude-desktop-3p" (cybercaius: its calls were
+// counted as Claude Code's).
+func TestCallsDesktop3pCodeTab(t *testing.T) {
+	d := setupCalls(t)
+	writeLines(t, filepath.Join(d.claude, "projects", "-p", "s3p.jsonl"),
+		swap(swap(claudeMsg("m1", "claude-haiku-5-5", 1, 2, 3, 4, 1), `"entrypoint":"cli"`, `"entrypoint":"claude-desktop-3p"`), `"sessionId":"sess1"`, `"sessionId":"s3p"`))
+	writeLines(t, filepath.Join(d.claude, "projects", "-p", "sess1.jsonl"), claudeMsg("m2", "claude-opus-5-5", 1, 2, 3, 4, 2))
+	cs := Calls(time.Time{})
+	if len(cs) != 2 || cs[0].Agent != "claude" || cs[1].Agent != "claude-desktop" || cs[1].Session != "s3p" {
+		t.Fatalf("calls: %+v", cs)
 	}
 }

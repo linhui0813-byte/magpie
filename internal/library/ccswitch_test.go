@@ -58,10 +58,10 @@ func TestCCSwitchSkillUpdates(t *testing.T) {
 	if origins["pdf"] != "https://github.com/owner/repo/tree/main" || origins["mine"] != "" {
 		t.Fatalf("origins %v", origins)
 	}
-	if _, err := UpdateSkill("mine"); err == nil {
+	if _, err := UpdateSkill("mine", false); err == nil {
 		t.Error("one CC Switch has no repository for was updated")
 	}
-	ok(t)(UpdateSkill("pdf"))
+	ok(t)(UpdateSkill("pdf", false))
 	if asked[len(asked)-1] != "/owner/repo/main" {
 		t.Errorf("asked %v", asked)
 	}
@@ -78,5 +78,5 @@ func TestCCSwitchSkillUpdates(t *testing.T) {
 	if s := l.skill("pdf"); s.Source == nil || s.Source.Kind != "github" || s.Source.Repo != "owner/repo" || s.Source.Path != "skills/pdf" {
 		t.Errorf("source %+v", s.Source)
 	}
-	ok(t)(UpdateSkill("pdf")) // from GitHub now, like any other
+	ok(t)(UpdateSkill("pdf", false)) // from GitHub now, like any other
 }

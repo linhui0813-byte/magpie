@@ -10,10 +10,16 @@ package agent
 //	PUT  /api/providers/:id/models   {"models":["<id>",…],"availableModels":[{"id","name","capabilityOverrides"}]}:
 //	                                 models, kept as given, are the ones Alma offers; a model's
 //	                                 capabilityOverrides, when sent, take the place of the ones it had
-//	GET  /api/settings, PUT it back  the whole settings; chat.defaultModel is "<providerId>:<model>"
+//	GET  /api/settings, PUT it back  the whole settings; chat.defaultModel is "<providerId>:<model>",
+//	                                 imageGen.model the same ("" for Auto)
 //
 // magpie is one provider there, named magpie, of type openai at the
-// gateway's /v1; choosing one of its models makes it Alma's default model.
+// gateway's /v1, under the id of Alma's own Magpie preset (almaPresetID);
+// a Magpie the user set up in Alma first is used in its place, and kept
+// when magpie is switched off (almaMade). Choosing one of its models
+// makes it Alma's default model,
+// and the model magpie draws with Alma's image generation model when Alma
+// has none picked (almaSetImage).
 // Alma not running is no error: there is nothing to read or keep current.
 
 import (
@@ -25,14 +31,17 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/yetone/magpie/internal/appdir"
 	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/gateway"
+	"github.com/yetone/magpie/internal/proc"
 )
 
 // almaAPI is where Alma's API answers. Under test it is nothing, so no test
@@ -50,6 +59,37 @@ var almaClient = &http.Client{Timeout: 1500 * time.Millisecond}
 
 // errAlmaDown is Alma not answering.
 var errAlmaDown = errors.New("Alma isn't running — open Alma and try again")
+
+// almaApp is Alma's desktop app as its packages install it
+// (electron-builder.yml and desktop-native/PACKAGING.md in Alma's repo):
+// Alma.app (com.yetone.alma) on a Mac; Alma\Alma.exe under
+// %LOCALAPPDATA%\Programs on Windows, or the folder its installer
+// registered under the guid electron-builder makes of the appId; on
+// Linux /opt/alma (the native deb and rpm) or /opt/Alma (the Electron
+// ones), or a desktop entry named Alma for alma:// links (an AppImage's).
+var almaApp = desktopApp{id: "com.yetone.alma", names: []string{"Alma.app"},
+	win: filepath.Join("Alma", "Alma.exe"), guid: "53efb302-dbc3-52a1-8bb5-041beae96976",
+	onLinux: &linuxApp{dirs: []string{"/opt/alma", "/opt/Alma"}, exe: "alma", name: "Alma", scheme: "alma"}}
+
+// almaInstalled reports whether Alma is installed here: its desktop app,
+// or on Linux alma-server, Alma without a desktop, on PATH. A var so a
+// test can say.
+var almaInstalled = func() bool {
+	if almaApp.installed() {
+		return true
+	}
+	if almaOS == "darwin" || almaOS == "windows" {
+		return false
+	}
+	_, err := proc.LookPath("alma-server")
+	return err == nil
+}
+
+// almaTakeOut, in the stash, is magpie's provider left in an Alma that was
+// gone when it was turned off (almaSet): Alma uninstalled keeps its data,
+// and only Alma itself can change it. It is taken out once Alma answers
+// again (Sync), installed again with that data.
+const almaTakeOut = "alma.takeout"
 
 // almaProvider is what magpie reads of one of Alma's providers.
 type almaProvider struct {
@@ -207,17 +247,51 @@ func almaProviders() ([]almaProvider, error) {
 	return ps, err
 }
 
+// almaProvidersSeen is almaProviders as almaLook has them, decoded once
+// per answer: the answer is kept 5s (almaReadFor), and the Agents page's
+// model field, its check and the options each decoded it again, all of
+// Alma's providers with their models, 390MB in 37 minutes of a live
+// magpie. What it gives is shared, only for reading.
 func almaProvidersSeen() ([]almaProvider, error) {
+	if almaAPI == "" {
+		return nil, errAlmaDown
+	}
+	b, err := almaSend("GET", "/api/providers", nil, true)
+	if err != nil {
+		return nil, err
+	}
+	almaSeen.Lock()
+	defer almaSeen.Unlock()
+	// the same bytes asked again (past almaReadFor, each poll of the
+	// Agents page) are the same providers: 4 MB a minute decoded again on
+	// a live magpie with Alma's 227 KB answer
+	if len(b) > 0 && len(b) == len(almaSeen.body) && (&b[0] == &almaSeen.body[0] || bytes.Equal(b, almaSeen.body)) {
+		return almaSeen.ps, nil
+	}
 	var ps []almaProvider
-	err := almaLook("/api/providers", &ps)
-	return ps, err
+	if len(bytes.TrimSpace(b)) > 0 {
+		if err := json.Unmarshal(b, &ps); err != nil {
+			return nil, err
+		}
+	}
+	almaSeen.body, almaSeen.ps = b, ps
+	return ps, nil
+}
+
+// almaSeen is the answer almaProvidersSeen decoded last, by its bytes.
+var almaSeen struct {
+	sync.Mutex
+	body []byte
+	ps   []almaProvider
 }
 
 // almaMagpie is magpie's provider among Alma's: the one named magpie, or
-// an OpenAI-shaped one at the gateway. Nil if there is none.
+// an OpenAI-shaped one at the gateway. Nil if there is none. One named
+// magpie at another machine's address is the user's own, a magpie on a
+// server say (Alex on Discord), and never this magpie's.
 func almaMagpie(ps []almaProvider) *almaProvider {
 	for i := range ps {
-		if ps[i].Name == magpieID && (ps[i].Type == "openai" || ps[i].Type == "custom") {
+		if ps[i].Name == magpieID && (ps[i].Type == "openai" || ps[i].Type == "custom") && !onAnotherMachine(ps[i].BaseURL) {
 			return &ps[i]
 		}
 	}
@@ -233,13 +307,38 @@ func almaMagpie(ps []almaProvider) *almaProvider {
 // and each one's name and what magpie knows it can do (almaCaps).
 func almaModels() (ids []string, known []map[string]any) {
 	ids, known = []string{}, []map[string]any{}
-	for _, m := range magpieModels("alma") {
+	for _, m := range sharedModels("alma") {
 		ids = append(ids, m.ID)
 		k := map[string]any{"id": m.ID, "name": m.Name}
-		if caps := almaCaps(m); len(caps) > 0 {
-			k["capabilityOverrides"] = caps
-		}
+		caps := almaCaps(m)
+		// every chat model magpie lists takes tools, as its /v1/models
+		// says (gateway's toolsTold). Alma looks function calling up on
+		// models.dev by the id, finds none for a routing group's name or a
+		// plugin's model, and puts the tools in the prompt instead
+		// (hermesToolMiddleware): no native tools went out, and DeepSeek
+		// answered with its DSML call text, shown raw (ethanchi on
+		// Discord). One the user set in Alma is kept (almaUserFirst).
+		caps["functionCalling"] = true
+		k["capabilityOverrides"] = caps
 		known = append(known, k)
+	}
+	// the model magpie draws with, which Alma offers for its image
+	// generation, said to make images (Settings › Image Generation lists
+	// a provider's models that make images, and shows one it doesn't list
+	// as unavailable)
+	if d := gateway.Drawer(); d != "" {
+		if i := slices.Index(ids, d); i >= 0 {
+			caps, _ := known[i]["capabilityOverrides"].(map[string]any)
+			if caps == nil {
+				caps = map[string]any{}
+				known[i]["capabilityOverrides"] = caps
+			}
+			caps["imageOutput"] = true
+		} else {
+			_, name, _ := strings.Cut(d, "/")
+			ids = append(ids, d)
+			known = append(known, map[string]any{"id": d, "name": name, "capabilityOverrides": map[string]any{"imageOutput": true}})
+		}
 	}
 	return ids, known
 }
@@ -294,10 +393,16 @@ func almaCaps(m catalog.Model) map[string]any {
 	return caps
 }
 
+// almaUserFirst are the overrides whose value a model already has in Alma
+// is kept over magpie's: magpie never wrote them before saying so, so one
+// there is the user's own (Model Options › Tool Calling), and magpie only
+// fills it in where it is missing.
+var almaUserFirst = []string{"functionCalling"}
+
 // almaWithOverrides is known with each model's overrides laid over the ones
 // it has in Alma: the overrides sent take the place of a model's, so one
-// the user set there that magpie says nothing of (functionCalling,
-// pricing) is sent back as it was.
+// the user set there that magpie says nothing of (pricing) is sent back as
+// it was, and one of almaUserFirst stays as the user set it.
 func almaWithOverrides(p *almaProvider, known []map[string]any) []map[string]any {
 	had := map[string]map[string]any{}
 	for _, k := range p.Known {
@@ -322,6 +427,9 @@ func almaWithOverrides(p *almaProvider, known []map[string]any) []map[string]any
 			merged[key] = v
 		}
 		for key, v := range mine {
+			if _, set := o[key]; set && slices.Contains(almaUserFirst, key) {
+				continue
+			}
 			merged[key] = v
 		}
 		kk := map[string]any{}
@@ -347,6 +455,9 @@ func almaSameModels(p *almaProvider, ids []string, known []map[string]any) bool 
 		mine, _ := k["capabilityOverrides"].(map[string]any)
 		had, _ := p.Known[i]["capabilityOverrides"].(map[string]any)
 		for key, v := range mine {
+			if _, set := had[key]; set && slices.Contains(almaUserFirst, key) {
+				continue
+			}
 			if !sameJSONValue(had[key], v) {
 				return false
 			}
@@ -384,8 +495,16 @@ func almaWire() (string, error) {
 	p := almaMagpie(ps)
 	if p == nil {
 		var made almaProvider
-		if err := almaDo("POST", "/api/providers", map[string]any{"name": magpieID, "type": "openai",
-			"apiKey": almaKey(), "baseURL": gatewayV1(), "enabled": true}, &made); err != nil {
+		body := map[string]any{"name": magpieID, "type": "openai",
+			"apiKey": almaKey(), "baseURL": gatewayV1(), "enabled": true, "icon": almaPresetID}
+		// under the id of Alma's own Magpie preset, so Alma's Providers
+		// page shows it as that preset, set up, and offers no second one
+		// (realLemonawa on X); a provider of that id already there, at
+		// another address, is the user's, and keeps it
+		if !slices.ContainsFunc(ps, func(o almaProvider) bool { return o.ID == almaPresetID }) {
+			body["id"] = almaPresetID
+		}
+		if err := almaDo("POST", "/api/providers", body, &made); err != nil {
 			return "", err
 		}
 		if made.ID == "" {
@@ -400,6 +519,11 @@ func almaWire() (string, error) {
 		}
 		p = &made
 	} else if p.BaseURL != gatewayV1() || !p.Enabled {
+		if !p.Enabled && !almaMade(p) {
+			// a Magpie of the user's own in Alma, turned off: off again
+			// when magpie is (almaSet)
+			stash(map[string]string{almaWasOff: p.ID})
+		}
 		if err := almaDo("PUT", "/api/providers/"+p.ID, map[string]any{"baseURL": gatewayV1(),
 			"apiKey": almaKey(), "enabled": true}, nil); err != nil {
 			return "", err
@@ -410,17 +534,37 @@ func almaWire() (string, error) {
 	return p.ID, almaSyncModels(p)
 }
 
+// almaPresetID is the id of Alma's own Magpie provider, its preset on
+// the Providers page and in its quick setup: {"id":"magpie","name":"Magpie",
+// "type":"custom","apiFormat":"openai-chat","icon":"magpie","apiKey":
+// "magpie-alma","baseURL":"http://127.0.0.1:3425/v1"} (provPredefBody in
+// Alma's desktop-native/internal/app/settings_providers_detail.go, and
+// NewProvidersSettings.tsx). Alma takes a provider of this id as that
+// preset set up, and offers it again while none has it.
+const almaPresetID = "magpie"
+
+// almaWasOff, in the stash, is the id of the user's own Magpie provider in
+// Alma that magpie turned on to use it, for turning it off again.
+const almaWasOff = "alma.wasoff"
+
+// almaMade says p is the provider magpie made in Alma: magpie names its
+// own magpie, and Alma's preset is Magpie. One the user made, the preset or
+// one of their own pointed at the gateway, magpie uses, and never removes.
+func almaMade(p *almaProvider) bool { return p.Name == magpieID }
+
 // almaKey is the key magpie's provider in Alma is given. Alma's requests
 // carry the AI SDK's User-Agent and nothing of Alma's, so the key is how
 // the gateway knows them for Alma's.
-func almaKey() string { return gateway.TokenFor("alma") }
+func almaKey() string { return agentKey("alma") }
 
-// almaKeyed gives magpie's provider the key almaKey in place of the one it
-// was given before there was one, gateway.Token; a key Alma gives back
-// some other way (encrypted) is left be. The key alone is sent: a baseURL,
-// even the same one, would have Alma drop its models.
+// almaKeyed gives magpie's provider the key almaKey in place of one magpie
+// gave it before: gateway.Token, from before there was one, or the key
+// named for Alma while the gateway's address beyond loopback wants the LAN
+// key, or the other way round (#1647); a key Alma gives back some other way
+// (encrypted) is left be. The key alone is sent: a baseURL, even the same
+// one, would have Alma drop its models.
 func almaKeyed(p *almaProvider) error {
-	if p.APIKey != gateway.Token {
+	if p.APIKey == almaKey() || !ourKey(p.APIKey) && p.APIKey != gateway.TokenFor("alma") {
 		return nil
 	}
 	return almaDo("PUT", "/api/providers/"+p.ID, map[string]any{"apiKey": almaKey()}, nil)
@@ -468,12 +612,69 @@ func almaSetDefault(v string) error {
 	return almaDo("PUT", "/api/settings", s, nil)
 }
 
+// almaImage is Alma's image generation model, "" for Auto.
+func almaImage(s map[string]any) string {
+	ig, _ := s["imageGen"].(map[string]any)
+	v, _ := ig["model"].(string)
+	return v
+}
+
+// almaSetImage makes the model magpie draws with Alma's image generation
+// model (Sorghum on Discord), on magpie's provider pid, when Alma has one
+// of magpie's that magpie no longer offers it (the drawer it was given
+// before, almaModels) or, with fill, none picked (Auto): fill is the user
+// choosing one of magpie's models for Alma, not Sync, which leaves an Auto
+// the user may have gone back to. One the user picked, theirs or magpie's,
+// is left as it is. Nothing when magpie draws with none.
+func almaSetImage(pid string, fill bool) error {
+	d := gateway.Drawer()
+	if d == "" {
+		return nil
+	}
+	s, err := almaSettings()
+	if err != nil {
+		return err
+	}
+	cur, want := almaImage(s), pid+":"+d
+	if cur == want {
+		return nil
+	}
+	if cur == "" && !fill {
+		return nil
+	}
+	if cur != "" {
+		ref, ours := strings.CutPrefix(cur, pid+":")
+		if !ours {
+			return nil
+		}
+		if ids, _ := almaModels(); slices.Contains(ids, ref) {
+			return nil
+		}
+	}
+	return almaPutImage(s, want)
+}
+
+// almaPutImage sets imageGen.model to v, the rest of the settings put
+// back as they were.
+func almaPutImage(s map[string]any, v string) error {
+	ig, ok := s["imageGen"].(map[string]any)
+	if !ok {
+		ig = map[string]any{}
+		s["imageGen"] = ig
+	}
+	ig["model"] = v
+	return almaDo("PUT", "/api/settings", s, nil)
+}
+
 // almaGet is Alma's default model, one of magpie's as magpie/<model>. With
 // Alma not running it is what magpie last set there, so that isn't taken
 // for something else having changed it.
 func almaGet() string {
 	s, err := almaSettingsSeen()
 	if err != nil {
+		if stashShared()[almaTakeOut] != "" {
+			return ""
+		}
 		return appliedOf("alma").Fields["model"]
 	}
 	v := almaDefault(s)
@@ -491,11 +692,25 @@ func almaGet() string {
 	return v
 }
 
-func almaSet(v string) error {
+func almaSet(v string) (err error) {
+	defer func() {
+		// put on magpie again: nothing is left to take out
+		if v != "" && err == nil && stashShared()[almaTakeOut] != "" {
+			forget(almaTakeOut)
+		}
+	}()
 	if v == "" {
 		// back to Alma's own: its default model is its to pick, and
 		// magpie's provider comes out
 		s, err := almaSettings()
+		if errors.Is(err, errAlmaDown) && !almaInstalled() {
+			// Alma uninstalled: nothing of it to change, and opening it
+			// to turn magpie off can't be done (aooo_han on X: "得先运行
+			// 起来"). Its data, which only it changes, loses magpie's
+			// provider if it is installed again (Sync).
+			stash(map[string]string{almaTakeOut: "1"})
+			return nil
+		}
 		if err != nil {
 			return err
 		}
@@ -512,6 +727,27 @@ func almaSet(v string) error {
 				return err
 			}
 		}
+		// an image generation model of magpie's goes back to Auto too
+		if pid, _, _ := strings.Cut(almaImage(s), ":"); pid == p.ID {
+			if s, err = almaSettings(); err != nil {
+				return err
+			}
+			if err := almaPutImage(s, ""); err != nil {
+				return err
+			}
+		}
+		if !almaMade(p) {
+			// the user's own Magpie in Alma (its preset, set up there
+			// first): Alma no longer starts on it, and it stays, as it
+			// was before magpie used it
+			if stashShared()[almaWasOff] == p.ID {
+				if err := almaDo("PUT", "/api/providers/"+p.ID, map[string]any{"enabled": false}, nil); err != nil {
+					return err
+				}
+				forget(almaWasOff)
+			}
+			return nil
+		}
 		return almaDo("DELETE", "/api/providers/"+p.ID, nil, nil)
 	}
 	if ref, ok := strings.CutPrefix(v, magpieID+"/"); ok {
@@ -519,7 +755,10 @@ func almaSet(v string) error {
 		if err != nil {
 			return err
 		}
-		return almaSetDefault(id + ":" + ref)
+		if err := almaSetDefault(id + ":" + ref); err != nil {
+			return err
+		}
+		return almaSetImage(id, true)
 	}
 	if _, _, ok := strings.Cut(v, ":"); !ok {
 		return fmt.Errorf("expected providerId:model or magpie/<model>, got %q", v)
@@ -557,13 +796,45 @@ func almaOwn() []Option {
 	return out
 }
 
-func alma() *Agent {
-	// where Alma keeps its data (~/Library/Application Support/alma on a
-	// Mac): there once Alma was installed and opened
-	dir := ""
+// almaDir is where Alma keeps its data, there once Alma was installed and
+// opened: ~/Library/Application Support/alma on a Mac, the user config
+// folder elsewhere. On Linux alma-server, Alma without a desktop, keeps it
+// in ALMA_DATA_DIR, else $XDG_DATA_HOME/alma (~/.local/share/alma), and
+// answers on the same port: with only the desktop's folder looked for it
+// was never found, so its magpie provider never got Alma's key and its
+// requests read as the AI SDK's (Lutra.x on Discord). The desktop's folder
+// comes first; "" when neither is there.
+func almaDir(goos string) string {
+	var dirs []string
 	if d, err := os.UserConfigDir(); err == nil {
-		dir = filepath.Join(d, "alma")
+		dirs = append(dirs, filepath.Join(d, "alma"))
 	}
+	if goos != "darwin" && goos != "windows" {
+		if d := appdir.Getenv("ALMA_DATA_DIR"); d != "" {
+			dirs = append(dirs, d)
+		}
+		if d := appdir.Getenv("XDG_DATA_HOME"); d != "" {
+			dirs = append(dirs, filepath.Join(d, "alma"))
+		} else if h, err := os.UserHomeDir(); err == nil {
+			dirs = append(dirs, filepath.Join(h, ".local", "share", "alma"))
+		}
+	}
+	for _, d := range dirs {
+		if st, err := os.Stat(d); err == nil && st.IsDir() {
+			return d
+		}
+	}
+	if len(dirs) > 0 {
+		return dirs[0]
+	}
+	return ""
+}
+
+// almaOS is the system almaDir looks for Alma's data on; a test sets it.
+var almaOS = runtime.GOOS
+
+func alma() *Agent {
+	dir := almaDir(almaOS)
 	return &Agent{
 		ID: "alma", Name: "Alma", Icon: "alma",
 		UA:  []string{"alma"},
@@ -598,21 +869,37 @@ func alma() *Agent {
 			if err != nil {
 				return nil // not running: nothing to keep current
 			}
+			if stashShared()[almaTakeOut] != "" {
+				// turned off while Alma was gone, and here again
+				if err := almaSet(""); err != nil {
+					return err
+				}
+				forget(almaTakeOut)
+				return nil
+			}
 			p := almaMagpie(ps)
 			if p == nil {
+				return nil
+			}
+			if !almaMade(p) && stashShared()["alma"+disconnectedKey] == "1" {
+				// the user's own Magpie in Alma, with magpie switched off
+				// for Alma: left as the user keeps it
 				return nil
 			}
 			if err := almaKeyed(p); err != nil {
 				return err
 			}
-			return almaSyncModels(p)
+			if err := almaSyncModels(p); err != nil {
+				return err
+			}
+			return almaSetImage(p.ID, false)
 		},
 		Fields: []Field{{
 			Key: "model", Label: "model",
 			Get: almaGet,
 			Set: almaSet,
 			Options: func(map[string]string) []Option {
-				return append(almaOwn(), viaMagpie("alma", magpieID+"/")...)
+				return withVia(almaOwn(), "alma", magpieID+"/")
 			},
 		}},
 	}

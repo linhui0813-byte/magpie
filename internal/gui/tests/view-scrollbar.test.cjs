@@ -2,7 +2,8 @@
 // A page that runs longer than the window shows a scrollbar (PAMI on
 // Discord: no page of the Mac app had one). The pages' scrollbar was
 // hidden everywhere; now on the Mac (body.mac) a page has a thin thumb of
-// 8px, and elsewhere the 10px one every other list has. In WebKit, which
+// 8px, across a page as at its side, and elsewhere the 10px one every
+// other list has. In WebKit, which
 // the Mac app is, and Chromium.
 const assert = require("node:assert/strict");
 const fs = require("node:fs/promises");
@@ -43,10 +44,11 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
     const page = await (await browser.newContext({ viewport: { width: 900, height: 500 }, reducedMotion: "reduce" })).newPage();
     t.after(() => browser.close());
     page.setDefaultTimeout(5000);
+    page.setDefaultNavigationTimeout(60000);
     const errors = [];
     page.on("pageerror", (e) => errors.push(e.message));
     await page.route("**/*", serve());
-    await page.goto("http://magpie.test/?view=routing");
+    await page.goto("http://magpie.test/?view=groups");
     await page.locator(".rt-group").nth(30).waitFor();
     const bar = () => page.evaluate(() => {
       const v = [...document.querySelectorAll(".view")].find((x) => x.offsetParent && x.scrollHeight > x.clientHeight);
@@ -60,7 +62,21 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       for (const v of document.querySelectorAll(".view")) { v.style.display = "none"; v.offsetWidth; v.style.display = ""; }
     });
     assert.equal(await bar(), 8, "a long page has no scrollbar on the Mac");
-    const thumb = await page.evaluate(() => getComputedStyle(document.querySelector("#view-routing"), "::-webkit-scrollbar-thumb").backgroundColor);
+    // a page that does run wider than the window has as thin a bar across
+    // its foot (#1623, fanbuz: Usage's was the engine's 15-17px one, twice
+    // the side's, as only the side's width was set)
+    const foot = await page.evaluate(() => {
+      const v = document.querySelector("#view-groups"), wide = document.createElement("div");
+      wide.style.cssText = "width: 3000px; height: 1px";
+      v.append(wide);
+      v.style.display = "none"; v.offsetWidth; v.style.display = "";
+      const b = getComputedStyle(v);
+      const h = v.offsetHeight - v.clientHeight - parseFloat(b.borderTopWidth) - parseFloat(b.borderBottomWidth);
+      wide.remove();
+      return h;
+    });
+    assert.equal(foot, 8, "a wide page's bar across its foot is as thin as the one at its side");
+    const thumb = await page.evaluate(() => getComputedStyle(document.querySelector("#view-groups"), "::-webkit-scrollbar-thumb").backgroundColor);
     assert.notEqual(thumb, "rgba(0, 0, 0, 0)", "the thumb is drawn in no colour");
     assert.deepEqual(errors, []);
   });

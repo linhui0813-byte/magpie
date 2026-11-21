@@ -71,14 +71,17 @@ func TestRemoteMagpieKeepsTheSession(t *testing.T) {
 		t.Fatalf("no record %d of the remote's", n)
 		return usage.Record{}
 	}
-	for i, tc := range []struct{ path, body string }{
-		{"/v1/chat/completions", `{"model":"office/fake/m1","messages":[{"role":"user","content":"hi"}]}`},
-		{"/v1/responses", `{"model":"office/fake/m1","input":[{"role":"user","content":"hi"}],"prompt_cache_key":"cache-A"}`},
+	for i, tc := range []struct{ path, body, ua, agent, header, native string }{
+		{"/v1/chat/completions", `{"model":"office/fake/m1","messages":[{"role":"user","content":"hi"}]}`, "pi/1.0", "pi", "session_id", "native-A"},
+		{"/v1/responses", `{"model":"office/fake/m1","input":[{"role":"user","content":"hi"}],"prompt_cache_key":"cache-A"}`, "pi/1.0", "pi", "session_id", "native-A"},
+		{"/v1/chat/completions", `{"model":"office/fake/m1","messages":[{"role":"user","content":"hi"}]}`, "CLI/2.161.0 WorkBuddy/2.161.0", "workbuddy", "X-Conversation-ID", "workbuddy-A"},
+		{"/v1/responses", `{"model":"office/fake/m1","input":[{"role":"user","content":"hi"}]}`, "CLI/2.161.0 WorkBuddy/2.161.0", "workbuddy", "X-Conversation-ID", "workbuddy-A"},
 	} {
 		req := httptest.NewRequest("POST", tc.path, strings.NewReader(tc.body))
-		req.Header.Set("User-Agent", "pi/1.0")
+		req.Header.Set("User-Agent", tc.ua)
+		req.Header.Set("Authorization", "Bearer "+TokenFor(tc.agent))
 		req.Header.Set(SessionHeader, "trace-A")
-		req.Header.Set("session_id", "native-A")
+		req.Header.Set(tc.header, tc.native)
 		rec := httptest.NewRecorder()
 		New().Handler().ServeHTTP(rec, req)
 		if rec.Code != 200 || !strings.Contains(rec.Body.String(), "hello") {
@@ -87,18 +90,18 @@ func TestRemoteMagpieKeepsTheSession(t *testing.T) {
 		mu.Lock()
 		got := arrived[len(arrived)-1]
 		mu.Unlock()
-		if got.Get(SessionHeader) != "trace-A" || got.Get("session_id") != "native-A" {
-			t.Errorf("%s: the remote magpie was sent %s=%q session_id=%q; want trace-A, native-A", tc.path, SessionHeader, got.Get(SessionHeader), got.Get("session_id"))
+		if got.Get(SessionHeader) != "trace-A" || got.Get(tc.header) != tc.native {
+			t.Errorf("%s: the remote magpie was sent %s=%q %s=%q; want trace-A, %s", tc.path, SessionHeader, got.Get(SessionHeader), tc.header, got.Get(tc.header), tc.native)
 		}
-		if r := there(i + 1); r.Session != "trace-A" || r.NativeSession != "native-A" || r.Agent != "pi" {
-			t.Errorf("%s: the remote recorded agent %q session %q native %q; want pi, trace-A, native-A", tc.path, r.Agent, r.Session, r.NativeSession)
+		if r := there(i + 1); r.Session != "trace-A" || r.NativeSession != tc.native || r.Agent != tc.agent {
+			t.Errorf("%s: the remote recorded agent %q session %q native %q; want %s, trace-A, %s", tc.path, r.Agent, r.Session, r.NativeSession, tc.agent, tc.native)
 		}
 	}
 	mu.Lock()
 	defer mu.Unlock()
 	for _, v := range vendor {
 		for k := range v {
-			if lk := strings.ToLower(k); strings.HasPrefix(lk, "x-magpie-") || lk == "session_id" {
+			if lk := strings.ToLower(k); strings.HasPrefix(lk, "x-magpie-") || lk == "session_id" || lk == "x-conversation-id" {
 				t.Errorf("the vendor was sent %s", k)
 			}
 		}

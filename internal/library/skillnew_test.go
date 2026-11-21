@@ -4,8 +4,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"slices"
 	"sort"
 	"strings"
@@ -30,17 +32,25 @@ func fakeSkillRepo(t *testing.T, files map[string]string) (asked map[string]int,
 			if r.URL.Query().Get("recursive") != "1" {
 				t.Errorf("tree asked without recursive: %s", r.URL)
 			}
+			// git's ref:path is that folder's own list, as GitHub
+			// answers it; no such folder is a 404
+			_, under, _ := strings.Cut(r.URL.Path[strings.Index(r.URL.Path, "/git/trees/")+len("/git/trees/"):], ":")
 			var tree gitTree
 			paths := []string{}
 			for p := range files {
-				paths = append(paths, p)
+				if under == "" {
+					paths = append(paths, p)
+				} else if rest, in := strings.CutPrefix(p, under+"/"); in {
+					paths = append(paths, rest)
+				}
+			}
+			if len(paths) == 0 {
+				http.NotFound(w, r)
+				return
 			}
 			sort.Strings(paths)
 			for _, p := range paths {
-				tree.Tree = append(tree.Tree, struct {
-					Path string `json:"path"`
-					Type string `json:"type"`
-				}{p, "blob"})
+				tree.Tree = append(tree.Tree, gitEntry{Path: p, Type: "blob"})
 			}
 			b, _ := json.Marshal(tree)
 			etag := `"` + hashOf(b) + `"`
@@ -208,12 +218,250 @@ func TestNewBase(t *testing.T) {
 	}
 	tree := &gitTree{}
 	for _, p := range []string{"SKILL.md.bak", "skills/a/SKILL.md", "skills/a/b/SKILL.md", "skills/node_modules/x/SKILL.md", "skills/.x/SKILL.md", "skills/c/d/e/f/SKILL.md", "skills/c/d/e/f/g/SKILL.md", "other/z/SKILL.md"} {
-		tree.Tree = append(tree.Tree, struct {
-			Path string `json:"path"`
-			Type string `json:"type"`
-		}{p, "blob"})
+		tree.Tree = append(tree.Tree, gitEntry{Path: p, Type: "blob"})
 	}
 	if got := skillDirsIn(tree, "skills"); !slices.Equal(got, []string{"skills/a", "skills/c/d/e/f"}) {
 		t.Errorf("skills in the tree: %v", got)
+	}
+}
+
+// char1eslu's report (#1217): skills from majiayu000/claude-arsenal and
+// two MCP servers, each switched off for every agent, were saved with
+// "agents": null; a check then offered the repository's other skills with
+// agents null, and the page threw drawing them. Every list of agents is
+// [] when it is empty: in library.json, and in what the page is sent.
+func TestNoAgentsIsEmptyNotNull(t *testing.T) {
+	sandbox(t)
+	fakeSkillRepo(t, map[string]string{
+		"skills/codex-fluent/SKILL.md":        "---\nname: codex-fluent\ndescription: Fluent\n---\n",
+		"skills/codex-retrospective/SKILL.md": "---\nname: codex-retrospective\ndescription: Retro\n---\n",
+		"skills/skill-usage-stats/SKILL.md":   "---\nname: skill-usage-stats\ndescription: Stats\n---\n",
+	})
+	ok(t)(InstallSkills("majiayu000/claude-arsenal", []string{"skills/codex-fluent", "skills/codex-retrospective"}, []string{"claude"}))
+	ok(t)(SkillAgents("codex-fluent", []string{}))
+	ok(t)(SkillAgents("codex-retrospective", []string{}))
+	ok(t)(SaveServer("", Server{Name: "stitch", Transport: "http", URL: "https://stitch.googleapis.com/mcp", Agents: []string{"gemini"}}))
+	ok(t)(ServerAgents("stitch", []string{}))
+	mu.Lock()
+	l, _ := load()
+	l.SeenSkills = nil // the third is new to the next check
+	l.save()
+	mu.Unlock()
+	check(t)
+
+	b, err := os.ReadFile(path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), `"agents": null`) {
+		t.Errorf("library.json has agents null:\n%s", b)
+	}
+	v, err := Read(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(v.NewSkills) != 1 || v.NewSkills[0].Name != "skill-usage-stats" {
+		t.Fatalf("new skills: %+v", v.NewSkills)
+	}
+	page, _ := json.Marshal(v)
+	if strings.Contains(string(page), `"agents":null`) {
+		t.Errorf("the page is sent agents null: %s", page)
+	}
+
+	// added, it is on the agents the others are on: none, as []
+	ok(t)(AddNewSkills([]string{v.NewSkills[0].ID}))
+	b, _ = os.ReadFile(path())
+	if !strings.Contains(string(b), `"skill-usage-stats"`) || strings.Contains(string(b), `"agents": null`) {
+		t.Errorf("after adding the new one:\n%s", b)
+	}
+}
+
+// UFO404's report (#1964): the market lists ui-ux-pro-max from
+// nextlevelbuilder/ui-ux-pro-max-skill, whose SKILL.md is only in
+// .claude/skills; its other skills are both there and in cli/assets/skills.
+// The install found no ui-ux-pro-max ("has no skill ui-ux-pro-max any
+// more"). The paths are the repository's own.
+func TestMarketInstallsASkillKeptInClaudesFolder(t *testing.T) {
+	sandbox(t)
+	files := map[string]string{
+		".claude/skills/ui-ux-pro-max/SKILL.md":          "---\nname: ui-ux-pro-max\ndescription: \"UI/UX design intelligence for web, mobile, and desktop.\"\n---\n\n# UI/UX Pro Max - Design Intelligence\n",
+		".claude/skills/ui-ux-pro-max/scripts/search.py": "print('hi')\n",
+		".github/workflows/ci.yml":                       "on: push\n",
+		"skills/.hidden/SKILL.md":                        "---\nname: hidden\ndescription: not a skill folder\n---\n",
+		".claude-plugin/x/SKILL.md":                      "---\nname: plugin-x\ndescription: not in a skills folder\n---\n",
+	}
+	for _, n := range []string{"banner-design", "brand", "design-system", "design", "slides", "ui-styling"} {
+		md := "---\nname: " + n + "\ndescription: Brand voice, visual identity.\n---\n"
+		files[".claude/skills/"+n+"/SKILL.md"] = md
+		files["cli/assets/skills/"+n+"/SKILL.md"] = md
+	}
+	fakeSkillRepo(t, files)
+
+	p, err := ProbeSkills("nextlevelbuilder/ui-ux-pro-max-skill")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var paths []string
+	for _, c := range p.Candidates {
+		paths = append(paths, c.Path)
+	}
+	want := []string{"cli/assets/skills/banner-design", "cli/assets/skills/brand", "cli/assets/skills/design", "cli/assets/skills/design-system", "cli/assets/skills/slides", "cli/assets/skills/ui-styling", ".claude/skills/ui-ux-pro-max"}
+	if !slices.Equal(paths, want) {
+		t.Errorf("candidates %v, want %v", paths, want)
+	}
+
+	r, err := InstallMarketSkill("nextlevelbuilder/ui-ux-pro-max-skill", "ui-ux-pro-max", []string{"claude"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(r.Installed, []string{"ui-ux-pro-max"}) {
+		t.Errorf("installed %v", r.Installed)
+	}
+	if _, err := os.Stat(skillDir("ui-ux-pro-max") + "/scripts/search.py"); err != nil {
+		t.Errorf("the skill's files weren't installed: %v", err)
+	}
+
+	// the check for new skills reads the tree the same way
+	tree := &gitTree{}
+	for p := range files {
+		tree.Tree = append(tree.Tree, gitEntry{Path: p, Type: "blob"})
+	}
+	sort.Slice(tree.Tree, func(i, j int) bool { return tree.Tree[i].Path < tree.Tree[j].Path })
+	got := skillDirsIn(tree, "")
+	sort.Strings(got)
+	sort.Strings(want)
+	if !slices.Equal(got, want) {
+		t.Errorf("skills in the tree %v, want %v", got, want)
+	}
+}
+
+// 碳碳双键's report on Discord: tw93/waza keeps its eight skills in skills/
+// and again in plugins/waza/skills/ (some copies behind the top ones), and
+// typing "tw93/waza" listed 16 skills, each twice. The paths are the
+// repository's own.
+func TestRepoWithAPluginCopyListsEachSkillOnce(t *testing.T) {
+	sandbox(t)
+	names := []string{"check", "health", "hunt", "learn", "read", "think", "ui", "write"}
+	files := map[string]string{}
+	for _, n := range names {
+		files["skills/"+n+"/SKILL.md"] = "---\nname: " + n + "\ndescription: the top one\n---\n"
+		files["plugins/waza/skills/"+n+"/SKILL.md"] = "---\nname: " + n + "\ndescription: the plugin's copy\n---\n"
+	}
+	fakeSkillRepo(t, files)
+
+	p, err := ProbeSkills("tw93/waza")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var paths []string
+	for _, c := range p.Candidates {
+		paths = append(paths, c.Path)
+		if c.Description != "the top one" {
+			t.Errorf("%s: %q, want the top one", c.Path, c.Description)
+		}
+	}
+	var want []string
+	for _, n := range names {
+		want = append(want, "skills/"+n)
+	}
+	if !slices.Equal(paths, want) {
+		t.Errorf("candidates %v, want %v", paths, want)
+	}
+
+	tree := &gitTree{}
+	for p := range files {
+		tree.Tree = append(tree.Tree, gitEntry{Path: p, Type: "blob"})
+	}
+	sort.Slice(tree.Tree, func(i, j int) bool { return tree.Tree[i].Path < tree.Tree[j].Path })
+	if got := skillDirsIn(tree, ""); !slices.Equal(got, want) {
+		t.Errorf("skills in the tree %v, want %v", got, want)
+	}
+}
+
+// stablyai/orca's file list answers 200 with ~10 MB of JSON, over the 8 MB
+// apiGet once read; the cut-off body then failed to parse as "unexpected
+// end of JSON input". A list that size is read and understood.
+func TestRepoTreeBigList(t *testing.T) {
+	// ~10 MB of entries, the shape GitHub answers for orca
+	tree := &gitTree{}
+	for i := 0; i < 60_000; i++ {
+		tree.Tree = append(tree.Tree, gitEntry{
+			Path: fmt.Sprintf("apps/desktop/src/renderer/components/panels/sidebar/file%05d.ts", i),
+			Type: "blob", Mode: "100644", SHA: "e488653ba64c6cfc3551ec46454b965421d50176", Size: 321,
+		})
+	}
+	tree.Tree = append(tree.Tree, gitEntry{Path: "skills/orca/SKILL.md", Type: "blob", Mode: "100644", SHA: "a438021d7b90192e2c0c4802e6cff1b0df8bb203"})
+	b, err := json.Marshal(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(b) <= 8<<20 {
+		t.Fatalf("fixture is %d bytes, not over the old cap", len(b))
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(b)
+	}))
+	defer srv.Close()
+	oldA := githubAPI
+	githubAPI = srv.URL
+	defer func() { githubAPI = oldA }()
+
+	got, err := repoTree("stablyai/orca", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Tree) != len(tree.Tree) {
+		t.Fatalf("read %d of %d entries", len(got.Tree), len(tree.Tree))
+	}
+	if dirs := skillDirsIn(got, "skills"); !slices.Equal(dirs, []string{"skills/orca"}) {
+		t.Errorf("skills in it: %v", dirs)
+	}
+}
+
+// zhaoxuya520/reverse-skill keeps a routing SKILL.md in its skills folder
+// (#4572): reverse-skill-router, an entry that routes to the skills beside
+// it. The folder is a skill and a collection at once, and only the router
+// was listed: every skill under it was hidden behind it. A folder that
+// holds several skills beside its own SKILL.md is both, and offers them
+// all; a lone SKILL.md inside another skill (skills/pentest-tools/
+// src-hunter here, skills/dbs-save/inner in TestCheckSkillsFindsNewOnes)
+// still isn't a skill of its own.
+func TestRepoWithARoutingSkillListsItsSkillsToo(t *testing.T) {
+	sandbox(t)
+	files := map[string]string{
+		"skills/SKILL.md":                          "---\nname: reverse-skill-router\ndescription: Routes to the skills beside it\n---\n",
+		"skills/apk-reverse/SKILL.md":              "---\nname: apk-reverse\ndescription: APKs\n---\n",
+		"skills/ida-reverse/SKILL.md":              "---\nname: ida-reverse\ndescription: Binaries\n---\n",
+		"skills/pentest-tools/SKILL.md":            "---\nname: pentest-tools\ndescription: Tools\n---\n",
+		"skills/pentest-tools/src-hunter/SKILL.md": "---\nname: src-hunter\ndescription: Sources\n---\n",
+	}
+	fakeSkillRepo(t, files)
+
+	// the repository's root and its skills folder offer the same: the
+	// router and the skills under it
+	want := []string{"skills", "skills/apk-reverse", "skills/ida-reverse", "skills/pentest-tools"}
+	for _, in := range []string{"zhaoxuya520/reverse-skill", "https://github.com/zhaoxuya520/reverse-skill/tree/HEAD/skills"} {
+		p, err := ProbeSkills(in)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var paths []string
+		for _, c := range p.Candidates {
+			paths = append(paths, c.Path)
+		}
+		sort.Strings(paths)
+		if !slices.Equal(paths, want) {
+			t.Errorf("%s: candidates %v, want %v", in, paths, want)
+		}
+	}
+
+	// the check for new skills reads the tree the same way
+	tree := &gitTree{}
+	for p := range files {
+		tree.Tree = append(tree.Tree, gitEntry{Path: p, Type: "blob"})
+	}
+	sort.Slice(tree.Tree, func(i, j int) bool { return tree.Tree[i].Path < tree.Tree[j].Path })
+	if got := skillDirsIn(tree, ""); !slices.Equal(got, want) {
+		t.Errorf("skills in the tree %v, want %v", got, want)
 	}
 }

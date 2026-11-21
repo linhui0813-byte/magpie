@@ -115,8 +115,8 @@ function server(lang, theme, variant, asked, exported) {
 }
 
 const L = {
-  en: { strip: ["Tokens", "Requests", "Cost", "Cache hit rate", "Output speed"], metric: ["Tokens", "Cost", "Requests", "Speed"], split: ["Model", "Model · provider", "Provider", "Agent"], all: "All providers", none: "No known price for these requests" },
-  zh: { strip: ["Token", "请求", "费用", "缓存命中率", "输出速度"], metric: ["Token", "费用", "请求", "速度"], split: ["模型", "模型 · 供应商", "供应商", "Agent"], all: "全部供应商", none: "这些请求没有已知价格" },
+  en: { strip: ["Tokens", "Requests", "Cost", "Cache hit rate", "Output speed"], metric: ["Tokens", "Cost", "Requests", "Speed", "Traffic"], split: ["Model", "Model · provider", "Provider", "Agent"], all: "All providers", none: "No known price for these requests" },
+  zh: { strip: ["Token", "请求", "费用", "缓存命中率", "输出速度"], metric: ["Token", "费用", "请求", "速度", "流量"], split: ["模型", "模型 · 供应商", "供应商", "Agent"], all: "全部供应商", none: "这些请求没有已知价格" },
 };
 // where each split is among #ledSplit's choices
 const SPLIT = { model: 0, modelAt: 1, provider: 2, agent: 3 };
@@ -134,11 +134,12 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       const context = ctx || (await browser.newContext({ viewport: { width, height: 760 }, reducedMotion: "reduce" }));
       const p = await context.newPage();
       p.setDefaultTimeout(5000);
+      p.setDefaultNavigationTimeout(60000);
       p.on("pageerror", (e) => errors.push(e.message));
       await p.route("**/*", server(lang, theme, variant, asked, exported));
       await p.goto("http://magpie.test/");
       await p.locator('[data-view="usage"]').first().click();
-      await p.locator("#usageTab .opt").nth(1).click();
+      await p.locator(":is(#usageTab .opt, .nav-s):visible").nth(1).click();
       if (variant !== "none") await p.locator("#ledRank .rk").first().waitFor();
       if (["many", "unpriced"].includes(variant)) await p.locator("#ledSplit .opt").nth(SPLIT.provider).click();
       return { p, errors, asked, exported, context };
@@ -157,7 +158,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         assert.deepEqual(await p.locator("#ledKpi .k").allTextContents(), w.strip);
         assert.equal(await p.locator("#ledKpi .blk").nth(0).getAttribute("title"), Math.round(allTokens).toLocaleString(lang === "zh" ? "zh-CN" : "en"));
         const rate = TOTALS.cache_read / (TOTALS.input + TOTALS.cache_write + TOTALS.cache_read);
-        assert.equal(await p.locator("#ledKpi .blk").nth(3).locator(".v").textContent(), (100 * rate).toFixed(1) + "%");
+        assert.equal(await p.locator("#ledKpi .blk").nth(3).locator(".v").textContent(), (100 * rate).toFixed(2) + "%");
         assert.equal(parseFloat(await p.locator("#ledKpi .blk").nth(3).locator(".meter i").evaluate((i) => i.style.width)), parseFloat((100 * rate).toFixed(1)));
         assert.equal(await p.locator("#ledKpi .blk").nth(1).locator(".v").textContent(), String(TOTALS.calls));
 
@@ -251,7 +252,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
           const global = new Set();
           for (const sel of rules) for (const part of sel.split(",")) { const m = part.trim().match(/^\.([\w-]+)$/); if (m) global.add(m[1]); }
           const used = new Set();
-          for (const e of document.querySelectorAll("#ledDash *, #ledWrap .led-detail *")) for (const c of e.classList) used.add(c);
+          for (const e of document.querySelectorAll("#ledDash *, #ledReqPane .led-detail *")) for (const c of e.classList) used.add(c);
           const ok = new Set(["segs", "opt", "grow", "text", "sess-pick", "skeleton", "thumb", "on", "ic"]); // the page's shared parts, used as meant
           // the new parts' own, prefixed names are theirs; a short bare one may be anyone's
           const own = /^(led|pu|cx|rk|usage)-/;
@@ -282,7 +283,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
 
     for (const lang of ["en", "zh"]) await t.test(lang + ": a day filters details while keeping the whole chart", async () => {
       const { p, asked, exported, errors } = await open(lang, lang === "zh" ? "dark" : "light", { variant: "daily" });
-      await p.locator("#period .opt").nth(1).click();
+      await p.locator("#period .opt").nth(2).click();
       const days = p.locator("#ledChart .led-day");
       await days.nth(6).waitFor();
       const initial = await p.locator("#ledChart rect.col").evaluateAll((rs) => rs.map((r) => [r.dataset.day, r.dataset.k, r.getAttribute("height"), r.dataset.color]));
@@ -323,7 +324,9 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
           blocked = true;
           asked.push(q);
           await held;
-          await route.fulfill({ json: page(q, "daily") });
+          // the read the second click moved on from is cancelled (Vantiboo1ean):
+          // there is no one left to answer
+          await route.fulfill({ json: page(q, "daily") }).catch(() => {});
           return;
         }
         await route.fallback();
@@ -336,7 +339,9 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       delay();
       const beforeClicks = asked.length, clickedDay = await days.nth(4).getAttribute("data-day");
       const requested = p.waitForRequest((r) => new URL(r.url()).searchParams.get("day") === clickedDay);
-      const selectedReply = reply(clickedDay), clearedReply = reply("");
+      // the first read either answers late or, as now, is cancelled by the second
+      const cancelled = p.waitForEvent("requestfailed", (r) => new URL(r.url()).pathname === "/api/usage/requests" && new URL(r.url()).searchParams.get("day") === clickedDay);
+      const selectedReply = Promise.race([reply(clickedDay), cancelled]), clearedReply = reply("");
       await days.nth(4).dispatchEvent("click");
       await requested;
       await days.nth(4).dispatchEvent("click");
@@ -410,13 +415,32 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       // are divided — the two sources the Requests tab draws keep none of it
       assert.equal(await p.locator("#ledKpi .blk").nth(2).evaluate((b) => getComputedStyle(b).borderLeftWidth), "0px", "a totals card starting a row carries no left line");
       assert.notEqual(await p.locator("#ledKpi .blk").nth(2).evaluate((b) => getComputedStyle(b).borderTopWidth), "0px", "and the rows are divided");
-      await p.locator("#usageTab .opt").nth(1).click();
+      await p.locator(":is(#usageTab .opt, .nav-s):visible").nth(1).click();
       await p.locator("#ledVia .blk").first().waitFor();
       assert.equal(await p.locator("#ledVia .blk").nth(1).evaluate((b) => getComputedStyle(b).borderLeftWidth), "0px", "a source cell carries no line between cells of one bar");
+      // a hovered end cell rounds as the bar does, never a square corner over
+      // its rounded one: stacked, the first rounds on top and the last below
+      const hoverFirst = async () => {
+        // wheel to it as a reader would: the app puts back a scroll no reader asked for
+        const first = p.locator("#ledVia .blk").first();
+        await p.mouse.move(280, 400);
+        for (let i = 0; i < 20 && (await first.boundingBox()).y > 300; i++) await p.mouse.wheel(0, 200), await p.waitForTimeout(60);
+        const r = await first.boundingBox();
+        await p.mouse.move(r.x + 8, r.y + 8);
+      };
+      const corners = (n) => p.locator("#ledVia .blk").nth(n).evaluate((b) => { const c = getComputedStyle(b); return [c.borderTopLeftRadius, c.borderTopRightRadius, c.borderBottomRightRadius, c.borderBottomLeftRadius].join(" "); });
+      await hoverFirst();
+      if (process.env.ARTIFACT_DIR) await p.screenshot({ clip: await p.locator("#ledVia").boundingBox(), path: path.join(process.env.ARTIFACT_DIR, `via-hover-${engine}-narrow.png`) });
+      assert.equal(await corners(0), "11px 11px 0px 0px", "the first source rounds on top");
+      assert.equal(await corners(-1), "0px 0px 11px 11px", "the last rounds below");
       // the chart follows the window
       await p.setViewportSize({ width: 1100, height: 760 });
       await p.waitForTimeout(300);
       const wider = await p.locator("#ledChart svg").boundingBox();
+      await hoverFirst();
+      if (process.env.ARTIFACT_DIR) await p.screenshot({ clip: await p.locator("#ledVia").boundingBox(), path: path.join(process.env.ARTIFACT_DIR, `via-hover-${engine}-wide.png`) });
+      assert.equal(await corners(0), "11px 0px 0px 11px", "in a row the first source rounds at its left");
+      assert.equal(await corners(-1), "0px 11px 11px 0px", "and the last at its right");
       assert(wider.width > 500 && (await p.locator("#ledRank").boundingBox()).x > wider.x + wider.width - 5, `beside it again: ${svg.width} → ${wider.width}`);
       if (process.env.ARTIFACT_DIR) await p.screenshot({ path: path.join(process.env.ARTIFACT_DIR, `chart-${engine}-dark.png`) });
       assert.deepEqual(errors, []);

@@ -32,43 +32,51 @@ func TestTrayMenuLabels(t *testing.T) {
 		{"de", enSys, "de"},
 		{"system", func() string { return "de-DE" }, "de"},
 		{"", func() string { return "de_AT.UTF-8" }, "de"},
+		{"zh-TW", enSys, "zh-TW"},
+		{"system", func() string { return "zh-Hant-TW" }, "zh-TW"},
+		{"system", func() string { return "zh-TW" }, "zh-TW"},
+		{"system", func() string { return "zh-HK" }, "zh-TW"},
+		{"system", func() string { return "zh-Hant" }, "zh-TW"},
+		{"", func() string { return "zh_TW.UTF-8" }, "zh-TW"},
+		{"", func() string { return "zh_HK" }, "zh-TW"},
+		{"system", func() string { return "zh-Hans-HK" }, "zh"},
+		{"system", func() string { return "zh-SG" }, "zh"},
 	} {
 		if got := trayLang(c.pref, c.sys); got != c.want {
 			t.Errorf("trayLang(%q, %s) = %s, want %s", c.pref, c.sys(), got, c.want)
 		}
 	}
-	de := trayMenuLabels("de", "0.1.500", "0.1.501")
-	if de != (trayLabels{"magpie öffnen", "Version 0.1.500", "Zum Aktualisieren auf 0.1.501 neu starten", "magpie beenden"}) {
+	de := trayMenuLabels("de", "0.1.500", "0.1.501", false)
+	if de != (trayLabels{"magpie öffnen", "Zugangspunkt pausieren", "Version 0.1.500", "Zum Aktualisieren auf 0.1.501 neu starten", "magpie beenden"}) {
 		t.Errorf("de: %+v", de)
 	}
-	for lang, want := range map[string]string{"de": "en", "en": "en", "zh": "zh"} {
+	for lang, want := range map[string]string{"de": "en", "en": "en", "zh": "zh", "zh-TW": "zh"} {
 		if got := notesLang(lang); got != want {
 			t.Errorf("notesLang(%q) = %q, want %q", lang, got, want)
 		}
 	}
-	zh := trayMenuLabels("zh", "0.1.500", "")
-	if zh != (trayLabels{"打开 magpie", "版本 0.1.500", "重启以更新", "退出 magpie"}) {
+	zh := trayMenuLabels("zh", "0.1.500", "", false)
+	if zh != (trayLabels{"打开 magpie", "暂停网关", "版本 0.1.500", "重启 magpie", "退出 magpie"}) {
 		t.Errorf("zh: %+v", zh)
 	}
-	if ja := trayMenuLabels("ja", "0.1.500", ""); ja != (trayLabels{"magpie を開く", "バージョン 0.1.500", "再起動してアップデート", "magpie を終了"}) {
+	if tw := trayMenuLabels("zh-TW", "0.1.500", "0.1.501", false); tw != (trayLabels{"開啟 magpie", "暫停閘道", "版本 0.1.500", "重新啟動以更新到 0.1.501", "結束 magpie"}) {
+		t.Errorf("zh-TW: %+v", tw)
+	}
+	if ja := trayMenuLabels("ja", "0.1.500", "", false); ja != (trayLabels{"magpie を開く", "ゲートウェイを一時停止", "バージョン 0.1.500", "magpie を再起動", "magpie を終了"}) {
 		t.Errorf("ja: %+v", ja)
 	}
-	if l := trayMenuLabels("zh", "0.1.500", "0.1.501"); l.restart != "重启以更新到 0.1.501" {
+	if l := trayMenuLabels("zh", "0.1.500", "0.1.501", false); l.restart != "重启以更新到 0.1.501" {
 		t.Errorf("zh restart: %q", l.restart)
 	}
-	en := trayMenuLabels("en", "0.1.500", "0.1.501")
-	if en != (trayLabels{"Open magpie", "Version 0.1.500", "Restart to Update to 0.1.501", "Quit magpie"}) {
+	en := trayMenuLabels("en", "0.1.500", "0.1.501", false)
+	if en != (trayLabels{"Open magpie", "Pause Gateway", "Version 0.1.500", "Restart to Update to 0.1.501", "Quit magpie"}) {
 		t.Errorf("en: %+v", en)
 	}
-	env := map[string]string{"LC_ALL": "C", "LANG": "zh_CN.UTF-8"}
-	if got := envLang(func(k string) string { return env[k] }); got != "zh_CN.UTF-8" {
-		t.Errorf("envLang skips C: %q", got)
-	}
-	if got := firstAppleLang("(\n    \"zh-Hans-CN\",\n    \"en-US\"\n)\n"); got != "zh-Hans-CN" {
-		t.Errorf("firstAppleLang: %q", got)
-	}
-	if got := firstAppleLang("(\n    en,\n    \"zh-Hans\"\n)\n"); got != "en" {
-		t.Errorf("firstAppleLang unquoted: %q", got)
+	// paused, the menu's line resumes the gateway (me2seeks on X)
+	for lang, want := range map[string]string{"en": "Resume Gateway", "zh": "恢复网关", "zh-TW": "恢復閘道", "ja": "ゲートウェイを再開", "de": "Zugangspunkt fortsetzen"} {
+		if l := trayMenuLabels(lang, "0.1.500", "", true); l.pause != want {
+			t.Errorf("%s paused: %q, want %q", lang, l.pause, want)
+		}
 	}
 }
 
@@ -101,7 +109,7 @@ func TestSettingsLangRelabelsTray(t *testing.T) {
 	if calls != 1 {
 		t.Fatalf("relabelled %d times after en → zh, want 1", calls)
 	}
-	if l := trayMenuLabels(trayLang(settings.Load().Lang, systemLang), "1", ""); l.quit != "退出 magpie" {
+	if l := trayMenuLabels(trayLang(settings.Load().Lang, systemLang), "1", "", false); l.quit != "退出 magpie" {
 		t.Fatalf("after the change the menu reads %+v", l)
 	}
 }

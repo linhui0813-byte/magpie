@@ -32,11 +32,11 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/yetone/magpie/internal/appdir"
 	"github.com/yetone/magpie/internal/catalog"
+	"github.com/yetone/magpie/internal/filelock"
 )
 
 // ChatGPTAPIID is the subscription's id, as a provider and in logins.json.
@@ -70,7 +70,12 @@ const (
 	SIWCUsageURL = "https://chatgpt.com/settings/usage"
 )
 
-var siwcClient = &http.Client{Timeout: 30 * time.Second}
+var siwcClient = &http.Client{Timeout: 30 * time.Second, CheckRedirect: KeepsCredentials}
+
+// siwcNoUsage is what a ChatGPT API account's usage line says: OpenAI's
+// API tells no plan usage, and the account added as ChatGPT (Codex's
+// backend) does.
+const siwcNoUsage = "a ChatGPT API account's usage isn't told through OpenAI's API, only at " + SIWCUsageURL + "; the same account added as ChatGPT shows it here"
 
 // ErrSIWCSignIn is an account OpenAI no longer refreshes: it must be
 // signed in again.
@@ -105,7 +110,21 @@ func siwcSide() []sideLogin {
 	})
 }
 
-func siwcLoginList() []Login { return loginsOf(siwcSide()) }
+// siwcLoginList lists the accounts, one OpenAI no longer refreshes said
+// on its row (siwcRefresh's Lapsed), which then offers Sign in again: the
+// lapse was kept, and shown nowhere but on a failed request.
+func siwcLoginList() []Login {
+	ls := siwcSide()
+	for i := range ls {
+		if ls[i].Lapsed == "" {
+			ls[i].Lapsed = ls[i].saved.Lapsed
+		}
+		if c, ok := siwcSaved(ls[i].saved); ok {
+			ls[i].Until = chatgptUntil(time.Now(), c.IDToken, c.Access)
+		}
+	}
+	return loginsOf(ls)
+}
 
 func switchSIWCLogin(user string) error { return switchSideLogin(ChatGPTAPIID, user, siwcSide()) }
 
@@ -114,12 +133,15 @@ func setSIWCLoginOn(user string, on bool) error {
 }
 
 // forgetSIWCLogin removes an account, and has OpenAI revoke its refresh
-// token: signed out, it is gone there too.
+// token: signed out, it is gone there too. The revoke leaves through the
+// account's own proxy, as its sign-in and requests did (#1663), read
+// before the account is forgotten.
 func forgetSIWCLogin(user string) error {
+	via := ViaLogin(context.Background(), ChatGPTAPIID, user)
 	return forgetSideLogin(ChatGPTAPIID, user, siwcSide(), func(l savedLogin) {
 		if c, ok := siwcSaved(l); ok {
 			go func() {
-				ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+				ctx, cancel := context.WithTimeout(via, 15*time.Second)
 				defer cancel()
 				_ = siwcRevoke(ctx, c)
 			}()
@@ -229,7 +251,9 @@ func siwcSignedIn(ctx context.Context, code, clientID, verifier, redirect, nonce
 	if err != nil {
 		return "", "", err
 	}
-	if err := addSideLogin(savedLogin{Agent: ChatGPTAPIID, User: user, Plan: plan, Auth: auth}, "", func(savedLogin) {}); err != nil {
+	if err := keepLogin(ctx, func() error {
+		return addSideLogin(savedLogin{Agent: ChatGPTAPIID, User: user, Plan: plan, Auth: auth}, "", func(savedLogin) {})
+	}); err != nil {
 		return "", "", err
 	}
 	// signed in again: whatever OpenAI refused before is over
@@ -368,9 +392,11 @@ func siwcFromToken(tok siwcTokenReply, c siwcCreds) (siwcCreds, error) {
 var siwcDead = []string{"invalid_grant", "invalid_refresh_token", "token_expired", "refresh_token_expired",
 	"refresh_token_invalidated", "refresh_token_reused"}
 
-// siwcRefreshing keeps two requests from refreshing at once: the refresh
-// token rotates, and the second would send the one the first used up.
-var siwcRefreshing sync.Mutex
+// siwcRefreshing keeps two requests from refreshing at once, in this
+// magpie and across magpies (two run at once while a restart hands the
+// gateway over): the refresh token rotates, and the second would send the
+// one the first used up. The account is looked up again once it is held.
+var siwcRefreshing = filelock.Mutex{Path: func() string { return loginsPath() + ".siwc.lock" }}
 
 // siwcFresh is an account's credentials with an access token that isn't
 // about to expire, refreshed when it is, or when force is set (OpenAI
@@ -611,6 +637,24 @@ func siwcBody(body []byte) []byte {
 			}
 		}
 	}
+	// the conversation is named, as on a Codex account: OpenAI keeps a
+	// ChatGPT sign-in's cached prompt by it (#933)
+	if k, _ := m["prompt_cache_key"].(string); k == "" {
+		own, _ := m["instructions"].(string)
+		input, _ := m["input"].([]any)
+		if k = conversationKey(own, input); k != "" {
+			m["prompt_cache_key"] = k
+		}
+	}
+	// GPT-6.2 reads top-level instructions after the input, uncached
+	// every turn: they go first in it (InstructionsAfterInput)
+	if own, _ := m["instructions"].(string); own != "" {
+		if model, _ := m["model"].(string); InstructionsAfterInput(model) {
+			input, _ := m["input"].([]any)
+			m["input"] = append([]any{DeveloperMessage(own)}, input...)
+			delete(m, "instructions")
+		}
+	}
 	if tools, ok := m["tools"].([]any); ok {
 		if tools = siwcOwnTools(tools); len(tools) == 0 {
 			delete(m, "tools")
@@ -701,12 +745,15 @@ func siwcExplain(status int, body []byte) string {
 func siwcProvider(l Login) Provider {
 	user := l.User
 	a := &Account{Agent: ChatGPTAPIID, User: user, Plan: l.Plan, Stream: true}
-	a.sign = func(ctx context.Context, req *http.Request, _ []byte) error {
+	a.sign = func(ctx context.Context, req *http.Request, body []byte) error {
 		c, err := siwcFresh(ctx, user, false)
 		if err != nil {
 			return err
 		}
 		req.Header.Set("Authorization", "Bearer "+c.Access)
+		if body != nil {
+			sessionHeaders(req.Header, body)
+		}
 		return nil
 	}
 	a.body = siwcBody

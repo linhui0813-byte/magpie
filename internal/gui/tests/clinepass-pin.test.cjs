@@ -1,6 +1,6 @@
 // Run with Node's test runner and Playwright on the module path; see README.md.
 // ClinePass's DeepSeek models pinned to DeepSeek's own API (White Immortal
-// on Discord): the editor of a Cline provider has the tick, as saved; Save
+// on Discord), and its GLM models to Z.ai's (sdytman): the editor of a Cline provider has the tick, as saved; Save
 // posts pinUpstream as ticked. The Cline plugin's provider, an account's
 // editor, has it too (ARNO on Discord). Another provider's editor has no
 // such tick. In English and Chinese.
@@ -54,7 +54,7 @@ function serve(lang, posts) {
   };
 }
 
-const words = { en: { tick: "DeepSeek models only from DeepSeek's own API", save: "Save" }, zh: { save: "保存" } };
+const words = { en: { tick: "DeepSeek and GLM models only from their makers' own APIs", save: "Save" }, zh: { save: "保存" } };
 
 for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium", "webkit"])) {
   for (const lang of ["en", "zh"]) {
@@ -64,23 +64,33 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       t.after(() => browser.close());
       const page = await (await browser.newContext({ viewport: { width: 900, height: 760 }, reducedMotion: "reduce" })).newPage();
       page.setDefaultTimeout(5000);
+      page.setDefaultNavigationTimeout(60000);
       const errors = [];
       page.on("pageerror", (e) => errors.push(e.message));
       const posts = [];
       await page.route("**/*", serve(lang, posts));
       await page.goto("http://magpie.test/?view=providers");
       const zh = await page.evaluate(() => [
-        "DeepSeek models only from DeepSeek's own API", "Upstream",
-        "Cline serves a model from any host its gateway picks; pinned, a request for a DeepSeek model goes only to DeepSeek, which keeps its prompt cache, and fails when DeepSeek can't take it",
+        "DeepSeek and GLM models only from their makers' own APIs", "Upstream",
+        "Since 2026-11-06 Cline refuses a pinned DeepSeek or GLM request with 403, so magpie sends them unpinned and Cline picks the host; only glm-5.3-flash still asks Z.ai",
       ].map((k) => I18N.zh[k]));
       assert(zh.every(Boolean), "every string has its Chinese");
+      for (const l of ["zh-TW", "ja", "de"]) {
+        const has = await page.evaluate(([l, k]) => !!I18N[l][k], [l, "Since 2026-11-06 Cline refuses a pinned DeepSeek or GLM request with 403, so magpie sends them unpinned and Cline picks the host; only glm-5.3-flash still asks Z.ai"]);
+        assert(has, `the Upstream note has its ${l}`);
+      }
       if (lang === "zh") w.tick = zh[0];
 
       await page.locator(".row.provider", { hasText: "ClinePass" }).click();
+      // Upstream is under Advanced
+      { const adv = page.locator(".editor details.advanced"); await adv.waitFor({ state: "attached" }); if (!(await adv.evaluate((d) => d.open))) await adv.locator(":scope > summary").click(); }
       const tick = page.locator(".editor label.pin-upstream");
       await tick.waitFor();
       assert.equal((await tick.textContent()).trim(), w.tick);
       assert.equal(await tick.locator("input").isChecked(), false, "not pinned as saved");
+      // the note says what the tick does since Cline refused providerOptions (#5442)
+      const note = await tick.locator("input").evaluate((i) => (i.getAttribute("aria-describedby") || "").split(" ").map((id) => document.getElementById(id)?.textContent).filter(Boolean).join(" "));
+      assert.equal(note, lang === "zh" ? zh[2] : "Since 2026-11-06 Cline refuses a pinned DeepSeek or GLM request with 403, so magpie sends them unpinned and Cline picks the host; only glm-5.3-flash still asks Z.ai");
       await tick.locator("input").check();
       const n = posts.length;
       await page.locator(".editor .bar").getByRole("button", { name: w.save, exact: true }).click();
@@ -106,7 +116,8 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       assert.equal(posts.at(-1).body.pinUpstream, false);
 
       await page.locator(".row.provider", { hasText: "Relay" }).click();
-      await page.locator(".editor input.price-rate").waitFor();
+      // Relay sets nothing under Advanced, so its editor opens folded
+      await page.locator(".editor details.advanced:not([open]) input.price-rate").waitFor({ state: "attached" });
       assert.equal(await page.locator(".editor label.pin-upstream").count(), 0, "only a Cline provider has it");
       assert.deepEqual(errors, []);
     });

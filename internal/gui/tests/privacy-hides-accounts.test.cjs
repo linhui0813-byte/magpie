@@ -5,7 +5,7 @@
 // accounts is chosen on this computer it follows Mask personal data;
 // turning Mask personal data on turns it on; and Privacy has the Hide
 // accounts switch itself. A choice made with the switch is kept over it.
-// English and Chinese; no backend, the API is faked here.
+// Mask personal data's description says so. Every language; no backend, the API is faked here.
 const assert = require("node:assert/strict");
 const fs = require("node:fs/promises");
 const path = require("node:path");
@@ -39,13 +39,20 @@ function serve(lang, settings, saved) {
   };
 }
 
+// sub: Mask personal data's description, which says it turns Hide accounts on too
 const words = {
-  en: { personal: "Mask personal data", hide: "Hide accounts", on: "On", off: "Off" },
-  zh: { personal: "脱敏个人信息", hide: "账号打码", on: "开启", off: "关闭" },
+  en: { personal: "Mask personal data", hide: "Hide accounts", on: "On", off: "Off",
+    sub: "Emails, phone numbers, ID and bank card numbers too. Turning it on turns on Hide accounts as well" },
+  zh: { personal: "脱敏个人信息", hide: "账号打码", on: "开启", off: "关闭", sub: "邮箱、手机号、身份证号和银行卡号也一并脱敏。打开时会一并打开「账号打码」" },
+  "zh-TW": { personal: "脫敏個人資訊", hide: "帳號打碼", on: "開啟", off: "關閉", sub: "郵箱、手機號、身份證號和銀行卡號也一併脫敏。開啟時會一併開啟「帳號打碼」" },
+  ja: { personal: "個人情報をマスク", hide: "アカウントを隠す", on: "オン", off: "オフ",
+    sub: "メールアドレス、電話番号、ID 番号、銀行カード番号もマスクします。オンにすると「アカウントを隠す」もオンになります" },
+  de: { personal: "Personenbezogene Daten maskieren", hide: "Konten verbergen", on: "An", off: "Aus",
+    sub: "Auch E-Mail-Adressen, Telefonnummern, Ausweis- und Bankkartennummern. Eingeschaltet schaltet es auch „Konten verbergen“ ein" },
 };
 
 for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium", "webkit"])) {
-  for (const lang of ["en", "zh"]) {
+  for (const lang of (process.env.LANGS ? process.env.LANGS.split(",") : Object.keys(words))) {
     const w = words[lang];
     test(`${engine} ${lang}: masking personal data hides the accounts on screen`, async (t) => {
       const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: "chromium" }));
@@ -56,6 +63,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await context.addInitScript((v) => { try { if (v === null) localStorage.removeItem("magpie.maskEmails"); else localStorage.setItem("magpie.maskEmails", v); } catch {} }, stored);
         const page = await context.newPage();
         page.setDefaultTimeout(5000);
+        page.setDefaultNavigationTimeout(60000);
         page.on("pageerror", (e) => errors.push(e.message));
         await page.route("**/*", serve(lang, settings, saved));
         await page.goto(url);
@@ -94,18 +102,41 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       // personal data on turns it on
       const settings = { ...base(), redactPersonal: false }, saved = [];
       page = await open(settings, null, "http://magpie.test/?view=settings&tab=privacy", saved);
-      const row = (name) => page.locator("#redactList .row", { has: page.locator(".name", { hasText: new RegExp("^" + name + "$") }) });
+      const row = (name) => page.locator("#setPage-privacy .list .row", { has: page.locator(".name", { hasText: new RegExp("^" + name + "$") }) });
       await row(w.hide).waitFor();
-      const y0 = await page.evaluate(() => scrollY);
+      // it says it turns Hide accounts on, before it is clicked
+      assert.equal((await row(w.personal).locator(".sub").textContent()).trim(), w.sub);
+      const top = () => page.evaluate(() => document.querySelector("#view-settings").scrollTop);
+      const y0 = await top();
       await row(w.personal).getByRole("button", { name: w.on, exact: true }).click();
       await page.waitForFunction(() => localStorage.getItem("magpie.maskEmails") === "1");
       await page.waitForFunction(() => document.querySelector("#usageMask")?.getAttribute("aria-pressed") === "true");
       assert.ok(saved.some((b) => b.redactPersonal === true), JSON.stringify(saved));
       // the switch here says so, and turns it off again
-      await page.waitForFunction((on) => [...document.querySelectorAll("#redactList .row")].some((r) => r.querySelector(".name")?.textContent === on.hide && r.querySelector(".opt.on")?.textContent === on.on), w);
-      await row(w.hide).getByRole("button", { name: w.off, exact: true }).click();
+      await page.waitForFunction((on) => [...document.querySelectorAll("#setPage-privacy .list .row")].some((r) => r.querySelector(".name")?.textContent === on.hide && r.querySelector(".opt.on")?.textContent === on.on), w);
+      assert.equal(await top(), y0, "a click never scrolls");
+      // since Settings' search box (51042630e) the row sits under the
+      // window's foot at this size, and the reader scrolls to it with the
+      // wheel. Playwright's own scroll into view is code, which the click
+      // guard puts back; WebKit's click came after that and hit the foot
+      // (#1632)
+      const off = row(w.hide).getByRole("button", { name: w.off, exact: true });
+      const under = () => off.evaluate((b) => b.getBoundingClientRect().bottom > document.querySelector("footer.foot").getBoundingClientRect().top - 4);
+      await page.mouse.move(450, 300);
+      for (let i = 0; i < 30 && (await under()); i++) { await page.mouse.wheel(0, 60); await page.waitForTimeout(30); }
+      assert.equal(await under(), false, "the wheel brings the row into sight");
+      // a wheel step can still be landing (Chromium scrolls off the main
+      // thread): the place the click is measured from is where it settles
+      await page.evaluate(() => new Promise((done) => {
+        const v = document.querySelector("#view-settings");
+        let last = v.scrollTop, still = 0;
+        const look = () => { if (v.scrollTop === last) still++; else { last = v.scrollTop; still = 0; } if (still >= 10) done(); else requestAnimationFrame(look); };
+        requestAnimationFrame(look);
+      }));
+      const y1 = await top();
+      await off.click();
       await page.waitForFunction(() => localStorage.getItem("magpie.maskEmails") === "0");
-      assert.equal(await page.evaluate(() => scrollY), y0, "a click never scrolls");
+      assert.equal(await top(), y1, "a click never scrolls");
       // no coloured left border on the new row
       assert.equal(await row(w.hide).evaluate((r) => getComputedStyle(r).borderLeftWidth), "0px");
       await page.context().close();

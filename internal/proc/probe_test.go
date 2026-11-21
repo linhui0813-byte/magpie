@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -126,4 +127,103 @@ func TestProbeForgotten(t *testing.T) {
 		}
 	}
 	t.Fatal("a probe that answered is still listed")
+}
+
+// a process the group's kill missed — forked as the signal went out, as
+// one of a launcher calling itself was (#1278) — is ended too: the group is
+// signalled again while any of it lives. The first signal here misses all
+// of it, as the race misses one.
+func TestProbeKillEndsWhatTheSignalMissed(t *testing.T) {
+	sh, pidFile := probeScript(t)
+	old := signalGroup
+	var mu sync.Mutex
+	missed := false
+	signalGroup = func(pgid int) error {
+		mu.Lock()
+		first := !missed
+		missed = true
+		mu.Unlock()
+		if first {
+			return nil // sent, and reached nobody
+		}
+		return old(pgid)
+	}
+	t.Cleanup(func() { signalGroup = old })
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	done := runProbe(ProbeContext(ctx, sh))
+	pid := childPid(t, pidFile, done)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the probe went on after its context ended")
+	}
+	if !gone(pid) {
+		t.Fatalf("what the probe started (pid %d) outlived a kill that missed it once", pid)
+	}
+}
+
+// missFor has the group's signal reach nobody for d from its first call, as
+// signals racing a launcher's forks do, and puts the real one back after.
+func missFor(t *testing.T, d time.Duration) {
+	old := signalGroup
+	var mu sync.Mutex
+	var first time.Time
+	signalGroup = func(pgid int) error {
+		mu.Lock()
+		if first.IsZero() {
+			first = time.Now()
+		}
+		missing := time.Since(first) < d
+		mu.Unlock()
+		if missing {
+			return nil // sent, and reached nobody
+		}
+		return old(pgid)
+	}
+	t.Cleanup(func() { signalGroup = old })
+}
+
+// magpie exiting right after EndProbes leaves nothing of a probe running,
+// even when the kill missed some of it at first (JJ-Lin's case on #1278):
+// EndProbes returned after the first signal, the exit ended the loop that
+// signals the group again, and the missed child lived on, adopted by init.
+// The exit is a real one: the test runs itself as a magpie that ends its
+// probes and exits at once.
+func TestEndProbesThenExitLeavesNothing(t *testing.T) {
+	if os.Getenv("MAGPIE_PROC_EXIT_HELPER") == "1" {
+		missFor(t, 300*time.Millisecond)
+		sh, pidFile := probeScript(t)
+		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cancel()
+		done := runProbe(ProbeContext(ctx, sh))
+		pid := childPid(t, pidFile, done)
+		os.Stdout.WriteString("child " + strconv.Itoa(pid) + "\n")
+		EndProbes()
+		os.Exit(0)
+	}
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(self, "-test.run=^TestEndProbesThenExitLeavesNothing$")
+	cmd.Env = append(os.Environ(), "MAGPIE_PROC_EXIT_HELPER=1")
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("the exiting magpie: %v\n%s", err, out)
+	}
+	var pid int
+	for _, l := range strings.Split(string(out), "\n") {
+		if s, ok := strings.CutPrefix(l, "child "); ok {
+			pid, _ = strconv.Atoi(s)
+		}
+	}
+	if pid == 0 {
+		t.Fatalf("the exiting magpie named no child:\n%s", out)
+	}
+	t.Cleanup(func() { _ = syscall.Kill(pid, syscall.SIGKILL) })
+	if !gone(pid) {
+		t.Fatalf("what the probe started (pid %d) outlived magpie's exit after EndProbes", pid)
+	}
 }

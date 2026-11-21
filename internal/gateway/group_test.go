@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/yetone/magpie/internal/provider"
+	"github.com/yetone/magpie/internal/routes"
 )
 
 // keyed is a vendor that says which key each request came with, and
@@ -39,12 +40,21 @@ func fresh(t *testing.T) {
 	t.Setenv("USERPROFILE", home) // Windows finds the home there
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	t.Setenv("XDG_CACHE_HOME", t.TempDir())
-	restingUntil.Lock()
-	restingUntil.m = map[string]time.Time{}
-	restingUntil.Unlock()
+	// a rest recorded here is let go when the test ends too: the next test
+	// in the process may not come through fresh (#6717)
+	noRests()
+	t.Cleanup(noRests)
 	sticks.Lock()
 	sticks.m = map[string]stick{}
 	sticks.Unlock()
+	provider.ForgetReorders()
+	t.Cleanup(provider.ForgetReorders)
+	refusedSeals.Lock()
+	refusedSeals.m = map[string]sealsRefused{}
+	refusedSeals.Unlock()
+	overflowLearned.Lock()
+	overflowLearned.m = map[string]map[string]refusedLong{}
+	overflowLearned.Unlock()
 	turnRules.Lock()
 	turnRules.m = map[string]turnRule{}
 	turnRules.Unlock()
@@ -56,9 +66,12 @@ func fresh(t *testing.T) {
 	levelled.Unlock()
 	provider.ForgetCopilotForTest()
 	provider.ForgetRemoteCardsForTest()
+	provider.ForgetKeptCardsForTest()
+	provider.ForgetCodexClientsForTest()
 	remoteRefreshes.Lock()
 	remoteRefreshes.at = map[string]time.Time{}
 	remoteRefreshes.Unlock()
+	resetAuthThrottle()
 	forgetRouting()
 }
 
@@ -68,11 +81,9 @@ func fresh(t *testing.T) {
 // rather than a turn on, or with a failure already counted.
 func forgetRouting() {
 	routed.Lock()
-	routed.turn, routed.used, routed.failures = map[string]int{}, map[string]tokenUse{}, map[string]int{}
+	routed.used, routed.failures, routed.slow, routed.answered = map[string]tokenUse{}, map[string]int{}, map[string]slowRun{}, map[string]time.Time{}
 	routed.Unlock()
-	wrr.Lock()
-	wrr.m = map[string]*wrrRound{}
-	wrr.Unlock()
+	routes.Forget()
 }
 
 // setHome makes dir the home, where Windows (USERPROFILE) finds it too.
@@ -236,7 +247,7 @@ func TestRoutingGroups(t *testing.T) {
 			ids = append(ids, e.ID)
 		}
 	}
-	if got := strings.Join(ids, " "); got != "group/auto-m a/m a/only-a b/vendor/m" {
+	if got := strings.Join(ids, " "); got != "auto/m a/m a/only-a b/vendor/m" {
 		t.Fatalf("catalog: %s", got)
 	}
 	if err := provider.SaveGroup(provider.Group{Name: "Mine", Members: []string{"b/vendor/m", "a/only-a"}, Routing: provider.Ordered}); err != nil {
@@ -254,6 +265,21 @@ func TestRoutingGroups(t *testing.T) {
 	r := s.trace.routes[len(s.trace.routes)-1]
 	if r.Group == nil || r.Group.ID != "mine" || len(r.Order) != 2 || r.Order[0].Provider != "b" || r.Order[1].Model != "only-a" {
 		t.Fatalf("trace: %+v", r)
+	}
+
+	// renamed, the group still takes requests on its old id (xinvxueyuan
+	// on Discord); renamed back, it is its own id again
+	if err := provider.RenameGroup("mine", "ours"); err != nil {
+		t.Fatal(err)
+	}
+	if code, body := postAs(t, s, "", `{"model":"group/mine","messages":[{"role":"user","content":"hi"}]}`); code != 200 || !strings.Contains(body, "from ka") {
+		t.Fatalf("old id: %d %s", code, body)
+	}
+	if r := s.trace.routes[len(s.trace.routes)-1]; r.Group == nil || r.Group.ID != "ours" {
+		t.Fatalf("old id trace: %+v", r)
+	}
+	if err := provider.RenameGroup("ours", "mine"); err != nil {
+		t.Fatal(err)
 	}
 
 	// removing one magpie found hides it; showing it brings it back
@@ -319,9 +345,7 @@ func TestAffinity(t *testing.T) {
 		serveOn(t, "aff", "k1", []string{"m"}, v, "k2")
 		provider.SetRouting("aff", c.routing)
 		provider.SetAffinity("aff", c.affinity)
-		routed.Lock()
-		delete(routed.turn, "aff")
-		routed.Unlock()
+		routes.Forget("aff")
 		s := New()
 		postAs(t, s, "s1", first)
 		postAs(t, s, "s1", c.body)
@@ -465,9 +489,7 @@ func TestRotateSpreadsSessions(t *testing.T) {
 		if err := provider.SaveGroup(provider.Group{Name: "Pair", Members: []string{"ga/m1", "gb/m2"}, Routing: provider.Rotate, Affinity: provider.AffinitySession}); err != nil {
 			t.Fatal(err)
 		}
-		routed.Lock()
-		delete(routed.turn, provider.GroupPrefix+"pair")
-		routed.Unlock()
+		routes.Forget(provider.GroupPrefix + "pair")
 		return a, b, New()
 	}
 	// which of the two the request went to

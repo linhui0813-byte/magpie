@@ -2,9 +2,9 @@ package sessions
 
 import (
 	"encoding/json"
+	"html"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"time"
 
@@ -12,6 +12,7 @@ import (
 	"github.com/tidwall/jsonc"
 
 	"github.com/yetone/magpie/internal/appdir"
+	"github.com/yetone/magpie/internal/lazyre"
 )
 
 // Factory's Droid keeps a session under its sessions folder
@@ -64,10 +65,21 @@ func readDroidStart(path string) (droidStart, bool) {
 	return s, ok
 }
 
+// droidCallers is whose subagent each transcript is, as its session_start
+// line said when the listing last read it: a listing runs on every poll, and
+// opening every session's transcript for its first line each time cost more
+// than the rest of the listing together.
+var droidCallers listMemo[string]
+
 func droidFiles() []file {
+	if !Reads("droid") {
+		return nil
+	}
 	root := filepath.Join(FactoryDir(), "sessions")
 	a, _ := filepath.Glob(filepath.Join(root, "*.jsonl"))
 	b, _ := filepath.Glob(filepath.Join(root, "*", "*.jsonl"))
+	callers := droidCallers.round()
+	defer callers.done()
 	var out []file
 	for _, p := range append(a, b...) {
 		id := strings.TrimSuffix(filepath.Base(p), ".jsonl")
@@ -78,17 +90,21 @@ func droidFiles() []file {
 		if !stat(&f) {
 			continue
 		}
+		calling, _ := callers.get(p, f.size, f.mod.Time(), func() (string, bool) {
+			s, ok := readDroidStart(p)
+			return s.Calling, ok
+		})
 		// what it spent and on which model are in its settings
 		m := file{path: strings.TrimSuffix(p, ".jsonl") + ".settings.json"}
 		if stat(&m) {
-			f.manifest = m.path
+			f.w().manifest = m.path
 			f.size += m.size
 			if m.mod.After(f.mod) {
 				f.mod = m.mod
 			}
 		}
-		if s, ok := readDroidStart(p); ok && s.Calling != "" && s.Calling != id && safeID.MatchString(s.Calling) {
-			f.key, f.main = "droid:"+s.Calling, false
+		if calling != "" && calling != id && safeID.MatchString(calling) {
+			f.key, f.main = "droid:"+calling, false
 		}
 		out = append(out, f)
 	}
@@ -137,101 +153,195 @@ func droidText(raw json.RawMessage) string {
 	return strings.Join(parts, "\n")
 }
 
-// droidTools are a message's tool calls, by name.
-func droidTools(raw json.RawMessage) []string {
+// droidTools are a message's tool calls: each tool's name, and the skill
+// a call of Droid's Skill tool calls up ({"skill":"<name>"}).
+func droidTools(raw json.RawMessage) [][2]string {
 	var blocks []struct {
-		Type string `json:"type"`
-		Name string `json:"name"`
+		Type  string `json:"type"`
+		Name  string `json:"name"`
+		Input struct {
+			Skill    any    `json:"skill"`
+			FilePath string `json:"file_path"`
+			Path     string `json:"path"`
+		} `json:"input"`
 	}
 	json.Unmarshal(raw, &blocks)
-	var out []string
+	var out [][2]string
 	for _, b := range blocks {
 		if b.Type == "tool_use" && b.Name != "" {
-			out = append(out, b.Name)
+			skill, _ := b.Input.Skill.(string)
+			if b.Name != "Skill" {
+				skill = ""
+			}
+			if strings.EqualFold(b.Name, "Read") {
+				skill = routedSkill(b.Input.FilePath + b.Input.Path)
+			}
+			out = append(out, [2]string{b.Name, strings.TrimSpace(skill)})
 		}
 	}
 	return out
 }
 
-// parseDroid reads a session's transcript whole, with its settings.
-func parseDroid(f file) *state {
-	s := &state{Size: f.size, Mod: f.mod.UnixNano()}
-	// a fork's lines up to upto are copies of its source's
-	upto, copied := "", false
-	first := true
-	scan(f.path, 0, func(b []byte) {
-		var l droidLine
-		if json.Unmarshal(b, &l) != nil {
-			return
+// droidPicked is what droid says, in the <system-notification> it puts
+// after a prompt, of each skill the user called up by typing /<name> (or
+// a builtin one droid ran for them); <skill filePath="…"> and
+// <name>…</name> follow it, the name HTML-escaped.
+const droidPicked = "selected the following skill for immediate execution"
+
+// droidSlashSkills are the skills a prompt calls up by /<name>: one for
+// each notification droid added. A /<name> no skill has gets none, and
+// is sent as typed.
+func droidSlashSkills(text string) []string {
+	var out []string
+	for rest := text; ; {
+		i := strings.Index(rest, droidPicked)
+		if i < 0 {
+			return out
 		}
-		if first {
-			first = false
-			var st droidStart
-			if l.Type == "session_start" && json.Unmarshal(b, &st) == nil {
-				s.ID, s.Cwd, s.Named = st.ID, st.Cwd, title(st.Title)
-				if s.Named == "New Session" {
-					s.Named = "" // Droid's until it names one
-				}
-				if st.LastCwd != "" {
-					s.Cwd = st.LastCwd
-				}
-				upto, copied = st.Forked, st.Forked != ""
-			}
-			return
+		rest = rest[i+len(droidPicked):]
+		j := strings.Index(rest, "<skill filePath=\"")
+		if j < 0 {
+			return out
 		}
-		if l.Type != "message" {
-			return
+		rest = rest[j:]
+		k := strings.Index(rest, "\">\n<name>")
+		if k < 0 || strings.ContainsRune(rest[:k], '\n') {
+			continue
 		}
-		if copied {
-			if l.ID == upto {
-				copied = false
-			}
-			return
+		rest = rest[k+len("\">\n<name>"):]
+		name, after, ok := strings.Cut(rest, "</name>")
+		if !ok || strings.ContainsRune(name, '\n') {
+			continue
 		}
-		at := tsAt(b, false)
-		s.saw(at, f.main)
-		switch l.Message.Role {
-		case "user":
-			text := droidText(l.Message.Content)
-			if strings.TrimSpace(text) == "" || !f.main {
-				return
-			}
-			if strings.HasPrefix(strings.TrimSpace(text), "<") {
-				if s.First == "" {
-					s.First = untagged(text)
-				}
-				return
-			}
-			s.day(dateOf(at)).Prompts++
-			if s.Title == "" {
-				s.Title = title(text)
-			}
-		case "assistant":
-			if f.main {
-				s.day(dateOf(at)).Replies++
-			}
-			for _, name := range droidTools(l.Message.Content) {
-				s.tool(at, name, "")
-			}
+		rest = after
+		if name = strings.TrimSpace(html.UnescapeString(name)); name != "" {
+			out = append(out, name)
 		}
+	}
+}
+
+// droidCarry is what a read of a Droid transcript carries on with: where
+// it read to, whether it has passed the session_start line and a fork's
+// copied lines, and what its settings' total was counted as, to be taken
+// back when the total moves on.
+type droidCarry struct {
+	Tail    *tail  `json:"tail,omitempty"`
+	Started bool   `json:"started,omitempty"`
+	Upto    string `json:"upto,omitempty"`
+	Copied  bool   `json:"copied,omitempty"`
+	// the settings' total, as counted
+	Date   string `json:"date,omitempty"`
+	Model  string `json:"model,omitempty"`
+	Tokens Tokens `json:"tokens,omitzero"`
+}
+
+// parseDroid reads a session's transcript, with its settings. Droid only
+// appends to a transcript, so one read before is read on from where that
+// read left off, and its settings' running total, counted on the day of
+// the last message, is taken back and counted again as it is now. A
+// transcript cut short or replaced is read whole again.
+func parseDroid(f file, old *state) *state {
+	var s *state
+	var c droidCarry
+	var off int64
+	if old != nil && old.more().Droid != nil && old.more().Droid.Tail.holds(f.path) {
+		s, c, off = old.clone(), *old.more().Droid, old.more().Droid.Tail.Off
+		s.dropUse(c.Date, c.Model, c.Tokens)
+	} else {
+		s = &state{}
+	}
+	s.Size, s.Mod = f.size, f.mod.UnixNano()
+	end, err := scanAt(f.path, off, nil, func(b []byte, _, _ int64) bool {
+		droidLineOf(s, &c, b, f.main)
+		return true
 	})
-	if f.manifest != "" {
+	c.Tail = nil
+	if err == nil {
+		c.Tail = markTail(f.path, end, 0, end)
+	}
+	c.Date, c.Model, c.Tokens = "", "", Tokens{}
+	if f.m().manifest != "" {
 		var st droidSettings
-		if b, err := os.ReadFile(f.manifest); err == nil && json.Unmarshal(b, &st) == nil && st.Usage != nil {
+		if b, err := os.ReadFile(f.m().manifest); err == nil && json.Unmarshal(b, &st) == nil && st.Usage != nil {
 			when := s.Last
 			if when.IsZero() {
 				when = time.Unix(0, s.Mod)
 			}
 			u := st.Usage
-			s.use(dateOf(when), droidModelName(st.Model), Tokens{Input: u.Input, Output: u.Output, CacheRead: u.CacheRead, CacheWrite: u.CacheWrite})
+			c.Date, c.Model = dateOf(when), droidModelName(st.Model)
+			c.Tokens = Tokens{Input: u.Input, Output: u.Output, CacheRead: u.CacheRead, CacheWrite: u.CacheWrite}
+			s.use(c.Date, c.Model, c.Tokens)
 		}
 	}
+	s.own().Droid = &c
 	return s
+}
+
+// droidLineOf counts one line of a transcript.
+func droidLineOf(s *state, c *droidCarry, b []byte, main bool) {
+	var l droidLine
+	if json.Unmarshal(b, &l) != nil {
+		return
+	}
+	if !c.Started {
+		c.Started = true
+		var st droidStart
+		if l.Type == "session_start" && json.Unmarshal(b, &st) == nil {
+			s.ID, s.Cwd, s.own().Named = st.ID, st.Cwd, title(st.Title)
+			if s.more().Named == "New Session" {
+				s.own().Named = "" // Droid's until it names one
+			}
+			if st.LastCwd != "" {
+				s.Cwd = st.LastCwd
+			}
+			// a fork's lines up to Upto are copies of its source's
+			c.Upto, c.Copied = st.Forked, st.Forked != ""
+		}
+		return
+	}
+	if l.Type != "message" {
+		return
+	}
+	if c.Copied {
+		if l.ID == c.Upto {
+			c.Copied = false
+		}
+		return
+	}
+	at := tsAt(b, false)
+	s.saw(at, main)
+	switch l.Message.Role {
+	case "user":
+		text := droidText(l.Message.Content)
+		for _, k := range droidSlashSkills(text) {
+			s.tool(at, "", k)
+		}
+		if strings.TrimSpace(text) == "" || !main {
+			return
+		}
+		if strings.HasPrefix(strings.TrimSpace(text), "<") {
+			if s.more().First == "" {
+				s.own().First = untagged(text)
+			}
+			return
+		}
+		s.day(dateOf(at)).Prompts++
+		if s.Title == "" {
+			s.Title = title(text)
+		}
+	case "assistant":
+		if main {
+			s.day(dateOf(at)).Replies++
+		}
+		for _, c := range droidTools(l.Message.Content) {
+			s.tool(at, c[0], c[1])
+		}
+	}
 }
 
 // droidSlot is the tail droid gives a custom model's id made of its name
 // ("custom:Kimi-K2-[Groq]-0").
-var droidSlot = regexp.MustCompile(`(-\[[^\]]*\])?-\d+$`)
+var droidSlot = lazyre.New(`(-\[[^\]]*\])?-\d+$`)
 
 // droidModelName is a session's model as it is priced: a custom one
 // ("custom:<id>") is the model its entry in droid's settings asks for —

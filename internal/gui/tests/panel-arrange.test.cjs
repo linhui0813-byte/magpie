@@ -18,8 +18,8 @@ const quotas = [
   { provider: "kimi", name: "Kimi Code 的一个名字很长很长的订阅 with a long name", icon: "kimi-color", windows: [{ name: "Weekly", used: 30 }] },
 ];
 
-function serve(lang, posts, fail) {
-  const settings = { theme: "light", lang, tray: "panel", quotaLeft: false, currency: "usd", usageOrder: [], panelUsageHidden: ["kimi"] };
+function serve(lang, posts, fail, saved = {}) {
+  const settings = { theme: "light", lang, tray: "panel", quotaLeft: false, currency: "usd", usageOrder: [], panelUsageHidden: ["kimi"], ...saved };
   return async (route) => {
     const url = new URL(route.request().url());
     const json = (data) => route.fulfill({ json: data });
@@ -62,6 +62,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       });
       const page = await context.newPage();
       page.setDefaultTimeout(5000);
+      page.setDefaultNavigationTimeout(60000);
       page.on("pageerror", (e) => errors.push(e.message));
       const handler = serve(lang, posts, fail);
       await page.route("**/*", handler);
@@ -149,7 +150,21 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await page.waitForFunction(() => document.querySelector("#panelQuota .pq-arow")?.dataset.key === "deepseek");
       assert.deepEqual(posts.splice(0), [{ order: ["deepseek", "codex", "claude", "kimi"] }]);
 
-      // Done: the cards in the new order, DeepSeek left out
+      // Done: the cards in the new order, DeepSeek left out. The reader brings
+      // Done out from under the sticky tabs with the wheel: Playwright's own
+      // scroll into view is code's, and the page puts it back
+      await page.mouse.move(220, 150);
+      for (let i = 0; i < 20; i++) {
+        const [by, was] = await page.evaluate(() => {
+          const d = document.querySelector("#panelQuota .pq-done").getBoundingClientRect();
+          const top = document.querySelector("#ptabs").getBoundingClientRect().bottom, v = document.querySelector("#view-agents");
+          const foot = v.getBoundingClientRect().bottom;
+          return [d.top < top ? d.top - top - 8 : d.bottom > foot ? d.bottom - foot + 8 : 0, v.scrollTop];
+        });
+        if (!by) break;
+        await page.mouse.wheel(0, by);
+        await page.waitForFunction((was) => document.querySelector("#view-agents").scrollTop !== was, was, { timeout: 1000 }).catch(() => {});
+      }
       await page.locator("#panelQuota .pq-done").click();
       await page.waitForFunction(() => !document.querySelector("#panelQuota .pq-arow"));
       assert.deepEqual(await cards(), ["codex|x@y.z", "claude|a@b.c", "kimi"]);
@@ -158,8 +173,16 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       assert.equal(await page.evaluate(() => window.__scrolled), 0, "nothing scrolled itself");
 
       // a menu bar cell for the hidden one opens its card all the same
-      await page.evaluate(() => panelQuotaFocus("deepseek"));
-      await page.waitForFunction(() => document.querySelector('#panelQuota .pq-card[data-card="deepseek"]')?.classList.contains("flash"));
+      // Reduced motion makes the flash one frame long, which a poll can miss:
+      // what lit up is recorded as it is lit
+      await page.evaluate(() => {
+        window.__flashed = [];
+        new MutationObserver((ms) => {
+          for (const m of ms) if (m.target.matches?.(".pq-card.flash")) window.__flashed.push(m.target.dataset.card);
+        }).observe(document.querySelector("#panelQuota"), { subtree: true, attributes: true, attributeFilter: ["class"] });
+        panelQuotaFocus("deepseek");
+      });
+      await page.waitForFunction(() => window.__flashed.includes("deepseek") && document.querySelector('#panelQuota .pq-card[data-card="deepseek"]'));
       assert.equal(await page.locator("#panelQuota .pq-foot .pq-hidden").count(), 0, "the one asked for isn't counted as hidden");
       // put away, the panel hides it again
       await page.evaluate(() => {
@@ -168,20 +191,14 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       });
       await page.waitForFunction(() => !document.querySelector('#panelQuota .pq-card[data-card="deepseek"]'));
 
-      // the Usage page keeps every card, in the shared order
+      // the Usage page keeps every card, in the shared order. The window reads
+      // the settings saved above from magpie, as it does: set into state by hand,
+      // its own load could answer after and put the first order back
       const win = await context.newPage();
       win.on("pageerror", (e) => errors.push(e.message));
-      // The second window reads the preferences the first one saved. A
-      // manual state edit here raced the initial /api/state response.
-      let releaseInitial;
-      const initial = new Promise(done => releaseInitial = done);
-      await win.route("**/*", async route => {
-        if (new URL(route.request().url()).pathname === "/api/state") await initial;
-        return handler(route);
-      });
+      await win.route("**/*", serve(lang, [], {}, { usageOrder: ["deepseek", "codex", "claude", "kimi"], panelUsageHidden: ["deepseek"] }));
       await win.goto("http://magpie.test/?view=usage&tab=usage");
-      releaseInitial();
-      await win.waitForFunction(() => document.querySelectorAll("#subscriptionUsage > [data-key]").length >= 4 && document.querySelector("#subscriptionUsage > [data-key]")?.dataset.key === "deepseek");
+      await win.waitForFunction(() => document.querySelectorAll("#subscriptionUsage > [data-key]").length >= 4);
       assert.deepEqual(await win.evaluate(() => [...new Set([...document.querySelectorAll("#subscriptionUsage > [data-key]")].map((c) => c.dataset.key))]), ["deepseek", "codex", "claude", "kimi"]);
 
       assert.deepEqual(errors, []);

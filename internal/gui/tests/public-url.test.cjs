@@ -1,9 +1,11 @@
 // Run with Node's test runner and Playwright on the module path; see README.md.
 // MAGPIE_PUBLIC_URL is the address other machines are told to reach the
 // gateway at: the connect page offers it beside this computer's loopback
-// address, and its hint tells the truth about the states — loopback, open to
-// the network (listening beyond loopback with nothing shared, which is the
-// Docker image's default), and a network address that needs a gateway key.
+// address, and its hint tells the truth about the states — loopback, on the
+// network (MAGPIE_ADDR beyond loopback with nothing shared, which is the
+// Docker image's default: its host and other machines need a gateway key,
+// and no "This computer · any key" is offered), and a network address that
+// needs a gateway key.
 // English and Chinese, Chromium and WebKit; no backend, the API is faked
 // here.
 const assert = require("node:assert/strict");
@@ -17,17 +19,18 @@ const network = "https://magpie.example.com";
 const cases = [
   {
     name: "loopback",
-    gateway: { url: "http://127.0.0.1:3999", lan: false, open: false, lanURLs: [] },
+    gateway: { url: "http://127.0.0.1:3999", lan: false, onNetwork: false, lanURLs: [] },
     note: "loopback",
   },
   {
-    name: "open",
-    gateway: { url: "http://127.0.0.1:3999", lan: false, open: true, lanURLs: [] },
-    note: "open",
+    name: "on the network",
+    gateway: { url: "http://127.0.0.1:3999", lan: true, onNetwork: true, lanURLs: [] },
+    note: "remote",
+    noAnyKey: true,
   },
   {
     name: "network address",
-    gateway: { url: "http://127.0.0.1:3999", lan: true, open: false, lanURLs: [network] },
+    gateway: { url: "http://127.0.0.1:3999", lan: true, onNetwork: false, lanURLs: [network] },
     note: "loopback",
     picks: "remote",
   },
@@ -35,12 +38,10 @@ const cases = [
 const words = {
   en: {
     loopback: "Loopback only · the key can be anything",
-    open: "Open to the network · anyone who reaches it can use any key",
     remote: "Local network · an enabled gateway key is required",
   },
   zh: {
     loopback: "仅限本机回环 · 密钥可以随意填",
-    open: "已开放到网络 · 任何能连上的人用任意密钥都能访问",
     remote: "局域网接入需要已启用的网关密钥",
   },
 };
@@ -73,7 +74,9 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         const context = await browser.newContext({ viewport: { width: 1100, height: 1000 }, reducedMotion: "reduce" });
         t.after(() => context.close());
         const page = await context.newPage();
+        await page.addInitScript(() => { try { localStorage.setItem("magpie.gwConnectFolded", "0"); } catch {} }); // Connect opened, as a user who reads it
         page.setDefaultTimeout(6000);
+        page.setDefaultNavigationTimeout(60000);
         const errors = [];
         page.on("pageerror", (e) => errors.push(e.message));
         const gateway = { running: true, mine: true, window: true, models: 0, calls: [], groups: [] };
@@ -86,6 +89,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
             await page.goto("http://magpie.test/?view=gateway");
             await note.waitFor();
             assert.equal(await note.textContent(), w[c.note]);
+            if (c.noAnyKey) assert.equal(await page.locator("#connect code", { hasText: /^magpie$/ }).count(), 0, "a key-less magpie is offered");
             if (!c.picks) return;
             await page.locator("#connectAddress").click();
             await page.locator(".proto-menu .pm-item", { hasText: network }).click();

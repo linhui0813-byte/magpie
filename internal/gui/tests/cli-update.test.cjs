@@ -69,6 +69,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
     const open = async (lang, posts, web = true) => {
       const page = await (await browser.newContext({ viewport: { width: 980, height: 520 } })).newPage();
       page.setDefaultTimeout(5000);
+      page.setDefaultNavigationTimeout(60000);
       page.on("pageerror", (e) => errors.push(e.message));
       await page.route("**/*", server(lang, posts, web));
       await page.goto("http://magpie.test/");
@@ -127,16 +128,24 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       assert(top > 0, "the list must be scrolled");
       const was = await page.locator(`${row("codex")} .ag-up`).evaluate((b) => b.getBoundingClientRect().top);
       await page.locator(`${row("codex")} .ag-up`).click();
-      await page.waitForTimeout(150);
+      // the busy state, not a fixed wait: the update runs while the pill is
+      // busy, so a sleep could end after it was done and the read sat out
+      // its whole 5s on a pill already gone (#3473); waiting for the busy
+      // class lands the reads inside the run whatever the load
+      await page.locator(`${row("codex")} .ag-up.busy`).waitFor();
       assert.equal(await page.locator(`${row("codex")} .ag-up`).textContent(), "Updating…");
       assert.equal(await page.locator(`${row("codex")} .ag-up.busy`).count(), 1);
+      // its ring turns inside the svg, round the viewBox's centre: a turned
+      // svg circles about a point off its centre in WebKit (owner, 10-09)
+      assert.deepEqual(await page.locator(`${row("codex")} .ag-up svg`).evaluate((s) => [getComputedStyle(s).animationName, getComputedStyle(s.firstElementChild).animationName, getComputedStyle(s.firstElementChild).transformBox]), ["none", "spin", "view-box"]);
       // clicked again while it runs: nothing more is asked
       await page.locator(`${row("codex")} .ag-up`).click({ force: true });
       await page.waitForTimeout(900);
       assert.deepEqual(posts, ["codex"]);
       assert.equal(await page.locator(`${row("codex")} .ag-ver`).textContent(), "0.159.0");
       assert.equal(await page.locator(`${row("codex")} .ag-up`).count(), 0);
-      assert.match(await page.locator("#status").textContent(), /Codex updated to 0\.159\.0/);
+      // the version it went from too (37FlowAI on X)
+      assert.equal(await page.locator("#status").textContent(), "Codex updated: 0.155.1 → 0.159.0");
       assert.equal(await view.evaluate((v) => v.scrollTop), top, "the update moved the page");
       const now = await page.locator(`${row("codex")} .ag-ver`).evaluate((b) => b.getBoundingClientRect().top);
       assert(Math.abs(now - was) <= 3, `the row moved ${now - was}px`);

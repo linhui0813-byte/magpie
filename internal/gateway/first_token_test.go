@@ -101,3 +101,44 @@ func TestGroupFirstTokenFailsOver(t *testing.T) {
 		t.Fatalf("in time: %d %s (b %d)", code, body, b.n)
 	}
 }
+
+// A group in a group times its own members' first tokens (#2246): the
+// innermost group that sets a FirstToken is the one that counts, and the
+// group asked for only times those under no group that sets one.
+func TestNestedGroupFirstToken(t *testing.T) {
+	for _, c := range []struct {
+		name         string
+		outer, inner int
+	}{
+		{"inner only", 0, 1},
+		{"inner under a longer outer", 60, 1},
+		{"outer only", 1, 0},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			fresh(t)
+			a := &slowStart{wait: 10 * time.Second}
+			b := &scripted{replies: []reply{{200, "text/event-stream", chatStreamOK}}}
+			slowOn(t, "a", a)
+			scriptedOn(t, "b", provider.Chat, b)
+			if err := provider.SaveGroup(provider.Group{Name: "In", Members: []string{"a/m", "b/m"}, Routing: provider.Ordered, FirstToken: c.inner}); err != nil {
+				t.Fatal(err)
+			}
+			if err := provider.SaveGroup(provider.Group{Name: "G", Members: []string{"group/in"}, Routing: provider.Ordered, FirstToken: c.outer}); err != nil {
+				t.Fatal(err)
+			}
+			s := New()
+			began := time.Now()
+			code, body := postAs(t, s, "", `{"model":"group/g","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+			if took := time.Since(began); took > 5*time.Second {
+				t.Fatalf("took %s", took)
+			}
+			if code != 200 || !strings.Contains(body, "from b") || a.n != 1 || b.n != 1 {
+				t.Fatalf("%d %s (a %d, b %d)", code, body, a.n, b.n)
+			}
+			r := s.trace.routes[len(s.trace.routes)-1]
+			if len(r.Tries) != 2 || r.Tries[0].Fail != failSlow || !strings.HasSuffix(r.Tries[0].Error, "no first token in 1s") {
+				t.Fatalf("tries: %+v", r.Tries)
+			}
+		})
+	}
+}

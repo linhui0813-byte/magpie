@@ -25,17 +25,24 @@ import (
 	"fmt"
 	"html"
 	"io"
+	"io/fs"
+	"mime"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/yetone/magpie/internal/edit"
+	"github.com/yetone/magpie/internal/filelock"
+	"github.com/yetone/magpie/internal/lastgood"
 	"github.com/yetone/magpie/internal/netproxy"
+	"github.com/yetone/magpie/internal/redact"
 	"github.com/yetone/magpie/internal/settings"
 	"github.com/yetone/magpie/internal/steady"
 )
@@ -72,6 +79,51 @@ var ErrExpired = errors.New("magpie's sign-in to this server has run out: sign i
 // mcp.exa.ai/mcp?login) is signed in to there. The GUI has it in Chinese.
 var ErrNoSignIn = errors.New("this server already works without signing in, so there is nothing to sign in to: the agents given it can use it as it is. A key it takes goes in Headers; a server that signs in at another address (as Exa's ?login) needs that URL")
 
+// ErrClientRefused is a server whose authorization server turned magpie's
+// registration away with 401 or 403: it admits only the clients it lists,
+// as Figma's (mcp.figma.com, a 403 "Forbidden" to any client_name it doesn't
+// list, #1619). magpie doesn't pass itself off as a listed client; a server
+// magpie isn't signed in to is given to the agents at its own address, so
+// each agent signs in there itself. The GUI has it in every language.
+var ErrClientRefused = errors.New("this server's sign-in admits only the apps it lists and turned magpie away, so magpie can't sign in for the agents. The agents given it still have the server's own address: sign in from each agent itself (in Claude Code, run /mcp and pick the server)")
+
+// ErrTurnedAway is a server whose address answered 403 with a web page
+// rather than the server's own reply: a firewall in front of it (Cloudflare's,
+// as agents.stackoverflow.com has) judged the network the request came from
+// and stopped it before the server could offer a sign-in (fremontdango on
+// Discord, where magpie said only "answered 403 and says nothing of a
+// sign-in"). The GUI has it in every language.
+var ErrTurnedAway = errors.New("a firewall in front of this server turned magpie's request away (403) before the server could offer a sign-in. It judges the network the request came from: try again on another network, or give magpie a proxy in Settings")
+
+// UnreachableError is a server magpie's first request to never got an
+// answer from: the connection was cut, refused or timed out, so the server
+// never said whether or how it signs in. It is the network between this
+// computer and Host, not the sign-in (CHENGJIAHEGOXIS on X read Notion's
+// "couldn't reach mcp.notion.com: Post …: EOF" as Notion having no
+// sign-in). Proxy is the proxy the request went through, redacted, "" when
+// it went direct; the GUI says it in every language.
+type UnreachableError struct {
+	Host, Proxy string
+	Err         error
+}
+
+func (e *UnreachableError) Error() string {
+	via := "directly, with no proxy"
+	if e.Proxy != "" {
+		via = "through the proxy " + e.Proxy
+	}
+	return fmt.Sprintf("couldn't reach %s (%s): %v", e.Host, via, e.Err)
+}
+
+func (e *UnreachableError) Unwrap() error { return e.Err }
+
+// ErrNoRegistration is a server whose sign-in doesn't let an app register
+// itself (GitHub's, 新v学员 on Discord): magpie signs in to it only as an
+// OAuth app of the user's own, made with the server's vendor, as Claude
+// Code does with --client-id. The page opens the server's fields for one
+// on it.
+var ErrNoRegistration = errors.New("the server's sign-in doesn't let an app register itself (no dynamic client registration), so magpie signs in to it only as an OAuth app of your own: make one with the server's vendor (GitHub's under Settings › Developer settings › OAuth Apps), with http://localhost/callback as its callback URL, then give its client ID and secret under \"OAuth app\" in the server's editor")
+
 // Record is magpie's sign-in to one server.
 type Record struct {
 	URL      string `json:"url"`                // the server's, as the library has it
@@ -91,23 +143,59 @@ type Record struct {
 	// Dead is a sign-in the server refused to renew: the page asks for it
 	// again
 	Dead bool `json:"dead,omitempty"`
+
+	// More than one sign-in to a server (Elorynth on X: several accounts,
+	// one in use). This record is always the one in use, so every reader of
+	// a server's sign-in (the gateway's relay, the check, a renewal) reads
+	// the account in use without knowing there are others; the others wait
+	// in Spare, and a switch swaps them. Seq keeps each account's place in
+	// the list, which a swap doesn't move. A sign-in made before accounts
+	// has none of these: it is account 1, with no label.
+	ID    string    `json:"id,omitempty"`
+	Label string    `json:"label,omitempty"`
+	Seq   int       `json:"seq,omitempty"`
+	Spare []*Record `json:"spare,omitempty"`
 }
 
-var fileMu sync.Mutex
+// fileMu is held for a change to mcp-signins.json read afresh under it,
+// across magpies too (#1674): the gateway renews a sign-in while a magpie
+// run from a terminal checks or renames a server.
+var fileMu = filelock.Mutex{Path: func() string { return path() + ".lock" }}
 
 func path() string { return filepath.Join(settings.Dir(), "mcp-signins.json") }
 
 func load() map[string]*Record {
-	m := map[string]*Record{}
-	if b, err := os.ReadFile(path()); err == nil {
-		_ = json.Unmarshal(b, &m)
-	}
+	m, _ := read()
 	return m
+}
+
+// read is the sign-ins, or their last good generation when a crash left
+// the file all zero (#1505); an error when neither reads, for a change
+// not to write them over as none.
+func read() (map[string]*Record, error) {
+	m := map[string]*Record{}
+	b, err := lastgood.Read(path(), validRecords)
+	if errors.Is(err, fs.ErrNotExist) {
+		return m, nil
+	}
+	if err != nil {
+		return m, err
+	}
+	_ = json.Unmarshal(b, &m)
+	return m, nil
+}
+
+func validRecords(b []byte) bool {
+	var m map[string]*Record
+	return json.Unmarshal(b, &m) == nil
 }
 
 func save(m map[string]*Record) error {
 	b, err := json.MarshalIndent(m, "", "  ")
 	if err != nil {
+		return err
+	}
+	if err := lastgood.Keep(path(), validRecords, 0o600); err != nil {
 		return err
 	}
 	return writePrivate(path(), append(b, '\n'))
@@ -122,30 +210,20 @@ func writePrivate(p string, b []byte) error {
 	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(p), "."+filepath.Base(p)+".*")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(tmp.Name())
-	if _, err := tmp.Write(b); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Chmod(0o600); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	return steady.Rename(tmp.Name(), p)
+	return steady.WriteFile(p, b, 0o600) // on the disk before it is renamed in
 }
 
 func update(f func(m map[string]*Record) bool) error {
 	fileMu.Lock()
 	defer fileMu.Unlock()
-	m := load()
-	if !f(m) {
+	// sign-ins that don't read are kept aside before a new one is saved
+	// (save), and never written over with none
+	m, err := read()
+	changed := f(m)
+	if err != nil && len(m) == 0 {
+		return err // what to change may be in what doesn't read
+	}
+	if !changed {
 		return nil
 	}
 	return save(m)
@@ -159,7 +237,9 @@ func Get(name string) (Record, bool) {
 	if r == nil {
 		return Record{}, false
 	}
-	return *r, true
+	c := *r
+	c.Spare = nil
+	return c, true
 }
 
 // SignedIn says whether magpie holds a sign-in to the server by that name
@@ -176,6 +256,8 @@ type Status struct {
 	SignedIn bool  `json:"signedIn"`
 	Dead     bool  `json:"dead,omitempty"`
 	At       int64 `json:"at,omitempty"`
+	// Accounts are the sign-ins, when there is more than one
+	Accounts []Account `json:"accounts,omitempty"`
 }
 
 // StatusOf is the sign-in to the server by that name at that URL.
@@ -184,7 +266,11 @@ func StatusOf(name, serverURL string) Status {
 	if !ok || r.URL != serverURL {
 		return Status{}
 	}
-	return Status{SignedIn: true, Dead: r.Dead, At: r.At}
+	st := Status{SignedIn: true, Dead: r.Dead, At: r.At}
+	if l := Accounts(name); len(l) > 1 {
+		st.Accounts = l
+	}
+	return st
 }
 
 // SignOut forgets magpie's sign-in to the server.
@@ -209,6 +295,157 @@ func Forget(name string) error {
 		delete(m, name)
 		return had
 	})
+}
+
+// Account is one of a server's sign-ins, as the page lists it.
+type Account struct {
+	ID     string `json:"id"`
+	Label  string `json:"label,omitempty"` // "" for one made before labels
+	Active bool   `json:"active,omitempty"`
+	Dead   bool   `json:"dead,omitempty"`
+	At     int64  `json:"at,omitempty"`
+}
+
+var (
+	// ErrNoAccount is an account the server has no sign-in for.
+	ErrNoAccount = errors.New("magpie has no such sign-in to this server")
+	// ErrLabelUsed is a label another sign-in to the server has.
+	ErrLabelUsed = errors.New("another sign-in to this server has that name")
+)
+
+// the record's id and place, which a sign-in made before accounts lacks
+func idOf(r *Record) string {
+	if r.ID == "" {
+		return "1"
+	}
+	return r.ID
+}
+
+func seqOf(r *Record) int {
+	if r.Seq == 0 {
+		return 1
+	}
+	return r.Seq
+}
+
+// all is the record with its spares, in the order they were signed in.
+func all(r *Record) []*Record {
+	a := *r
+	a.Spare = nil
+	out := append([]*Record{&a}, r.Spare...)
+	slices.SortStableFunc(out, func(x, y *Record) int { return seqOf(x) - seqOf(y) })
+	return out
+}
+
+// Accounts are the sign-ins to the server by that name, in the order they
+// were made; none when magpie isn't signed in to it.
+func Accounts(name string) []Account {
+	fileMu.Lock()
+	defer fileMu.Unlock()
+	r := load()[name]
+	if r == nil {
+		return nil
+	}
+	var out []Account
+	for _, x := range all(r) {
+		out = append(out, Account{ID: idOf(x), Label: x.Label, Active: x == nil || idOf(x) == idOf(r), Dead: x.Dead, At: x.At})
+	}
+	return out
+}
+
+// InUse is the id of the sign-in in use, "" when there is none.
+func InUse(name string) string {
+	for _, a := range Accounts(name) {
+		if a.Active {
+			return a.ID
+		}
+	}
+	return ""
+}
+
+// Use puts the sign-in by that id in use: what the gateway sends the
+// server, and the check, from the next request on. The agents are told
+// through Changed as for a new sign-in.
+func Use(name, id string) error {
+	found := false
+	err := update(func(m map[string]*Record) bool {
+		cur := m[name]
+		if cur == nil {
+			return false
+		}
+		if idOf(cur) == id {
+			found = true
+			return false
+		}
+		i := slices.IndexFunc(cur.Spare, func(x *Record) bool { return idOf(x) == id })
+		if i < 0 {
+			return false
+		}
+		found = true
+		was := *cur
+		was.ID, was.Seq, was.Spare = idOf(cur), seqOf(cur), nil
+		next := *cur.Spare[i]
+		next.ID, next.Seq = idOf(&next), seqOf(&next)
+		rest := slices.Clone(cur.Spare)
+		rest[i] = &was
+		next.Spare = rest
+		m[name] = &next
+		return true
+	})
+	if err != nil {
+		return err
+	}
+	if !found {
+		return ErrNoAccount
+	}
+	if Changed != nil {
+		Changed(name)
+	}
+	return nil
+}
+
+// RemoveAccount forgets one sign-in to the server. The one in use going
+// puts the first of the others in use; the last going is a sign-out.
+func RemoveAccount(name, id string) error {
+	found := false
+	err := update(func(m map[string]*Record) bool {
+		cur := m[name]
+		if cur == nil {
+			return false
+		}
+		l := all(cur)
+		i := slices.IndexFunc(l, func(x *Record) bool { return idOf(x) == id })
+		if i < 0 {
+			return false
+		}
+		found = true
+		active := idOf(cur)
+		l = slices.Delete(l, i, i+1)
+		if len(l) == 0 {
+			delete(m, name)
+			return true
+		}
+		// the one in use stays, unless it is the one removed
+		next := 0
+		if id != active {
+			next = slices.IndexFunc(l, func(x *Record) bool { return idOf(x) == active })
+		}
+		n := *l[next]
+		n.ID, n.Seq = idOf(&n), seqOf(&n)
+		n.Spare = slices.Delete(slices.Clone(l), next, next+1)
+		m[name] = &n
+		return true
+	})
+	if err != nil {
+		return err
+	}
+	if !found {
+		return ErrNoAccount
+	}
+	if Changed != nil {
+		Changed(name)
+	}
+	return nil
 }
 
 // Rename moves a sign-in to the server's new name.
@@ -265,6 +502,10 @@ func renew(ctx context.Context, name string, still func(Record) bool) (string, e
 	mu := lockOf(name)
 	mu.Lock()
 	defer mu.Unlock()
+	// one renewal at a time across magpies as well: a server that rotates
+	// its refresh tokens takes each once
+	unlock, _ := filelock.Lock(path()+".renew.lock", filelock.Wait)
+	defer unlock()
 	r, ok := Get(name)
 	if !ok {
 		return "", ErrNotSignedIn
@@ -286,7 +527,7 @@ func renew(ctx context.Context, name string, still func(Record) bool) (string, e
 	t, err := tokenRequest(ctx, r, form)
 	if err != nil {
 		var te *tokenError
-		if errors.As(err, &te) && (te.Code == "invalid_grant" || te.Code == "invalid_client" || te.Status == http.StatusUnauthorized) {
+		if errors.As(err, &te) && (dead(te.Code) || te.Status == http.StatusUnauthorized) {
 			markDead(name, r.Access)
 			return "", ErrExpired
 		}
@@ -306,6 +547,23 @@ func renew(ctx context.Context, name string, still func(Record) bool) (string, e
 	})
 	return t.Access, err
 }
+
+// dead says a token endpoint's error means the refresh token, or the app
+// it was given to, won't be taken again; GitHub's has its own names.
+func dead(code string) bool {
+	switch code {
+	case "invalid_grant", "invalid_client", "bad_refresh_token", "incorrect_client_credentials":
+		return true
+	}
+	return false
+}
+
+// Rejected says the server refused access, a token magpie had just
+// renewed: renewing it again won't help, so the sign-in has run out, and
+// the page says so instead of calling it signed in beside the server's
+// refusal (新v学员 on Discord). A sign-in renewed or redone meanwhile is
+// left as it is.
+func Rejected(name, access string) { markDead(name, access) }
 
 func markDead(name, access string) {
 	_ = update(func(m map[string]*Record) bool {
@@ -378,6 +636,10 @@ func tokenRequest(ctx context.Context, r Record, form url.Values) (tokens, error
 		return tokens{}, te
 	}
 	var t tokens
+	// GitHub's answers its errors with a 200 too
+	if te := (&tokenError{Status: resp.StatusCode}); json.Unmarshal(b, te) == nil && te.Code != "" {
+		return tokens{}, te
+	}
 	if err := json.Unmarshal(b, &t); err != nil {
 		// a few answer as a form, as GitHub's does
 		if v, perr := url.ParseQuery(string(b)); perr == nil && v.Get("access_token") != "" {
@@ -407,6 +669,17 @@ type meta struct {
 }
 
 func origin(u *url.URL) string { return u.Scheme + "://" + u.Host }
+
+// WebURL is whether u is a web page a browser may be asked to open: http
+// or https, with a host. A sign-in page an MCP server names is opened by
+// the system, so anything else (file:, smb:, an app's scheme) is refused.
+func WebURL(u *url.URL) bool {
+	if u == nil || u.Host == "" || u.Opaque != "" {
+		return false
+	}
+	s := strings.ToLower(u.Scheme)
+	return s == "https" || s == "http"
+}
 
 // challenge is the server's 401: its resource metadata and the scope it
 // asks for, from WWW-Authenticate.
@@ -489,16 +762,34 @@ func discover(ctx context.Context, serverURL string) (meta, error) {
 	}
 	// ask it something, as an agent would: its 401 says where to sign in
 	body := `{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"` + protocolVersion + `","capabilities":{},"clientInfo":{"name":"magpie","version":"1"}}}`
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, serverURL, strings.NewReader(body))
-	if err != nil {
-		return meta{}, err
+	ask := func() (*http.Response, *http.Request, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, serverURL, strings.NewReader(body))
+		if err != nil {
+			return nil, nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "application/json, text/event-stream")
+		req.Header.Set("MCP-Protocol-Version", protocolVersion)
+		resp, err := Client.Do(req)
+		return resp, req, err
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json, text/event-stream")
-	req.Header.Set("MCP-Protocol-Version", protocolVersion)
-	resp, err := Client.Do(req)
+	resp, req, err := ask()
+	if err != nil && req != nil && ctx.Err() == nil {
+		// Go doesn't send a POST again on its own when a kept-alive
+		// connection the server or a proxy had closed reads EOF: this one
+		// asks nothing of the account, so it is asked once more, on a
+		// new connection
+		resp, req, err = ask()
+	}
 	if err != nil {
-		return meta{}, fmt.Errorf("couldn't reach %s: %w", su.Host, err)
+		if req == nil {
+			return meta{}, err
+		}
+		via := ""
+		if p, perr := netproxy.Func(req); perr == nil && p != nil {
+			via = netproxy.Redact(p.String())
+		}
+		return meta{}, &UnreachableError{Host: su.Host, Proxy: via, Err: err}
 	}
 	io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
 	resp.Body.Close()
@@ -581,9 +872,22 @@ func discover(ctx context.Context, serverURL string) (meta, error) {
 		return meta{}, fmt.Errorf("couldn't read the metadata of %s, the server's authorization server", issuer)
 	}
 	if resp.StatusCode != http.StatusUnauthorized && !found && !got {
+		if turnedAway(resp) {
+			return meta{}, ErrTurnedAway
+		}
 		return meta{}, fmt.Errorf("the server answered %d and says nothing of a sign-in", resp.StatusCode)
 	}
 	return m, nil
+}
+
+// turnedAway is a 403 from a firewall rather than the MCP server: a web page
+// to a JSON-RPC request, or Cloudflare saying it stopped it.
+func turnedAway(resp *http.Response) bool {
+	if resp.StatusCode != http.StatusForbidden {
+		return false
+	}
+	ct, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type"))
+	return ct == "text/html" || resp.Header.Get("Cf-Mitigated") != ""
 }
 
 // withOffline asks for offline_access too when the authorization server
@@ -612,16 +916,19 @@ func contains(l []string, s string) bool {
 // redirect.
 func register(ctx context.Context, m meta, redirect string) (id, secret, method string, err error) {
 	if m.RegisterURL == "" {
-		return "", "", "", errors.New("the server's sign-in doesn't let an app register itself (no dynamic client registration), so magpie can't sign in to it")
+		return "", "", "", ErrNoRegistration
 	}
 	method = "none"
 	if len(m.AuthMethods) > 0 && !contains(m.AuthMethods, "none") {
-		method = m.AuthMethods[0]
-		if !contains(m.AuthMethods, "client_secret_post") && !contains(m.AuthMethods, "client_secret_basic") {
-			return "", "", "", fmt.Errorf("the server's token endpoint takes only %s, which magpie can't do", strings.Join(m.AuthMethods, ", "))
-		}
-		if contains(m.AuthMethods, "client_secret_post") {
+		// the metadata's order is no preference: one listing private_key_jwt
+		// first, which magpie can't do, may take a secret too
+		switch {
+		case contains(m.AuthMethods, "client_secret_post"):
 			method = "client_secret_post"
+		case contains(m.AuthMethods, "client_secret_basic"):
+			method = "client_secret_basic"
+		default:
+			return "", "", "", fmt.Errorf("the server's token endpoint takes only %s, which magpie can't do", strings.Join(m.AuthMethods, ", "))
 		}
 	}
 	reg := map[string]any{
@@ -648,8 +955,17 @@ func register(ctx context.Context, m meta, redirect string) (id, secret, method 
 	}
 	defer resp.Body.Close()
 	rb, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		return "", "", "", ErrClientRefused
+	}
 	if resp.StatusCode/100 != 2 {
-		return "", "", "", fmt.Errorf("registering magpie with the server's sign-in failed (%d): %s", resp.StatusCode, strings.TrimSpace(string(rb)))
+		// the reply is quoted with its secrets out: a registration's
+		// answer may carry a client_secret, and the error is shown and logged
+		said := strings.TrimSpace(string(redact.ScrubJSON(rb)))
+		if r := []rune(said); len(r) > 300 {
+			said = string(r[:300]) + "…"
+		}
+		return "", "", "", fmt.Errorf("registering magpie with the server's sign-in failed (%d): %s", resp.StatusCode, said)
 	}
 	var out struct {
 		ID     string `json:"client_id"`
@@ -660,6 +976,13 @@ func register(ctx context.Context, m meta, redirect string) (id, secret, method 
 		return "", "", "", errors.New("the server's sign-in registered magpie but gave it no client id")
 	}
 	if out.Method != "" {
+		// the server may register magpie for another of the methods it
+		// supports than the one asked for (RFC 7591's registration
+		// response): one magpie can't send would fail the code exchange
+		// after the browser round trip, so it is said here instead
+		if !contains([]string{"none", "client_secret_post", "client_secret_basic"}, out.Method) {
+			return "", "", "", fmt.Errorf("the server's sign-in registered magpie for %s, which magpie can't do", out.Method)
+		}
 		method = out.Method
 	}
 	if out.Secret == "" {
@@ -668,6 +991,18 @@ func register(ctx context.Context, m meta, redirect string) (id, secret, method 
 		method = "client_secret_post"
 	}
 	return out.ID, out.Secret, method, nil
+}
+
+// appMethod is how an app of the user's own gives its secret to the token
+// endpoint: in the form unless the endpoint takes only basic auth.
+func appMethod(m meta, secret string) string {
+	switch {
+	case secret == "":
+		return "none"
+	case contains(m.AuthMethods, "client_secret_basic") && !contains(m.AuthMethods, "client_secret_post"):
+		return "client_secret_basic"
+	}
+	return "client_secret_post"
 }
 
 // ---- the sign-in -------------------------------------------------------------
@@ -701,23 +1036,82 @@ func randomToken(n int) string {
 	return base64.RawURLEncoding.EncodeToString(b)
 }
 
+// App is an OAuth app of the user's own, for a server whose sign-in
+// doesn't let magpie register itself: Claude Code's --client-id,
+// --client-secret and --callback-port. Its callback is Claude Code's,
+// http://localhost:<port>/callback, so an app made for Claude Code signs
+// magpie in as it is; the callback is still listened for on 127.0.0.1
+// alone, as Claude Code does. Without a CallbackPort the port is any free
+// one, which a loopback callback URL registered without one takes
+// (GitHub's, RFC 8252).
+type App struct {
+	ClientID     string
+	ClientSecret string
+	CallbackPort int
+}
+
 // Start begins signing magpie in to the server called name at serverURL:
 // open the State's URL in a browser and the rest happens on its own;
 // StatusOf follows it.
 func Start(ctx context.Context, name, serverURL string) (State, error) {
+	return StartWith(ctx, name, serverURL, nil)
+}
+
+// StartWith is Start as app when there is one, which magpie then doesn't
+// register in its place.
+func StartWith(ctx context.Context, name, serverURL string, app *App) (State, error) {
+	return start(ctx, name, serverURL, app, nil)
+}
+
+// StartAccount is StartWith as another account of the server: the sign-in
+// it makes is added to the ones there are and put in use, with the label,
+// and the others are kept. With no sign-in yet it is the first.
+func StartAccount(ctx context.Context, name, serverURL string, app *App, label string) (State, error) {
+	label = strings.TrimSpace(label)
+	if len([]rune(label)) > 60 {
+		return State{}, errors.New("the name of a sign-in is at most 60 characters")
+	}
+	if label != "" {
+		for _, a := range Accounts(name) {
+			if strings.EqualFold(a.Label, label) {
+				return State{}, ErrLabelUsed
+			}
+		}
+	}
+	return start(ctx, name, serverURL, app, &label)
+}
+
+func start(ctx context.Context, name, serverURL string, app *App, add *string) (State, error) {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	m, err := discover(ctx, serverURL)
 	if err != nil {
 		return State{}, err
 	}
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	port := 0
+	if app != nil {
+		port = app.CallbackPort
+	}
+	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
 	if err != nil {
+		if port != 0 {
+			return State{}, fmt.Errorf("the OAuth app's callback port %d is in use by another program: %w", port, err)
+		}
 		return State{}, err
 	}
-	redirect := fmt.Sprintf("http://127.0.0.1:%d/callback", ln.Addr().(*net.TCPAddr).Port)
-	id, secret, method, err := register(ctx, m, redirect)
-	if err != nil {
+	// magpie's own registration names 127.0.0.1, as RFC 8252 asks; an
+	// app of the user's own is called back as Claude Code calls it back,
+	// at localhost (its v2.1.231 went back to localhost because servers
+	// that match the registered URL exactly refused 127.0.0.1).
+	host := "127.0.0.1"
+	if app != nil {
+		host = "localhost"
+	}
+	redirect := fmt.Sprintf("http://%s:%d/callback", host, ln.Addr().(*net.TCPAddr).Port)
+	var id, secret, method string
+	if app != nil {
+		id, secret, method = app.ClientID, app.ClientSecret, appMethod(m, app.ClientSecret)
+	} else if id, secret, method, err = register(ctx, m, redirect); err != nil {
 		ln.Close()
 		return State{}, err
 	}
@@ -739,6 +1133,14 @@ func Start(ctx context.Context, name, serverURL string) (State, error) {
 	if err != nil {
 		ln.Close()
 		return State{}, fmt.Errorf("the authorization endpoint isn't a URL: %w", err)
+	}
+	if !WebURL(au) {
+		// the server's metadata names it, and the page is handed to the
+		// system to open: a file:, smb: or app link there would run or
+		// mount what the server chose (Windows opens it through
+		// url.dll's FileProtocolHandler)
+		ln.Close()
+		return State{}, fmt.Errorf("the authorization endpoint isn't a web page (%q)", m.AuthorizeURL)
 	}
 	aq := au.Query()
 	for k, v := range q {
@@ -789,16 +1191,10 @@ func Start(ctx context.Context, name, serverURL string) (State, error) {
 		if t.Scope != "" {
 			r2.Scope = t.Scope
 		}
-		if err := update(func(m map[string]*Record) bool { m[name] = &r2; return true }); err != nil {
-			f.finish(State{State: "failed", Error: err.Error()})
+		if err := f.keep(name, r2, add); err != nil {
 			page(w, http.StatusOK, "Magpie couldn't keep the sign-in: "+err.Error())
 			return
 		}
-		// the agents are given magpie's address before the sign-in is said done
-		if Changed != nil {
-			Changed(name)
-		}
-		f.finish(State{State: "done"})
 		page(w, http.StatusOK, "Magpie is signed in to "+name+". Every agent given it in the Library uses this sign-in. You can close this tab.")
 	})
 	f.srv = &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
@@ -822,6 +1218,56 @@ func (f *flow) status() State {
 	return f.st
 }
 
+// keep commits the callback only while the flow is still live. Cancel or
+// timeout and the write take the same lock, so a late token cannot save a
+// sign-in the user already ended, or replace their previous sign-in.
+func (f *flow) keep(name string, r Record, add *string) error {
+	f.mu.Lock()
+	if f.finished {
+		f.mu.Unlock()
+		return errors.New("the sign-in has ended; start it again")
+	}
+	err := update(func(m map[string]*Record) bool { m[name] = signedAs(m[name], r, add); return true })
+	f.finished = true
+	f.mu.Unlock()
+	if err != nil {
+		f.end(State{State: "failed", Error: err.Error()})
+		return err
+	}
+	// The commit won over cancellation; give the agents the new address
+	// outside the flow's lock, before saying the sign-in is done.
+	if Changed != nil {
+		Changed(name)
+	}
+	f.end(State{State: "done"})
+	return nil
+}
+
+// signedAs is the record a new sign-in leaves for the server: an added
+// account joins the ones there are, in use; any other replaces the one in
+// use (signing in again), and the other accounts stay.
+func signedAs(old *Record, r Record, add *string) *Record {
+	if old == nil || old.URL != r.URL {
+		if add != nil {
+			r.Label = *add
+		}
+		return &r
+	}
+	if add == nil {
+		r.ID, r.Label, r.Seq, r.Spare = old.ID, old.Label, old.Seq, old.Spare
+		return &r
+	}
+	l := all(old)
+	top := 0
+	for _, x := range l {
+		top = max(top, seqOf(x))
+		x.ID, x.Seq = idOf(x), seqOf(x)
+	}
+	r.Seq, r.ID, r.Label = top+1, strconv.Itoa(top+1), *add
+	r.Spare = l
+	return &r
+}
+
 func (f *flow) finish(st State) {
 	f.mu.Lock()
 	if f.finished {
@@ -829,6 +1275,13 @@ func (f *flow) finish(st State) {
 		return
 	}
 	f.finished = true
+	f.mu.Unlock()
+	f.end(st)
+}
+
+// end is called once by the operation that claimed finished.
+func (f *flow) end(st State) {
+	f.mu.Lock()
 	f.st.State, f.st.Error = st.State, st.Error
 	f.mu.Unlock()
 	close(f.done)
@@ -869,5 +1322,5 @@ func Cancel(id string) {
 func page(w http.ResponseWriter, status int, msg string) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(status)
-	fmt.Fprintf(w, `<!doctype html><meta charset="utf-8"><title>Magpie</title><body style="font:15px -apple-system,system-ui,sans-serif;max-width:32em;margin:4em auto;padding:0 1em;color:#222">%s</body>`, html.EscapeString(msg))
+	fmt.Fprintf(w, `<!doctype html><meta charset="utf-8"><meta name="color-scheme" content="light dark"><title>Magpie</title><body style="font:15px -apple-system,system-ui,sans-serif;max-width:32em;margin:4em auto;padding:0 1em">%s</body>`, html.EscapeString(msg))
 }

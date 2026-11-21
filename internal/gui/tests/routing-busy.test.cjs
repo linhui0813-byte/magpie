@@ -38,7 +38,7 @@ function serve(lang, feed) {
       const trace = (routes) => json({ mine: true, now: new Date().toISOString(), seq: routes.length ? routes[routes.length - 1].seq : Number(url.searchParams.get("after")), totals: { requests: 0, rerouted: 0, errors: 0 }, routes });
       if (!url.searchParams.get("wait")) return trace(first);
       while (!feed.q.length && !feed.closed) await new Promise((r) => setTimeout(r, 20));
-      return trace(feed.q.length ? [feed.q.shift()] : []).catch(() => {});
+      return trace(feed.q.splice(0)).catch(() => {}); // every change since, as the gateway answers
     }
     if (url.pathname === "/api/gateway/history") return json({ cut: false, days: [], routes: [] });
     if (url.pathname === "/api/groups") return json({ models: [], groups: [], pools: [] });
@@ -59,6 +59,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       const context = await browser.newContext({ viewport: { width: 1100, height: 760 } });
       const page = await context.newPage();
       page.setDefaultTimeout(5000);
+      page.setDefaultNavigationTimeout(60000);
       const errors = [];
       page.on("pageerror", (e) => errors.push(e.message));
       const feed = { q: [], closed: false };

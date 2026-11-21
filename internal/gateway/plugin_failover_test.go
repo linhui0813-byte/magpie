@@ -6,7 +6,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -15,6 +14,7 @@ import (
 
 	"github.com/yetone/magpie/internal/plugin"
 	"github.com/yetone/magpie/internal/provider"
+	"github.com/yetone/magpie/internal/testenv"
 )
 
 // A plugin's provider with several accounts fails over as a built-in's
@@ -24,10 +24,7 @@ import (
 // and a routing group goes on to its next member when every account of
 // the plugin is out.
 func TestPluginFailover(t *testing.T) {
-	bun, err := exec.LookPath("bun")
-	if err != nil {
-		t.Skip("no bun on PATH")
-	}
+	bun := testenv.Bun(t)
 	fresh(t)
 	t.Setenv("MAGPIE_BUN", bun)
 	t.Cleanup(plugin.Settle)
@@ -39,7 +36,7 @@ func TestPluginFailover(t *testing.T) {
 	var mu sync.Mutex
 	var tried []string          // each request's account, as its token names it
 	fail := map[string]string{} // account → how it fails
-	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	up := testenv.FakeVendor(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		io.ReadAll(r.Body)
 		who := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer fresh-r-")
 		mu.Lock()
@@ -81,7 +78,6 @@ func TestPluginFailover(t *testing.T) {
 		fmt.Fprint(w, `data: {"id":"c","object":"chat.completion.chunk","model":"fake-1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`+"\n\ndata: [DONE]\n\n")
 	}))
 	defer up.Close()
-	t.Setenv("FAKE_BASE", up.URL+"/v1")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
@@ -149,6 +145,15 @@ func TestPluginFailover(t *testing.T) {
 		hit := false
 		for _, first := range []string{"a", "b", "full"} {
 			reset(map[string]string{first: how})
+			if how == "gone" {
+				// the allowances the last round left to be read again are
+				// read before the 401: the fake's usage doesn't ask the
+				// upstream that refuses, so a reading that asked after the
+				// 401 would find the sign-in good and rightly take the
+				// mark off (one begun before it doesn't:
+				// TestPluginUsageReadOlderThanAnswer)
+				provider.LoginUsage(ctx, "plugin:fakeco")
+			}
 			code, body, seen := ask("fakeco/fake-1")
 			if code != 200 || servedBy(body) == "" || servedBy(body) == first {
 				t.Fatalf("%s with %s failing: %d %s (tried %v)", how, first, code, body, seen)
@@ -166,6 +171,33 @@ func TestPluginFailover(t *testing.T) {
 				t.Fatalf("%s: the next request tried %s again: %d %s (tried %v)", how, first, code, body, seen)
 			}
 			if how == "gone" {
+				// one 401 on an access token not due yet, with a
+				// refresh token beside it, makes the token due and
+				// keeps the sign-in (plugins#618): the account is
+				// marked when the token renewed for its next request
+				// is turned away too
+				for _, l := range provider.Logins("fakeco") {
+					if strings.HasPrefix(l.User, first+"@") && l.Lapsed != "" {
+						t.Fatalf("%s is marked for one 401 its refresh token can renew: %+v", first, l)
+					}
+				}
+				for again := 0; ; again++ {
+					restingUntil.Lock()
+					restingUntil.m = map[string]time.Time{}
+					restingUntil.Unlock()
+					sticks.Lock()
+					sticks.m = map[string]stick{}
+					sticks.Unlock()
+					mu.Lock()
+					tried = nil
+					mu.Unlock()
+					if _, _, seen := ask("fakeco/fake-1"); contains(seen, first) {
+						break
+					}
+					if again == 20 {
+						t.Fatalf("%s wasn't tried again", first)
+					}
+				}
 				for _, l := range provider.Logins("fakeco") {
 					if strings.HasPrefix(l.User, first+"@") && !strings.Contains(l.Lapsed, "sign-in has expired") {
 						t.Fatalf("%s refused isn't marked: %+v", first, l)
@@ -246,17 +278,14 @@ func contains(xs []string, x string) bool {
 // lapsed, as the built-in's did; a 401 the built-in didn't take for a
 // refused sign-in leaves it be. The agent never sees the header.
 func TestPluginSaysSignIn(t *testing.T) {
-	bun, err := exec.LookPath("bun")
-	if err != nil {
-		t.Skip("no bun on PATH")
-	}
+	bun := testenv.Bun(t)
 	fresh(t)
 	t.Setenv("MAGPIE_BUN", bun)
 	t.Cleanup(plugin.Settle)
 
 	var mu sync.Mutex
 	status, said := 200, ""
-	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	up := testenv.FakeVendor(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		io.ReadAll(r.Body)
 		mu.Lock()
 		st, sa := status, said
@@ -274,7 +303,6 @@ func TestPluginSaysSignIn(t *testing.T) {
 		fmt.Fprint(w, `data: {"id":"c","object":"chat.completion.chunk","model":"fake-1","choices":[{"index":0,"delta":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`+"\n\ndata: [DONE]\n\n")
 	}))
 	defer up.Close()
-	t.Setenv("FAKE_BASE", up.URL+"/v1")
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()

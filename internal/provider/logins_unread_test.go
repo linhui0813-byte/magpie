@@ -47,9 +47,17 @@ func TestUnreadLoginsWriteErrorsKeepCredentials(t *testing.T) {
 						t.Fatal(err)
 					}
 				} else {
+					// the folder takes no new file, so the bad copy can't
+					// be made
 					blocked = p + ".bad-" + time.Now().Format("20060102-150405")
-					if err := os.Mkdir(blocked, 0o700); err != nil {
+					dir := filepath.Dir(p)
+					if err := os.Chmod(dir, 0o500); err != nil {
 						t.Fatal(err)
+					}
+					t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+					if f, err := os.Create(filepath.Join(dir, "probe")); err == nil {
+						f.Close()
+						t.Skip("the filesystem does not enforce the read-only folder")
 					}
 				}
 				err := addGoogleLogin("gemini", "new@example.com", "", googleAuth{RefreshToken: "new-refresh-token", Project: "p"})
@@ -74,6 +82,7 @@ func TestUnreadLoginsWriteErrorsKeepCredentials(t *testing.T) {
 // Valid JSON can still be unreadable as saved accounts. On a cold start,
 // adding an account must keep those original credentials in a backup.
 func TestUnreadLoginsFieldTypesKeptBeforeWrite(t *testing.T) {
+	t.Cleanup(AntigravityBuiltinForTest()) // the retired built-in route
 	for _, tc := range []struct {
 		name string
 		text string
@@ -122,6 +131,7 @@ func TestUnreadLoginsFieldTypesKeptBeforeWrite(t *testing.T) {
 }
 
 func TestReadableLoginsNotKeptAside(t *testing.T) {
+	t.Cleanup(AntigravityBuiltinForTest()) // the retired built-in route
 	googleSandbox(t, &fakeGoogle{})
 	for _, u := range []string{"a@x.com", "b@x.com"} {
 		if err := addGoogleLogin("antigravity", u, "", googleAuth{RefreshToken: "1//" + u, Project: "p"}); err != nil {
@@ -144,6 +154,7 @@ func TestReadableLoginsNotKeptAside(t *testing.T) {
 // else) was read as no accounts, and the next account added wrote the
 // file anew with that one alone: every saved sign-in gone.
 func TestUnreadLoginsNotWrittenOver(t *testing.T) {
+	t.Cleanup(AntigravityBuiltinForTest()) // the retired built-in route
 	googleSandbox(t, &fakeGoogle{})
 	for _, u := range []string{"a@x.com", "b@x.com"} {
 		if err := addGoogleLogin("antigravity", u, "", googleAuth{RefreshToken: "1//" + u, Project: "p"}); err != nil {

@@ -384,8 +384,10 @@ func TestGeminiParallelToolResultsStayWithTheirCalls(t *testing.T) {
 }
 
 func TestClaudeTraceSubagentsShareSessionWithoutIDCollisions(t *testing.T) {
-	for _, agent := range []string{"claude", "claude-desktop"} {
-		t.Run(agent, func(t *testing.T) {
+	// Desktop's Code tab writes "claude-desktop", or "claude-desktop-3p"
+	// in its third-party inference mode (cybercaius, a gateway setup)
+	for entry, agent := range map[string]string{"claude": "claude", "claude-desktop": "claude-desktop", "claude-desktop-3p": "claude-desktop"} {
+		t.Run(entry, func(t *testing.T) {
 			testenv.SetHome(t, t.TempDir())
 			t.Setenv("CODEX_HOME", t.TempDir())
 			t.Setenv("PI_CODING_AGENT_DIR", t.TempDir())
@@ -405,8 +407,8 @@ func TestClaudeTraceSubagentsShareSessionWithoutIDCollisions(t *testing.T) {
 				// No sessionId is required: child paths provide the parent session ID.
 				var lines []string
 				for _, event := range []map[string]any{
-					{"type": "user", "uuid": "old", "entrypoint": agent, "timestamp": since.Add(-time.Minute), "message": map[string]any{"content": "PRIVATE-OLD"}},
-					{"type": "user", "uuid": "same-user", "entrypoint": agent, "timestamp": since, "message": map[string]any{"content": "PRIVATE-NEW"}},
+					{"type": "user", "uuid": "old", "entrypoint": entry, "timestamp": since.Add(-time.Minute), "message": map[string]any{"content": "PRIVATE-OLD"}},
+					{"type": "user", "uuid": "same-user", "entrypoint": entry, "timestamp": since, "message": map[string]any{"content": "PRIVATE-NEW"}},
 					{"type": "assistant", "timestamp": since.Add(time.Second), "message": map[string]any{"id": "same-message", "model": "claude-sonnet", "stop_reason": "end_turn", "content": []map[string]string{{"type": "text", "text": "PRIVATE-ANSWER"}}, "usage": map[string]int{"input_tokens": 10, "output_tokens": 5}}},
 					{"type": "system", "subtype": "turn_duration", "timestamp": since.Add(2 * time.Second)},
 				} {
@@ -617,4 +619,120 @@ func TestClaudeSubagentRepeatedEndTurnBlocks(t *testing.T) {
 			})
 		}
 	}
+}
+
+// OpenCode's trace window counted every session row, then skipped children.
+// Limit newer children (which are not exported) dropped the parent, so the
+// poll that Claude's children cannot evict (traceRecentFiles) exported
+// nothing. The parent must still be exported; a child still is not.
+func TestOpenCodeChildrenDoNotEvictParentTrace(t *testing.T) {
+	t.Run("sqlite", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "opencode.db")
+		t.Setenv("OPENCODE_DB", path)
+		db, err := sql.Open("sqlite", path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { db.Close() })
+		for _, q := range []string{
+			`CREATE TABLE session_v2 (id TEXT PRIMARY KEY, parent_id TEXT, directory TEXT, title TEXT, time_created INTEGER, time_updated INTEGER)`,
+			`CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER, time_created INTEGER, time_updated INTEGER, data TEXT)`,
+			`CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT)`,
+			`INSERT INTO kv VALUES ('migration.v1-v2', '{"phase":"completed"}')`,
+		} {
+			if _, err = db.Exec(q); err != nil {
+				t.Fatal(err)
+			}
+		}
+		now := time.Now().Add(-5 * time.Second).UnixMilli()
+		if _, err = db.Exec(`INSERT INTO session_v2 VALUES ('s', NULL, 'private', 'private', ?, ?)`, now, now+5000); err != nil {
+			t.Fatal(err)
+		}
+		user, _ := json.Marshal(map[string]any{"role": "user", "text": "question", "time": map[string]int64{"created": now}})
+		asst, _ := json.Marshal(map[string]any{
+			"role": "assistant", "parentID": "u", "modelID": "model",
+			"model":      map[string]string{"id": "model", "providerID": "p"},
+			"providerID": "p",
+			"time":       map[string]int64{"created": now + 1000, "completed": now + 4000},
+			"tokens":     map[string]any{"input": 100, "output": 10, "reasoning": 0, "cache": map[string]int{"read": 0, "write": 0}},
+			"content":    []any{map[string]string{"type": "text", "text": "answer"}},
+		})
+		if _, err = db.Exec(`INSERT INTO session_message VALUES ('u', 's', 'user', 0, ?, ?, ?)`, now, now+5000, string(user)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err = db.Exec(`INSERT INTO session_message VALUES ('a', 's', 'assistant', 1, ?, ?, ?)`, now+1000, now+5000, string(asst)); err != nil {
+			t.Fatal(err)
+		}
+		for i := range Limit {
+			id := fmt.Sprintf("c%d", i)
+			at := now + 10000 + int64(i)
+			if _, err = db.Exec(`INSERT INTO session_v2 VALUES (?, 's', 'private', 'child', ?, ?)`, id, at, at); err != nil {
+				t.Fatal(err)
+			}
+		}
+		r := NewTraceReader(ms(now).Add(-time.Second))
+		budget := int64(8 << 20)
+		spans := r.pollOpenCode(false, &budget)
+		if !spanSession(spans, "s") {
+			t.Fatalf("parent dropped behind %d newer children: %+v", Limit, spans)
+		}
+		if spanSession(spans, "c0") {
+			t.Fatal("a child session was exported")
+		}
+	})
+	t.Run("json", func(t *testing.T) {
+		dir := t.TempDir()
+		root := filepath.Join(dir, "opencode", "storage")
+		t.Setenv("XDG_DATA_HOME", dir)
+		t.Setenv("OPENCODE_DB", "")
+		write := func(path string, value any) {
+			t.Helper()
+			if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			b, err := json.Marshal(value)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, b, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		now := time.Now().Add(-5 * time.Second).UnixMilli()
+		write(filepath.Join(root, "session", "project", "s.json"), map[string]any{"id": "s", "time": map[string]int64{"created": now, "updated": now}})
+		write(filepath.Join(root, "message", "s", "u.json"), map[string]any{"id": "u", "role": "user", "time": map[string]int64{"created": now}})
+		write(filepath.Join(root, "message", "s", "a.json"), map[string]any{
+			"id": "a", "role": "assistant", "parentID": "u", "modelID": "model",
+			"time":   map[string]int64{"created": now + 100, "completed": now + 500},
+			"tokens": map[string]int{"input": 10, "output": 2},
+		})
+		later := time.Now().Add(time.Hour)
+		for i := range Limit {
+			id := fmt.Sprintf("c%d", i)
+			write(filepath.Join(root, "session", "project", id+".json"), map[string]any{
+				"id": id, "parentID": "s", "time": map[string]int64{"created": now, "updated": now},
+			})
+			if err := os.Chtimes(filepath.Join(root, "session", "project", id+".json"), later, later); err != nil {
+				t.Fatal(err)
+			}
+		}
+		r := NewTraceReader(ms(now).Add(-time.Second))
+		budget := int64(8 << 20)
+		spans := r.pollOpenCode(false, &budget)
+		if !spanSession(spans, "s") {
+			t.Fatalf("parent dropped behind %d newer children: %+v", Limit, spans)
+		}
+		if spanSession(spans, "c0") {
+			t.Fatal("a child session was exported")
+		}
+	})
+}
+
+func spanSession(spans []TraceSpan, id string) bool {
+	for _, s := range spans {
+		if s.Session == id {
+			return true
+		}
+	}
+	return false
 }

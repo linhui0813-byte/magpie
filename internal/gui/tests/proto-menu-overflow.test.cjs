@@ -14,6 +14,7 @@ const fs = require("node:fs/promises");
 const path = require("node:path");
 const { test } = require("node:test");
 const { chromium, webkit } = require("playwright");
+const { openPart } = require("./reader.cjs");
 
 const assets = path.resolve(__dirname, "../assets");
 
@@ -74,12 +75,13 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await browser.close();
       });
       page.setDefaultTimeout(5000);
+      page.setDefaultNavigationTimeout(60000);
       const errors = [], posts = [];
       page.on("pageerror", (e) => errors.push(e.message));
       await page.route("**/*", server(lang, posts));
       await page.goto("http://magpie.test/?view=usage");
       await page.locator("#prefs").click();
-      await page.locator("#setTab-usage").click();
+      await openPart(page, "usage");
       const pill = page.locator("#trayUsagePick button");
       await pill.waitFor();
       await pill.scrollIntoViewIfNeeded();
@@ -88,7 +90,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       const menu = page.locator(".proto-menu");
       const items = page.locator(".proto-menu .pm-item");
       await items.first().waitFor();
-      assert.equal(await items.count(), N + 2, "off, the account in use, then each account");
+      assert.equal(await items.count(), N + 4, "off, the account in use, each account, then magpie's own two totals (#1984)");
 
       // the menu is clamped to the viewport, not grown past its bottom edge.
       const box = await menu.boundingBox();

@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -26,16 +27,34 @@ func syncHome(t *testing.T) string {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)
+	t.Setenv("APPDATA", filepath.Join(home, "AppData", "Roaming"))
+	t.Setenv("LOCALAPPDATA", filepath.Join(home, "AppData", "Local"))
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
 	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
 	t.Setenv("CODEX_HOME", "")
 	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(home, ".claude"))
 	t.Setenv("HERMES_HOME", "")
 	t.Setenv("MIMOCODE_HOME", "")
+	t.Setenv("DEVECO_CONFIG_DIR", "")
 	t.Setenv("HANA_HOME", "")
 	t.Setenv("DSH_HOME", "")
+	t.Setenv("DS_BOT_HOME", "")
+	t.Setenv("DS_BOT_SHELL_DATA", "")
+	t.Setenv("OMB_DATA_DIR", "")
+	t.Setenv("AVIBE_HOME", "")
+	t.Setenv("KUN_DATA_DIR", "")
+	t.Setenv("NMEM_APP_CONFIG_DIR", "")
+	t.Setenv("NMEM_API_URL", "")
 	t.Setenv("OMO_CODING_AGENT_DIR", "")
 	t.Setenv("SENPI_CODING_AGENT_DIR", "")
+	t.Setenv("PRIME_AGENT_CODING_AGENT_DIR", "")
+	for _, k := range []string{"MU_AGENT_DIR", "KYRN_AGENT_DIR", "MU_CODING_AGENT_DIR", "KYRN_CODING_AGENT_DIR"} {
+		t.Setenv(k, "")
+	}
+	t.Setenv("MOTHX_DIR", "")
+	t.Setenv("SHELLEY_SOCKET", "")
+	t.Setenv("PENGUIN_HOME", "")
+	t.Setenv("PENGUIN_PROJECT_ID", "")
 	t.Setenv("PI_CODING_AGENT_DIR", "")
 	t.Setenv("PI_CONFIG_DIR", "")
 	t.Setenv("OMP_PROFILE", "")
@@ -133,11 +152,12 @@ func TestCrushModelsCarryMaxTokens(t *testing.T) {
 // magpie hands an output limit; one whose window isn't known keeps its
 // output. ZCode and WorkBuddy cap it at zcodeMaxOutput besides, Crush falls
 // back to 16384 without a known output, OpenCode is handed no limit without
-// a window, and AtomCode, told a 128000 window when the model's isn't known,
-// is cut to that.
+// a window, and AtomCode and Snow CLI, each told a window of its own when
+// the model's isn't known, are cut to that. dsh is held to what leaves it
+// half of a known window, or a quarter of it (dshMaxTokens, #2823).
 func TestMaxTokensWithinContextWindow(t *testing.T) {
 	home := syncHome(t)
-	check := func(limit string, want int) {
+	check := func(limit string, want, window int) {
 		t.Helper()
 		os.WriteFile(catalog.CachePath(), []byte(`{"zai":{"models":{"glm-4.6":{"id":"glm-4.6","name":"GLM-4.6","limit":{`+limit+`}}}}}`), 0o644)
 		catalog.Reset()
@@ -156,6 +176,10 @@ func TestMaxTokensWithinContextWindow(t *testing.T) {
 			t.Fatal(err)
 		}
 		atomcodeCfg, _ := os.ReadFile(atomcode)
+		snowOut, _, err := snowProfileFor(nil, false, gatewayV1(), "k", "relay/glm-4.6", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
 		rules, wb := filepath.Join(t.TempDir(), "provider_config.json"), filepath.Join(t.TempDir(), "models.json")
 		if err := zcodeRules(rules, true, true); err != nil {
 			t.Fatal(err)
@@ -170,11 +194,22 @@ func TestMaxTokensWithinContextWindow(t *testing.T) {
 		if !strings.Contains(limit, "context") {
 			told = strconv.Itoa(min(want, atomcodeContext))
 		}
+		// dsh reserves maxTokens out of its window before compacting, so a
+		// known window holds it to what leaves dsh half of it, or a quarter
+		// where that is more (dshMaxTokens, #2823, #3298).
+		dshTold := n
+		if strings.Contains(limit, "context") {
+			dshTold = strconv.Itoa(min(want, max(window/4, window/2-65536)))
+		}
+		snowTold := n
+		if !strings.Contains(limit, "context") {
+			snowTold = strconv.Itoa(min(want, snowContext))
+		}
 		wants := map[string][2]string{
 			"pi":          {string(pi), `"maxTokens":` + n},
 			"cline":       {string(cline), `"maxTokens":` + n},
 			"omp":         {string(omp), "maxTokens: " + n},
-			"dsh":         {string(dshRoute), "maxTokens: " + n},
+			"dsh":         {string(dshRoute), "maxTokens: " + dshTold},
 			"droid":       {string(droid), `"maxOutputTokens":` + n},
 			"qoder":       {string(qoder), `"maxOutputTokens":` + n},
 			"hanako":      {string(hanako), `"maxOutput":` + n},
@@ -183,6 +218,7 @@ func TestMaxTokensWithinContextWindow(t *testing.T) {
 			"zcode rules": {string(zcRules), `"max":` + capped},
 			"workbuddy":   {string(wbModels), `"maxOutputTokens": ` + capped},
 			"atomcode":    {string(atomcodeCfg), "max_tokens = " + told},
+			"snow":        {string(snowOut), `"maxTokens": ` + snowTold},
 		}
 		if strings.Contains(limit, "context") {
 			wants["opencode"] = [2]string{string(opencode), `"output":` + n}
@@ -193,10 +229,10 @@ func TestMaxTokensWithinContextWindow(t *testing.T) {
 			}
 		}
 	}
-	check(`"context":128000,"output":384000`, 128000)
-	check(`"output":384000`, 384000)
-	check(`"context":204800,"output":131072`, 131072)
-	check(`"context":64000,"output":384000`, 64000)
+	check(`"context":128000,"output":384000`, 128000, 128000)
+	check(`"output":384000`, 384000, 0)
+	check(`"context":204800,"output":131072`, 131072, 204800)
+	check(`"context":64000,"output":384000`, 64000, 64000)
 }
 
 // A provider added after a magpie model was picked reaches the lists agents
@@ -205,6 +241,10 @@ func TestSyncCatalogRewritesAgentLists(t *testing.T) {
 	home := syncHome(t)
 	piModels := filepath.Join(home, ".pi", "agent", "models.json")
 	writeFile(t, piModels, `{"providers":{"mine":{"baseUrl":"http://x"},"magpie":{"name":"magpie","models":[]}}}`)
+	// connected: a block of magpie's name in an agent not on magpie is the
+	// user's own (TestCatalogSyncLeavesAHandWrittenMagpieBlock)
+	writeFile(t, filepath.Join(home, ".pi", "agent", "settings.json"), `{"defaultProvider":"magpie","defaultModel":"relay/glm-4.6"}`)
+	setUpInMagpie("pi")
 	crushCfg := filepath.Join(home, ".config", "crush", "crush.json")
 	crushBody := `{"providers":{"mine":{"base_url":"http://x"}}}`
 	writeFile(t, crushCfg, crushBody)
@@ -263,7 +303,7 @@ func TestSyncCatalogAgesCodexCache(t *testing.T) {
 		t.Errorf("stale cache: %+v", c)
 	}
 
-	fresh := `{"fetched_at":"2026-09-25T10:00:00Z","etag":` + string(must(json.Marshal(codexcat.WithTag(`W/"v1"`, codexcat.Tag(provider.CodexListed()))))) + `,"models":[]}`
+	fresh := `{"fetched_at":"2026-09-25T10:00:00Z","etag":` + string(must(json.Marshal(codexcat.WithTag(`W/"v1"`, provider.CodexListTag())))) + `,"models":[]}`
 	writeFile(t, cache, fresh)
 	SyncCatalog()
 	if got := readFile(cache); got != fresh {
@@ -342,6 +382,58 @@ func TestOpenCodeKeepsItsOwnGatewayProviders(t *testing.T) {
 	}
 }
 
+// OpenCode 2 keeps a provider under providers, its base URL in settings,
+// as OpenChamber's provider form saves one, and reads it there before the
+// same name under provider: a provider of the user's own at magpie's
+// gateway there is the file's own as one under provider is (#3915).
+func TestOpenCodeKeepsItsOwnGatewayProvidersUnderProviders(t *testing.T) {
+	home := syncHome(t)
+	cfg := filepath.Join(home, ".config", "opencode", "opencode.json")
+	writeFile(t, cfg, `{
+  "providers": {
+    "magpie-relay": {"package": "aisdk:@ai-sdk/openai-compatible", "settings": {"baseURL": "http://localhost:3425/v1/"}, "models": {"relay/glm-4.6": {}}},
+    "elsewhere": {"settings": {"baseURL": "https://example.com/v1"}, "models": {"relay/glm-4.6": {}}}
+  },
+  "model": "magpie-relay/relay/glm-4.6"
+}`)
+	oc := opencode(home, filepath.Join(home, ".config"))
+	if err := oc.Fields[0].Set("magpie/relay/glm-4.6"); err != nil {
+		t.Fatal(err)
+	}
+	if v, _ := edit.GetJSON(cfg, "model"); v != "magpie-relay/relay/glm-4.6" {
+		t.Fatalf("model = %q", v)
+	}
+	if _, ok := edit.GetJSON(cfg, "provider.magpie"); ok {
+		t.Fatal("magpie's provider added beside the file's own")
+	}
+	// one named as magpie's relay, at the gateway: its model is magpie's
+	writeFile(t, cfg, `{"providers": {"relay": {"settings": {"baseURL": "http://127.0.0.1:3425/v1"}, "models": {"glm-4.6": {}}}}, "model": "relay/glm-4.6"}`)
+	if got := oc.Models(); len(got) != 1 || got[0] != "relay/glm-4.6" {
+		t.Fatalf("models = %v", got)
+	}
+	// the same name under both is the one under providers, as OpenCode 2
+	// reads it
+	writeFile(t, cfg, `{
+  "provider": {"relay": {"options": {"baseURL": "http://127.0.0.1:3425/v1"}, "models": {"glm-4.6": {}}}},
+  "providers": {"relay": {"settings": {"baseURL": "https://example.com/v1"}, "models": {"glm-4.6": {}}}},
+  "model": "relay/glm-4.6"
+}`)
+	if got := oc.Models(); len(got) != 0 {
+		t.Fatalf("the provider under provider read over the one under providers: %v", got)
+	}
+	// and a pick doesn't go to it
+	writeFile(t, cfg, `{
+  "provider": {"mine": {"options": {"baseURL": "http://localhost:3425/v1/"}, "models": {"relay/glm-4.6": {}}}},
+  "providers": {"mine": {"settings": {"baseURL": "https://example.com/v1"}, "models": {"relay/glm-4.6": {}}}}
+}`)
+	if err := oc.Fields[0].Set("magpie/relay/glm-4.6"); err != nil {
+		t.Fatal(err)
+	}
+	if v, _ := edit.GetJSON(cfg, "model"); v != "magpie/relay/glm-4.6" {
+		t.Fatalf("picked on the provider under provider: model = %q", v)
+	}
+}
+
 // MiMo Code shares OpenCode's config shape: a sync writes magpie's provider
 // into its own mimocode.json, and reads its own model list.
 func TestMiMoCodeMirrorsOpenCode(t *testing.T) {
@@ -411,12 +503,15 @@ func TestMiMoCodeCatalogNarrowedSeparately(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { settings.Save(settings.Settings{}) })
-	mimo := magpieProviderJSONFor("opencode", "mimocode").(map[string]any)["models"].(map[string]any)
-	oc := magpieProviderJSON("opencode").(map[string]any)["models"].(map[string]any)
-	if len(mimo) != 1 || mimo["relay/glm-4.6"] == nil {
+	mimo := magpieProviderJSONFor("opencode", "mimocode").(map[string]any)["models"].(orderedJSON)
+	oc := magpieProviderJSON("opencode").(map[string]any)["models"].(orderedJSON)
+	has := func(ms orderedJSON, id string) bool {
+		return slices.IndexFunc(ms, func(p jsonPair) bool { return p.k == id }) >= 0
+	}
+	if len(mimo) != 1 || !has(mimo, "relay/glm-4.6") {
 		t.Fatalf("mimocode catalog: %v", mimo)
 	}
-	if oc["relay/glm-4.6"] == nil {
+	if !has(oc, "relay/glm-4.6") {
 		t.Fatalf("opencode catalog was narrowed too: %v", oc)
 	}
 }

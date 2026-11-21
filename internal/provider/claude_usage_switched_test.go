@@ -27,10 +27,10 @@ func TestClaudeUsageOfAnotherAccountNotKept(t *testing.T) {
 	var out atomic.Value
 	out.Store("")
 	runs := fakeClaudeUsage(t, &out, nil)
-	spent := "Current session: 100% used · resets " + soon(1) + " at 3:30pm (UTC)\nCurrent week (all models): 60% used · resets " + soon(3) + " at 2pm (UTC)\n"
-	fine := "Current session: 5% used · resets " + soon(1) + " at 3:30pm (UTC)\nCurrent week (all models): 20% used · resets " + soon(3) + " at 2pm (UTC)\n"
+	spent := "Current session: 100% used · resets " + sessionReset() + "\nCurrent week (all models): 60% used · resets " + soon(3) + " at 2pm (UTC)\n"
+	fine := "Current session: 5% used · resets " + sessionReset() + "\nCurrent week (all models): 20% used · resets " + soon(3) + " at 2pm (UTC)\n"
 	switchMidway := false
-	UsageClaudeVia(func(context.Context) (string, error) {
+	UsageClaudeVia(func(context.Context, string) (string, error) {
 		runs.Add(1)
 		if switchMidway {
 			// Claude Code moved to B as its /usage ran: it read B's

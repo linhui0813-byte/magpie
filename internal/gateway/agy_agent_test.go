@@ -127,3 +127,32 @@ func TestAgyToolResultsAreTheUsers(t *testing.T) {
 		}
 	}
 }
+
+// Goose's HTTP client sends no User-Agent (reqwest's default,
+// crates/goose-providers/src/api_client.rs), so its requests are Goose's by
+// the key magpie writes into its custom provider (#1083).
+func TestGooseAgentByKey(t *testing.T) {
+	setHome(t, t.TempDir())
+	f := &fake{t: t, reply: sse(
+		`data: {"id":"c1","choices":[{"delta":{"content":"OK"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":2}}`,
+		`data: [DONE]`)}
+	setup(t, provider.Chat, f)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"fake/m1","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Del("User-Agent")
+	req.Header.Set("Authorization", "Bearer "+TokenFor("goose"))
+	New().Handler().ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("%d %s", rec.Code, rec.Body.String())
+	}
+	var got []usage.Record
+	for range 100 {
+		if got = usage.Load(time.Time{}); len(got) > 0 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if len(got) != 1 || got[0].Agent != "goose" {
+		t.Fatalf("records %+v, want one of goose's", got)
+	}
+}

@@ -2,6 +2,8 @@ package backup
 
 import (
 	"bytes"
+	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"os"
@@ -13,6 +15,7 @@ import (
 
 	"github.com/yetone/magpie/internal/agentenv"
 	"github.com/yetone/magpie/internal/library"
+	"github.com/yetone/magpie/internal/plugin"
 	"github.com/yetone/magpie/internal/profile"
 	"github.com/yetone/magpie/internal/provider"
 	"github.com/yetone/magpie/internal/settings"
@@ -68,10 +71,11 @@ func setUp(t *testing.T) {
 	}
 	for _, p := range []provider.Provider{
 		{ID: "acme", Name: "Acme", Chat: "https://acme.example.com/v1", Key: "sk-acme", Icon: icon,
-			BalanceToken: "balance-acme",
-			Keys:         []provider.KeyAccount{{Name: "second", Key: "sk-acme-2"}},
-			Headers:      map[string]string{"X-Team": "a", "X-Api-Key": "hdr-secret"}},
-		{ID: "beta", Name: "Beta", Chat: "https://beta.example.com/v1", Key: "sk-beta", BalanceToken: "balance-beta"},
+			BalanceToken: "balance-acme", AccessKeyID: "AK-acme", SecretAccessKey: "SK-acme",
+			Keys:    []provider.KeyAccount{{Name: "second", Key: "sk-acme-2"}},
+			Headers: map[string]string{"X-Team": "a", "X-Api-Key": "hdr-secret"}},
+		// one of the user's whose certificate isn't checked (#2383)
+		{ID: "beta", Name: "Beta", Chat: "https://beta.example.com/v1", Key: "sk-beta", BalanceToken: "balance-beta", InsecureTLS: true},
 	} {
 		if err := provider.Save(p); err != nil {
 			t.Fatal(err)
@@ -96,7 +100,7 @@ func TestRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, secret := range []string{"sk-acme", "balance-acme", "hdr-secret", "acme.example.com", "work"} {
+	for _, secret := range []string{"sk-acme", "balance-acme", "SK-acme", "hdr-secret", "acme.example.com", "work"} {
 		if strings.Contains(string(data), secret) {
 			t.Fatalf("%q readable in the file", secret)
 		}
@@ -118,8 +122,12 @@ func TestRoundTrip(t *testing.T) {
 		t.Fatalf("result: %+v", r)
 	}
 	p, err := provider.Find("acme")
-	if err != nil || p.Key != "sk-acme" || len(p.Keys) != 1 || p.BalanceToken != "balance-acme" || p.Headers["X-Api-Key"] != "hdr-secret" {
+	if err != nil || p.Key != "sk-acme" || len(p.Keys) != 1 || p.BalanceToken != "balance-acme" || p.Headers["X-Api-Key"] != "hdr-secret" ||
+		p.AccessKeyID != "AK-acme" || p.SecretAccessKey != "SK-acme" {
 		t.Fatalf("acme: %+v %v", p, err)
+	}
+	if b, err := provider.Find("beta"); err != nil || !b.InsecureTLS {
+		t.Fatalf("beta's unchecked certificate not restored: %+v %v", b, err)
 	}
 	name, _ := strings.CutPrefix(p.Icon, "file:")
 	if _, err := os.Stat(provider.IconFile(name)); err != nil {
@@ -143,7 +151,7 @@ func TestNoKeys(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, p := range b.Providers {
-		if p.Key != "" || len(p.Keys) != 0 || p.BalanceToken != "" {
+		if p.Key != "" || len(p.Keys) != 0 || p.BalanceToken != "" || p.AccessKeyID != "" || p.SecretAccessKey != "" {
 			t.Fatalf("key in a keyless backup: %+v", p)
 		}
 		if _, ok := p.Headers["X-Api-Key"]; ok {
@@ -159,7 +167,8 @@ func TestNoKeys(t *testing.T) {
 	}
 
 	home(t)
-	if err := provider.Save(provider.Provider{ID: "acme", Name: "Acme old", Chat: "https://old.example.com/v1", Key: "sk-here", BalanceToken: "balance-here"}); err != nil {
+	if err := provider.Save(provider.Provider{ID: "acme", Name: "Acme old", Chat: "https://old.example.com/v1", Key: "sk-here", BalanceToken: "balance-here",
+		AccessKeyID: "AK-here", SecretAccessKey: "SK-here"}); err != nil {
 		t.Fatal(err)
 	}
 	got, err := Open(data, "pw")
@@ -173,7 +182,7 @@ func TestNoKeys(t *testing.T) {
 	if r.Added != 1 || r.Replaced != 1 || !slices.Equal(r.NeedKey, []string{"Beta"}) || r.Settings || r.Profiles != 0 {
 		t.Fatalf("result: %+v", r)
 	}
-	if p, _ := provider.Find("acme"); p.Key != "sk-here" || p.BalanceToken != "balance-here" || p.Chat != "https://acme.example.com/v1" || p.Headers["X-Team"] != "a" {
+	if p, _ := provider.Find("acme"); p.Key != "sk-here" || p.BalanceToken != "balance-here" || p.AccessKeyID != "AK-here" || p.SecretAccessKey != "SK-here" || p.Chat != "https://acme.example.com/v1" || p.Headers["X-Team"] != "a" {
 		t.Fatalf("acme: %+v", p)
 	}
 	if p, _ := provider.Find("beta"); p.BalanceToken != "" {
@@ -253,6 +262,41 @@ func TestGitHubTokenBackup(t *testing.T) {
 		want := map[bool]string{false: "ghp_local", true: "ghp_incoming"}[keys]
 		if got := settings.Load(); got.GitHubToken != want || got.Theme != "light" {
 			t.Errorf("keys %v: restored token %q theme %q, want %q", keys, got.GitHubToken, got.Theme, want)
+		}
+	}
+}
+
+// Bark's device key is a key too (EV_John_Liu on X): a backup without keys
+// leaves it out, and restoring one keeps the key this machine has.
+func TestBarkKeyBackup(t *testing.T) {
+	home(t)
+	if err := settings.Save(settings.Settings{BarkKey: "bark_local_key", BarkServer: "https://bark.example.com", Theme: "dark"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, keys := range []bool{false, true} {
+		b, err := Collect(keys, "test")
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, _ := Seal(b, "pw")
+		if got := strings.Contains(string(mustOpen(t, data)), "bark_local_key"); got != keys {
+			t.Fatalf("keys %v: the Bark key is in the backup: %v", keys, got)
+		}
+	}
+	for _, keys := range []bool{false, true} {
+		incoming := settings.Settings{Theme: "light"}
+		if keys {
+			incoming.BarkKey = "bark_incoming_key"
+		}
+		if err := settings.Save(settings.Settings{BarkKey: "bark_local_key"}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Restore(Bundle{Version: 1, Keys: keys, Settings: &incoming}, Parts{Settings: true}); err != nil {
+			t.Fatal(err)
+		}
+		want := map[bool]string{false: "bark_local_key", true: "bark_incoming_key"}[keys]
+		if got := settings.Load(); got.BarkKey != want {
+			t.Errorf("keys %v: restored key %q, want %q", keys, got.BarkKey, want)
 		}
 	}
 }
@@ -396,5 +440,95 @@ func TestProfileKeys(t *testing.T) {
 	want := []string{"codex.provider", "claude.model", "codex.model", "codex.effort"}
 	if !slices.Equal(got, want) {
 		t.Fatalf("%v", got)
+	}
+}
+
+// A sync seals a backup every round and opens the one on the server: the
+// key is derived once a run, not once a backup, PBKDF2 being slow on
+// purpose (davsync's tests ran past go test's 10 minutes under -race).
+func TestSealDerivesOnce(t *testing.T) {
+	pass := rand.Text() // one no earlier run derived a key for
+	keysMu.Lock()
+	before := len(keys)
+	keysMu.Unlock()
+	var sealed [][]byte
+	for range 2 {
+		data, err := Seal(Bundle{Version: 1}, pass)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sealed = append(sealed, data)
+	}
+	for _, data := range sealed {
+		if _, err := Open(data, pass); err != nil {
+			t.Fatal(err)
+		}
+	}
+	keysMu.Lock()
+	derivedNow := len(keys) - before
+	keysMu.Unlock()
+	if derivedNow != 1 {
+		t.Fatalf("derived %d keys for two backups under one passphrase, want 1", derivedNow)
+	}
+}
+
+// A backup carries the plugins from npm, which the other machine installs,
+// and names the subscriptions it brought the settings of with no account
+// there (yapechan on Discord: the import said providers were added, and
+// none showed).
+func TestRestorePluginsAndSignIn(t *testing.T) {
+	home(t)
+	if err := os.MkdirAll(settings.Dir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(settings.Dir(), "plugins.json"), []byte(`{"plugins":[
+		{"spec":"@magpie-community/opencode-cursor-auth"},{"spec":"/Users/me/mine"}]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(provider.Path(), []byte(`{"providers":[
+		{"id":"claude","models":["claude-opus-4-8"]},
+		{"id":"acme","name":"Acme","chat":"https://acme.example.invalid/v1","key":"sk-acme"}]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	b, err := Collect(false, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := Seal(b, "correct horse")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	home(t) // another machine
+	old := addPlugins
+	t.Cleanup(func() { addPlugins = old })
+	var asked []string
+	addPlugins = func(_ context.Context, es []plugin.Entry) ([]string, map[string]error) {
+		for _, e := range es {
+			asked = append(asked, e.Spec)
+		}
+		return asked[:1], map[string]error{"github:x/y": errors.New("no such repository")}
+	}
+	got, err := Open(data, "correct horse")
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := Restore(got, All)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(asked, []string{"@magpie-community/opencode-cursor-auth"}) {
+		t.Fatalf("asked to install %v, want the npm plugin only", asked)
+	}
+	if !slices.Equal(r.SignIn, []string{"claude"}) || !slices.Equal(r.Plugins, asked) ||
+		r.PluginErrors["github:x/y"] != "no such repository" || !slices.Equal(r.NeedKey, []string{"Acme"}) {
+		t.Fatalf("result: %+v, want claude to sign in to, the plugin added, the failure said, acme to key", r)
+	}
+
+	// a backup from a magpie before plugins installs nothing
+	asked = nil
+	got.Plugins = nil
+	if _, err := Restore(got, All); err != nil || asked != nil {
+		t.Fatalf("an older backup asked to install %v (%v)", asked, err)
 	}
 }

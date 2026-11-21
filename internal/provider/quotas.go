@@ -4,6 +4,8 @@ import (
 	"context"
 	"math"
 	"slices"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -13,15 +15,37 @@ import (
 // what doesn't answer before ctx ends comes back with an error.
 func Quotas(ctx context.Context) []SubscriptionQuota {
 	subs, plans, balances := quotas(ctx)
-	return append(append(subs, plans...), balances...)
+	return cardsServed(subs, plans, balances, LastServed())
+}
+
+// InProviderOrder is qs in the order the user put the providers in on the
+// Providers page (SetOrder), each provider's cards as they came; a card of
+// no provider here (a remote magpie's) after them all. The window's Usage
+// page and the tray panel's Allowances tab draw them so, where the user
+// hasn't arranged the cards themselves (Zhenbao TONG on Discord: the
+// providers moved in the window, the tray kept its own order).
+func InProviderOrder(qs []SubscriptionQuota) []SubscriptionQuota {
+	at := map[string]int{}
+	for i, p := range All() {
+		at[p.ID] = i
+	}
+	rank := func(q SubscriptionQuota) int {
+		if i, ok := at[q.Provider]; ok {
+			return i
+		}
+		return len(at)
+	}
+	out := slices.Clone(qs)
+	slices.SortStableFunc(out, func(a, b SubscriptionQuota) int { return rank(a) - rank(b) })
+	return out
 }
 
 // Allotted is Quotas without the keys' balances: the accounts and plans
 // whose allowance runs out and starts again, which is what magpie quota
 // wait waits on; no key's balance is asked for.
 func Allotted(ctx context.Context) []SubscriptionQuota {
-	subs := SubscriptionUsage(ctx)
-	return append(subs, notShown(PlanQuotas(ctx), subs)...)
+	plans, subs := seatCards(PlanQuotas(ctx), SubscriptionUsage(ctx))
+	return append(withAccountNames(subs), plans...)
 }
 
 func quotas(ctx context.Context) (subs, plans, balances []SubscriptionQuota) {
@@ -31,8 +55,8 @@ func quotas(ctx context.Context) (subs, plans, balances []SubscriptionQuota) {
 	go func() { b <- KeyBalances(ctx) }()
 	go func() { p <- PlanQuotas(ctx) }()
 	go func() { r <- RemoteCards(ctx) }()
-	subs = SubscriptionUsage(ctx)
-	plans, balances = notShown(<-p, subs), <-b
+	plans, subs = seatCards(<-p, SubscriptionUsage(ctx))
+	subs, balances = WithImageLane(withAccountNames(subs), time.Now()), <-b
 	// a remote magpie's cards, each after this computer's of its kind
 	for _, q := range <-r {
 		switch q.Kind {
@@ -45,43 +69,6 @@ func quotas(ctx context.Context) (subs, plans, balances []SubscriptionQuota) {
 		}
 	}
 	return subs, plans, balances
-}
-
-// notShown is the plans not already on a subscription's card: a GLM
-// Coding plan read with a Zhipu or Z.ai key is the ZCode account's own
-// when ZCode is signed in to the same account, and shown once, on its
-// card, which counts the calls. plans, PlanQuotas' cache, is left as it is.
-func notShown(plans, subs []SubscriptionQuota) []SubscriptionQuota {
-	return slices.DeleteFunc(slices.Clone(plans), func(p SubscriptionQuota) bool {
-		return slices.ContainsFunc(subs, func(s SubscriptionQuota) bool { return sameAccount(p, s) })
-	})
-}
-
-// sameAccount matches a GLM key's plan to ZCode (built-in or plugin) by
-// their account-relative resets. A plan's User is a key label, not the
-// subscription's login, so it cannot identify the shared account. Every
-// comparable window must agree, with at least one match. This heuristic
-// must not compare unrelated vendors whose reset schedules can coincide.
-func sameAccount(a, b SubscriptionQuota) bool {
-	if !a.glmPlan || (b.Provider != "zcode" && b.Provider != "zcode-plugin") {
-		return false
-	}
-	if a.Error != "" || b.Error != "" {
-		return false
-	}
-	matched := false
-	for _, x := range a.Windows {
-		for _, y := range b.Windows {
-			if x.Aside || y.Aside || x.Span == 0 || x.Span != y.Span || x.ResetsAt == nil || y.ResetsAt == nil {
-				continue
-			}
-			if !x.ResetsAt.Equal(*y.ResetsAt) {
-				return false
-			}
-			matched = true
-		}
-	}
-	return matched
 }
 
 // Quota is one account's or key's allowance as magpie quota --json and
@@ -98,8 +85,18 @@ type Quota struct {
 	Windows         []QuotaSpan      `json:"windows"`
 	Balance         string           `json:"balance,omitempty"`
 	BillingEstimate *BillingEstimate `json:"billingEstimate,omitempty"`
-	Error           string           `json:"error,omitempty"`
-	AsOf            *time.Time       `json:"asOf,omitempty"` // the cached reading's time, nil for a new one
+	// BalanceSplit is what the Balance is made of, when the vendor tells
+	// it (SubscriptionQuota's)
+	BalanceSplit []BalancePart `json:"balanceSplit,omitempty"`
+	// SharedBalance is the first of the keys whose Balance is this key's
+	// account's too (SubscriptionQuota's)
+	SharedBalance string     `json:"sharedBalance,omitempty"`
+	Error         string     `json:"error,omitempty"`
+	AsOf          *time.Time `json:"asOf,omitempty"` // the cached reading's time, nil for a new one
+	// ReadDeferred says no request was made this time, rather than one failed.
+	ReadDeferred bool `json:"readDeferred,omitempty"`
+	// ReadError is why the reading AsOf stands in for failed.
+	ReadError string `json:"readError,omitempty"`
 	// ReadAt is when the windows or balance shown were read, nil when not
 	// known; a Claude account's can be well before now (claudeReadAt).
 	ReadAt *time.Time `json:"readAt,omitempty"`
@@ -109,6 +106,9 @@ type Quota struct {
 	Renew string     `json:"renew,omitempty"`
 	// Resets are a Codex account's rate-limit resets, when it holds any.
 	Resets *ResetCredits `json:"resets,omitempty"`
+	// ResetsUsed are the Codex account's resets magpie spent, newest
+	// first, by itself or by hand (codex_resets_used.go)
+	ResetsUsed []ResetUse `json:"resetsUsed,omitempty"`
 	// LastServedAt is when the account, plan or key last answered a
 	// request through the gateway, nil when it hasn't in the last 30 days
 	// (served.go); Last is on the latest of them (#570).
@@ -117,6 +117,10 @@ type Quota struct {
 	// From is the remote magpie whose account this is, by its name here
 	// (remote_quotas.go); "" for this computer's own.
 	From string `json:"from,omitempty"`
+	// Alias is the account's name of the user's own, else Seat: the name
+	// of the key plan whose card this account's stands in for (#1515).
+	Alias string `json:"alias,omitempty"`
+	Seat  string `json:"seat,omitempty"`
 }
 
 // QuotaSpan is one window of an allowance: how much of it is used and
@@ -128,13 +132,42 @@ type QuotaSpan struct {
 	Remaining float64    `json:"remaining"`
 	ResetsAt  *time.Time `json:"resetsAt,omitempty"`
 	Display   string     `json:"display,omitempty"` // the vendor's own count, "1.2k / 3k"
+	// Text: the window is its Display alone, Used and Remaining no
+	// reading (QuotaWindow.Text)
+	Text bool `json:"text,omitempty"`
+	// Lane names an allowance apart from the account's own (QuotaWindow.Lane)
+	Lane string `json:"lane,omitempty"`
 	// Amount of Limit in Unit: the window's count, used, when the vendor
 	// counts it so ("credits")
 	Amount float64 `json:"amount,omitempty"`
 	Limit  float64 `json:"limit,omitempty"`
 	Unit   string  `json:"unit,omitempty"`
 	Pool   string  `json:"pool,omitempty"` // the shared pool the window draws on ("Gemini")
+	// RunsOutAt is when the soonest of what is left is lost, apart from
+	// the reset, and RunsOut how much (QuotaWindow.RunsOutAt): WorkBuddy's
+	// credits come in packages that each end on their own day, and a free
+	// account's have no reset at all (#3762).
+	RunsOutAt *time.Time `json:"runsOutAt,omitempty"`
+	RunsOut   float64    `json:"runsOut,omitempty"`
+	// Balance is how much is left in Unit, a prepaid wallet's reading
+	// (QuotaWindow.Balance, #3950): Used and Remaining are then no share.
+	Balance *float64 `json:"balance,omitempty"`
+	// Spent is what magpie counted such a wallet spending since
+	// SpentSince, its period's first reading (QuotaWindow.Spent, #5770).
+	Spent      *float64   `json:"spent,omitempty"`
+	SpentSince *time.Time `json:"spentSince,omitempty"`
+	// Holds and HoldsWhy are the window's whole as the Usage page's card
+	// tells it (QuotaWindow.Holds, #2333): reckoned when ReckonHolds is
+	// set, else left out.
+	Holds    *WindowHolds `json:"holds,omitempty"`
+	HoldsWhy string       `json:"holdsWhy,omitempty"`
 }
+
+// ReckonHolds is usage.WithWindowHolds, which package usage sets: it reads
+// the usage log, which this package can't import. QuotaReport,
+// KeptQuotaReport and RefreshReport tell each window's whole by it, as the
+// Usage page does (#2333); nil, where usage isn't linked in, leaves it out.
+var ReckonHolds func(qs []SubscriptionQuota, now time.Time) []SubscriptionQuota
 
 // QuotaReport is Quotas as Quota, the reset times made absolute from now.
 func QuotaReport(ctx context.Context, now time.Time) []Quota {
@@ -142,21 +175,45 @@ func QuotaReport(ctx context.Context, now time.Time) []Quota {
 	return withServed(quotaReport(subs, plans, balances, now), LastServed())
 }
 
+// KeptQuotaReport is QuotaReport from what was last read (CachedCards),
+// asking no vendor: for a status line, which Claude Code runs again on
+// every message (#1997), so it must neither wait for a read nor start one.
+func KeptQuotaReport(now time.Time) []Quota {
+	var subs, plans, balances []SubscriptionQuota
+	for _, q := range CachedCards(now) {
+		switch q.Kind {
+		case "plan":
+			plans = append(plans, q)
+		case "balance":
+			balances = append(balances, q)
+		default:
+			subs = append(subs, q)
+		}
+	}
+	return withServed(quotaReport(subs, plans, balances, now), LastServed())
+}
+
 // quotaReport assembles the cards from readings the tests feed directly.
 func quotaReport(subs, plans, balances []SubscriptionQuota, now time.Time) []Quota {
+	if ReckonHolds != nil { // one pass over the log for every card
+		all := ReckonHolds(slices.Concat(subs, plans, balances), now)
+		ns, np := len(subs), len(plans)
+		subs, plans, balances = all[:ns], all[ns:ns+np], all[ns+np:]
+	}
 	out := []Quota{}
 	for _, g := range []struct {
 		kind string
 		qs   []SubscriptionQuota
 	}{{"subscription", subs}, {"plan", plans}, {"balance", balances}} {
 		for _, q := range g.qs {
-			r := Quota{Provider: q.Provider, Name: q.Name, Kind: g.kind, Plan: q.Plan, User: q.User, AsOf: q.AsOf, ReadAt: q.ReadAt,
-				Windows: []QuotaSpan{}, Balance: q.Balance, BillingEstimate: q.BillingEstimate, Error: q.Error, Until: q.Until, Renew: q.Renew, Resets: q.Resets, From: q.From}
+			r := Quota{Provider: q.Provider, Name: q.Name, Kind: g.kind, Plan: q.Plan, User: q.User, AsOf: q.AsOf, ReadAt: q.ReadAt, ReadDeferred: q.ReadDeferred, ReadError: q.ReadError,
+				Windows: []QuotaSpan{}, Balance: q.Balance, BillingEstimate: q.BillingEstimate, BalanceSplit: q.BalanceSplit, SharedBalance: q.SharedBalance, Error: q.Error, Until: q.Until, Renew: q.Renew, Resets: q.Resets, ResetsUsed: q.ResetsUsed, From: q.From, Alias: q.Alias, Seat: q.Seat}
 			// a pool's own windows stand in for the models' drawing on it,
 			// as the usage page shows them
 			for _, w := range PooledWindows(q.Windows) {
-				s := QuotaSpan{Unlimited: w.Unlimited, Name: w.Name, Used: w.Used, Remaining: max(0, 100-w.Used), ResetsAt: w.ResetsAt, Display: w.Display,
-					Amount: w.Amount, Limit: w.Limit, Unit: w.Unit, Pool: w.Pool}
+				s := QuotaSpan{Unlimited: w.Unlimited, Name: w.Name, Used: w.Used, Remaining: max(0, 100-w.Used), ResetsAt: w.ResetsAt, Display: w.Display, Text: w.Text, Lane: w.Lane,
+					Amount: w.Amount, Limit: w.Limit, Unit: w.Unit, Pool: w.Pool, RunsOutAt: w.RunsOutAt, RunsOut: w.RunsOut, Balance: w.Balance,
+					Spent: w.Spent, SpentSince: w.SpentSince, Holds: w.Holds, HoldsWhy: w.HoldsWhy}
 				if s.ResetsAt == nil && w.ResetSecs > 0 {
 					t := now.Add(time.Duration(w.ResetSecs) * time.Second)
 					s.ResetsAt = &t
@@ -167,6 +224,23 @@ func quotaReport(subs, plans, balances []SubscriptionQuota, now time.Time) []Quo
 		}
 	}
 	return out
+}
+
+// BalanceText is a wallet's balance as told, the figure in its unit:
+// "6,291 points left" (QuotaWindow.Balance).
+func BalanceText(b float64, unit string) string {
+	s := strconv.FormatFloat(math.Round(b*100)/100, 'f', -1, 64)
+	whole, frac, _ := strings.Cut(strings.TrimPrefix(s, "-"), ".")
+	for i := len(whole) - 3; i > 0; i -= 3 {
+		whole = whole[:i] + "," + whole[i:]
+	}
+	if frac != "" {
+		whole += "." + frac
+	}
+	if b < 0 {
+		whole = "-" + whole
+	}
+	return strings.TrimSpace(whole+" "+unit) + " left"
 }
 
 // ResetClock is when a window starts again, on the clock: "14:30" today,

@@ -123,12 +123,31 @@ func (s *s3) sendTo(ctx context.Context, method string, u *url.URL, body []byte,
 		return nil, err
 	}
 	for k, v := range h {
-		req.Header.Set(k, v)
+		if !unsigned(k) {
+			req.Header.Set(k, v)
+		}
 	}
 	payload := sum(body)
 	req.Header.Set("X-Amz-Content-Sha256", payload)
 	s.sig.sign(req, payload, s.now())
+	for k, v := range h {
+		if unsigned(k) {
+			req.Header.Set(k, v)
+		}
+	}
 	return s.client.Do(req)
+}
+
+// unsigned are the headers sent outside the signature: the conditions
+// (If-Match, If-None-Match, If-Modified-Since). SigV4 needs only the host
+// and x-amz-* signed, and a server, or a proxy before it, that checks the
+// signature over a condition as it reads it back rather than as it
+// arrived refuses a signed one with 403 SignatureDoesNotMatch. That came only once a sync had
+// kept the server's ETag to ask with, until the state was started afresh
+// (CyberCaius on Discord: a working key refused after a while, back after
+// switching to WebDAV and to S3 again).
+func unsigned(name string) bool {
+	return strings.HasPrefix(strings.ToLower(name), "if-")
 }
 
 // s3Error is what an S3 server says went wrong: its XML body's code and
@@ -216,6 +235,11 @@ func (s *s3) get(ctx context.Context, have version) (data []byte, v version, err
 	if err != nil {
 		return nil, version{}, err
 	}
+	// Go unpacks a gzip it asked for; an object stored compressed under
+	// another encoding, or without saying so, is unpacked here
+	if data, err = unpacked("S3", data, res.Header.Get("Content-Encoding")); err != nil {
+		return nil, version{}, fmt.Errorf("reading %s: %w", s.where(), err)
+	}
 	return data, versionOf(res.Header), nil
 }
 
@@ -258,7 +282,10 @@ func (s *s3) put(ctx context.Context, data []byte, etag string) (version, error)
 	// header. There the ETag is looked at with a HEAD just before an
 	// unconditional PUT: another computer's write in the moment between
 	// the two would be lost, where a conditional PUT would refuse it, but
-	// one at any other time since this computer read is still caught.
+	// one at any other time since this computer read is still caught. The
+	// write is told as blind, so the next sync can tell it was gone over
+	// and merges this computer's changes again (syncOnce, #1776: Aliyun
+	// OSS answers If-Match 400 NotImplemented).
 	now, there, err := s.head(ctx)
 	if err != nil {
 		return version{}, err
@@ -272,7 +299,7 @@ func (s *s3) put(ctx context.Context, data []byte, etag string) (version, error)
 	}
 	defer res.Body.Close()
 	if res.StatusCode >= 200 && res.StatusCode < 300 {
-		return version{ETag: res.Header.Get("ETag")}, nil
+		return version{ETag: res.Header.Get("ETag"), Blind: true}, nil
 	}
 	return version{}, s.explain("write", readError(res))
 }

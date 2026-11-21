@@ -30,7 +30,8 @@ import (
 
 	"github.com/tidwall/gjson"
 
-	"github.com/yetone/magpie/internal/agent"
+	"github.com/yetone/magpie/internal/desktopdir"
+	"github.com/yetone/magpie/internal/dirent"
 	"github.com/yetone/magpie/internal/edit"
 )
 
@@ -38,12 +39,24 @@ const desktopManifest = "manifest.json"
 
 // desktopSkillRoots are the skills-plugin folders of every account Claude
 // Desktop has, in its own folder and Claude-3p's alike: each one with a
-// manifest.json or the plugin's plugin.json.
+// manifest.json or the plugin's plugin.json. Claude Magpie's folder, the
+// isolated Desktop's, is not one of them: that app is given skills of its
+// own (agent.DesktopTwinApp, xMopf7RF on X).
 func desktopSkillRoots(desktopDir string) []string {
-	dirs := []string{desktopDir, filepath.Dir(agent.DesktopConfig3p(home()))}
-	if d, err := os.UserConfigDir(); err == nil {
-		dirs = append(dirs, filepath.Join(d, "Claude"), filepath.Join(d, "Claude-3p"))
+	home, _ := os.UserHomeDir()
+	twin := desktopdir.Isolated(desktopdir.OS, home)
+	var dirs []string
+	for _, d := range append([]string{desktopDir}, desktopdir.Everywhere()...) {
+		if twin == "" || filepath.Clean(d) != filepath.Clean(twin) {
+			dirs = append(dirs, d)
+		}
 	}
+	return desktopSkillRootsIn(dirs)
+}
+
+// desktopSkillRootsIn are the skills-plugin folders of every account in
+// dirs, Desktop's userData folders.
+func desktopSkillRootsIn(dirs []string) []string {
 	var out []string
 	seen := map[string]bool{}
 	for _, d := range dirs {
@@ -54,13 +67,13 @@ func desktopSkillRoots(desktopDir string) []string {
 		base := filepath.Join(d, "local-agent-mode-sessions", "skills-plugin")
 		orgs, _ := os.ReadDir(base)
 		for _, o := range orgs {
-			if !o.IsDir() {
+			if !dirent.IsFolder(base, o) {
 				continue
 			}
 			accts, _ := os.ReadDir(filepath.Join(base, o.Name()))
 			for _, a := range accts {
 				p := filepath.Join(base, o.Name(), a.Name())
-				if a.IsDir() && (isFile(filepath.Join(p, desktopManifest)) || isFile(filepath.Join(p, ".claude-plugin", "plugin.json"))) {
+				if dirent.IsFolder(filepath.Join(base, o.Name()), a) && (isFile(filepath.Join(p, desktopManifest)) || isFile(filepath.Join(p, ".claude-plugin", "plugin.json"))) {
 					out = append(out, p)
 				}
 			}
@@ -250,7 +263,7 @@ func (l *Library) syncDesktopSkills(t *Target, res *Result) {
 		put := map[string]bool{}
 		var drop []string
 		for _, name := range prior {
-			if s := l.skill(name); s != nil && slices.Contains(s.Agents, id) {
+			if s := l.skill(name); s.gives(id) {
 				continue
 			}
 			p := filepath.Join(dir, name)
@@ -273,21 +286,30 @@ func (l *Library) syncDesktopSkills(t *Target, res *Result) {
 			res.changed(id)
 		}
 		for _, s := range l.Skills {
-			if !slices.Contains(s.Agents, id) {
+			if !s.gives(id) {
 				continue
 			}
 			p := filepath.Join(dir, s.Name)
 			if ours(p, s.Name) {
 				keep(s.Name)
+				current := false
+				if !linked(p) {
+					var err error
+					current, err = copyIsFresh(p, l.libHash(s.Name), false)
+					if err != nil {
+						res.fail(id, "skill:"+s.Name, err)
+						continue
+					}
+				}
 				switch {
-				case linked(p) || !fresh(p, s.Name) && !desktopEdited(p):
+				case linked(p) || !current && !desktopEdited(p):
 					if err := desktopCopy(p, s.Name); err != nil {
 						res.fail(id, "skill:"+s.Name, err)
 						continue
 					}
 					put[s.Name] = true
 					res.changed(id)
-				case !fresh(p, s.Name):
+				case !current:
 					res.Problems = append(res.Problems, Problem{Agent: id, What: "skill:" + s.Name,
 						Error: fmt.Sprintf("%s was changed in Claude Desktop, so the library's copy isn't put over it: delete it in Desktop to have the library's again", s.Name)})
 				}
@@ -299,10 +321,12 @@ func (l *Library) syncDesktopSkills(t *Target, res *Result) {
 			}
 			// one of Desktop's own (built in, or made there) by that name
 			// stays, the library's left out; magpie's own entry, its folder
-			// gone, gets the folder back
+			// gone, gets the folder back. It is the agent's own, which the
+			// page settles by keeping Desktop's (#1896), not a write that
+			// failed and might work if tried again.
 			_, err := os.Lstat(p)
 			if err == nil || manifestEntry(raw, s.Name) != "" && !slices.Contains(prior, s.Name) {
-				res.Problems = append(res.Problems, Problem{Agent: id, What: "skill:" + s.Name,
+				res.Problems = append(res.Problems, Problem{Agent: id, What: "skill:" + s.Name, Own: true,
 					Error: fmt.Sprintf("Claude Desktop already has a skill of its own called %s", s.Name)})
 				continue
 			}

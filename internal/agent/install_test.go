@@ -27,14 +27,17 @@ func TestInstallCommands(t *testing.T) {
 		id, goos string
 		want     []string
 	}{
-		{"claude", "darwin", []string{"script: curl -fsSL https://claude.ai/install.sh | bash", "npm: npm install -g @anthropic-ai/claude-code"}},
-		{"claude", "windows", []string{"powershell: irm https://claude.ai/install.ps1 | iex", "npm: npm install -g @anthropic-ai/claude-code"}},
+		{"claude", "darwin", []string{"script: curl -fsSL https://claude.ai/install.sh | bash", "npm: npm install -g --allow-scripts=@anthropic-ai/claude-code @anthropic-ai/claude-code"}},
+		{"claude", "windows", []string{"powershell: irm https://claude.ai/install.ps1 | iex", "npm: npm install -g --allow-scripts=@anthropic-ai/claude-code @anthropic-ai/claude-code"}},
 		{"codex", "darwin", []string{"script: curl -fsSL https://chatgpt.com/codex/install.sh | sh", "brew: brew install --cask codex", "npm: npm install -g @openai/codex"}},
 		{"codex", "linux", []string{"script: curl -fsSL https://chatgpt.com/codex/install.sh | sh", "npm: npm install -g @openai/codex"}},
 		{"gemini", "linux", []string{"brew: brew install gemini-cli", "npm: npm install -g @google/gemini-cli"}},
 		{"gemini", "windows", []string{"npm: npm install -g @google/gemini-cli"}},
-		{"opencode", "darwin", []string{"script: curl -fsSL https://opencode.ai/install | bash", "npm: npm install -g opencode-ai"}},
-		{"opencode", "windows", []string{"npm: npm install -g opencode-ai"}},
+		{"opencode", "darwin", []string{"script: curl -fsSL https://opencode.ai/v2/install | bash", "npm: npm install -g --allow-scripts=@opencode/cli @opencode/cli"}},
+		{"opencode", "windows", []string{"npm: npm install -g --allow-scripts=@opencode/cli @opencode/cli"}},
+		{"deveco", "darwin", []string{"npm: npm install -g --allow-scripts=@deveco/deveco-code @deveco/deveco-code"}},
+		{"deveco", "windows", []string{"npm: npm install -g --allow-scripts=@deveco/deveco-code @deveco/deveco-code"}},
+		{"deveco", "linux", nil}, // no Linux build in its package
 		{"pi", "linux", []string{"npm: npm install -g @earendil-works/pi-coding-agent"}},
 		{"cursor", "darwin", nil}, // no command magpie knows
 	} {
@@ -51,7 +54,7 @@ func TestInstallsOnlyMissing(t *testing.T) {
 	here := &Agent{ID: "codex", Name: "Codex", Path: filepath.Join(home, "codex.toml"), Dir: home}
 	gone := &Agent{ID: "gemini", Name: "Gemini CLI", Icon: "gemini", Path: filepath.Join(home, "nope", "settings.json"), Bin: "gemini"}
 	wsl := &Agent{ID: "claude@wsl:Ubuntu", Name: "Claude Code", WSL: "Ubuntu", Path: filepath.Join(home, "nope", "x")}
-	none := &Agent{ID: "cursor", Name: "Cursor", Path: filepath.Join(home, "nope", "y")}
+	none := &Agent{ID: "cursor", Name: "Cursor CLI", Path: filepath.Join(home, "nope", "y")}
 	got := installsOf([]*Agent{here, gone, wsl, none}, "darwin", true)
 	if len(got) != 1 || got[0].ID != "gemini" || got[0].Name != "Gemini CLI" || got[0].Icon != "gemini" || len(got[0].Commands) != 2 {
 		t.Fatalf("installs: %+v", got)
@@ -78,7 +81,7 @@ func TestInstallCommandsWithoutNode(t *testing.T) {
 		{"pi", "windows", []InstallCmd{{Via: "npm", Node: "winget", Command: winget + "@earendil-works/pi-coding-agent"}}},
 		{"claude", "linux", []InstallCmd{
 			{Via: "script", Command: "curl -fsSL https://claude.ai/install.sh | bash"},
-			{Via: "npm", Node: "nvm", Command: nvm + "@anthropic-ai/claude-code"},
+			{Via: "npm", Node: "nvm", Command: nvm + "--allow-scripts=@anthropic-ai/claude-code @anthropic-ai/claude-code"},
 		}},
 	} {
 		if got := installCommands(c.id, c.goos, false); !reflect.DeepEqual(got, c.want) {
@@ -101,8 +104,11 @@ func TestInstallCommandsWithoutNode(t *testing.T) {
 // npm is found in a folder of a user's tools (nvm's, Homebrew's), as
 // npm.cmd on Windows; a folder without it, or a folder named npm, isn't it.
 func TestNpmIn(t *testing.T) {
-	empty, nvm, win, odd := t.TempDir(), t.TempDir(), t.TempDir(), t.TempDir()
+	empty, nvm, win, odd, miseExe := t.TempDir(), t.TempDir(), t.TempDir(), t.TempDir(), t.TempDir()
 	testenv.Program(t, filepath.Join(nvm, "npm"), "#!/bin/sh\n")
+	if err := os.WriteFile(filepath.Join(miseExe, "npm.exe"), []byte("MZ"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(filepath.Join(win, "npm.cmd"), nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -120,6 +126,8 @@ func TestNpmIn(t *testing.T) {
 		{[]string{nvm}, "windows", false},
 		{[]string{empty, win}, "windows", true},
 		{[]string{win}, "linux", false},
+		// mise's shims folder in its default (exe) mode
+		{[]string{empty, miseExe}, "windows", true},
 	} {
 		if got := npmIn(c.dirs, c.goos); got != c.want {
 			t.Errorf("npmIn(%q, %s) = %v, want %v", c.dirs, c.goos, got, c.want)

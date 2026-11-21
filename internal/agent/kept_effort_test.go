@@ -196,8 +196,8 @@ func TestCodeBuddyKeepsTheUsersDefaultEffort(t *testing.T) {
 	}
 }
 
-// ZCode's config.json: a defaultVariant set by hand stays through a sync.
-func TestZCodeKeepsTheUsersDefaultVariant(t *testing.T) {
+// ZCode's config.json: a defaultLevel set by hand stays through a sync.
+func TestZCodeKeepsTheUsersDefaultLevel(t *testing.T) {
 	home := keptEffortHome(t)
 	path := filepath.Join(home, ".zcode", "v2", "config.json")
 	os.MkdirAll(filepath.Dir(path), 0o755)
@@ -209,9 +209,46 @@ func TestZCodeKeepsTheUsersDefaultVariant(t *testing.T) {
 	b, _ := os.ReadFile(path)
 	json.Unmarshal(b, &doc)
 	r := doc["provider"].(map[string]any)[magpieID].(map[string]any)["models"].(map[string]any)["think/wide"].(map[string]any)["reasoning"].(map[string]any)
-	if r["defaultVariant"] != "medium" {
+	if r["defaultLevel"] != "medium" {
 		t.Fatalf("magpie's default: %s", b)
 	}
+	r["defaultLevel"] = "high"
+	b, _ = json.Marshal(doc)
+	os.WriteFile(path, b, 0o644)
+	if err := a.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	var c struct {
+		Provider map[string]struct {
+			Models map[string]struct {
+				Reasoning struct{ DefaultLevel string }
+			}
+		}
+	}
+	b, _ = os.ReadFile(path)
+	json.Unmarshal(b, &c)
+	ms := c.Provider[magpieID].Models
+	if ms["think/deep"].Reasoning.DefaultLevel != "high" || ms["think/wide"].Reasoning.DefaultLevel != "high" {
+		t.Fatalf("after sync: %s", b)
+	}
+}
+
+// A default a magpie before #3852 wrote as defaultVariant — a key ZCode
+// never read — is carried over: the user's choice survives the first sync
+// on the keys ZCode reads.
+func TestZCodeCarriesTheOldDefaultVariantOver(t *testing.T) {
+	home := keptEffortHome(t)
+	path := filepath.Join(home, ".zcode", "v2", "config.json")
+	os.MkdirAll(filepath.Dir(path), 0o755)
+	a := zcode(home)
+	if err := a.Field("provider").Set(magpieID); err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]any
+	b, _ := os.ReadFile(path)
+	json.Unmarshal(b, &doc)
+	r := doc["provider"].(map[string]any)[magpieID].(map[string]any)["models"].(map[string]any)["think/wide"].(map[string]any)["reasoning"].(map[string]any)
+	delete(r, "defaultLevel")
 	r["defaultVariant"] = "high"
 	b, _ = json.Marshal(doc)
 	os.WriteFile(path, b, 0o644)
@@ -221,14 +258,14 @@ func TestZCodeKeepsTheUsersDefaultVariant(t *testing.T) {
 	var c struct {
 		Provider map[string]struct {
 			Models map[string]struct {
-				Reasoning struct{ DefaultVariant string }
+				Reasoning struct{ DefaultLevel string }
 			}
 		}
 	}
 	b, _ = os.ReadFile(path)
 	json.Unmarshal(b, &c)
 	ms := c.Provider[magpieID].Models
-	if ms["think/deep"].Reasoning.DefaultVariant != "high" || ms["think/wide"].Reasoning.DefaultVariant != "high" {
+	if ms["think/wide"].Reasoning.DefaultLevel != "high" {
 		t.Fatalf("after sync: %s", b)
 	}
 }
@@ -276,10 +313,10 @@ func TestMiniMaxKeepsTheUsersDefaultEffort(t *testing.T) {
 		t.Fatal(err)
 	}
 	c, raw := readMiniMax(t, path)
-	if c.CustomProvider[magpieID].Models["think/wide"].Thinking.DefaultEffort != "high" {
+	if c.CustomProvider[magpieID].Models["think~wide"].Thinking.DefaultEffort != "high" {
 		t.Fatalf("magpie's default:\n%s", raw)
 	}
-	at := strings.Index(raw, "think/wide:")
+	at := strings.Index(raw, "think~wide:")
 	raw = raw[:at] + strings.Replace(raw[at:], "defaultEffort: high", "defaultEffort: low", 1)
 	os.WriteFile(path, []byte(raw), 0o644)
 	if err := a.Sync(); err != nil {
@@ -287,7 +324,53 @@ func TestMiniMaxKeepsTheUsersDefaultEffort(t *testing.T) {
 	}
 	c, raw = readMiniMax(t, path)
 	ms := c.CustomProvider[magpieID].Models
-	if ms["think/wide"].Thinking.DefaultEffort != "low" || ms["think/deep"].Thinking.DefaultEffort != "high" {
+	if ms["think~wide"].Thinking.DefaultEffort != "low" || ms["think~deep"].Thinking.DefaultEffort != "high" {
 		t.Fatalf("after sync:\n%s", raw)
+	}
+}
+
+// ZCode's config.json: providerOptionsByLevel a user wrote for a level
+// (the workaround #3852's reporter could have had in place) stays through
+// a sync; the levels they left alone get magpie's.
+func TestZCodeKeepsTheUsersLevelOptions(t *testing.T) {
+	home := keptEffortHome(t)
+	path := filepath.Join(home, ".zcode", "v2", "config.json")
+	os.MkdirAll(filepath.Dir(path), 0o755)
+	a := zcode(home)
+	if err := a.Field("provider").Set(magpieID); err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]any
+	b, _ := os.ReadFile(path)
+	json.Unmarshal(b, &doc)
+	r := doc["provider"].(map[string]any)[magpieID].(map[string]any)["models"].(map[string]any)["think/deep"].(map[string]any)["reasoning"].(map[string]any)
+	r["providerOptionsByLevel"] = map[string]any{"high": map[string]any{"thinking": map[string]any{"type": "adaptive"}}}
+	b, _ = json.Marshal(doc)
+	os.WriteFile(path, b, 0o644)
+	if err := a.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	var c struct {
+		Provider map[string]struct {
+			Models map[string]struct {
+				Reasoning struct {
+					Options map[string]struct {
+						Thinking struct {
+							Type   string `json:"type"`
+							Budget int    `json:"budget_tokens"`
+						} `json:"thinking"`
+					} `json:"providerOptionsByLevel"`
+				}
+			}
+		}
+	}
+	b, _ = os.ReadFile(path)
+	json.Unmarshal(b, &c)
+	o := c.Provider[magpieID].Models["think/deep"].Reasoning.Options
+	if o["high"].Thinking.Type != "adaptive" || o["high"].Thinking.Budget != 0 {
+		t.Fatalf("the user's high level was written over: %s", b)
+	}
+	if o["low"].Thinking.Type != "enabled" || o["low"].Thinking.Budget != 4096 || o["disabled"].Thinking.Type != "disabled" {
+		t.Fatalf("the levels the user left alone: %s", b)
 	}
 }

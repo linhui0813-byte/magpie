@@ -133,7 +133,7 @@ func TestTraceOrderIsAList(t *testing.T) {
 	if !strings.Contains(string(b), `"order":[]`) || strings.Contains(string(b), `"order":null`) {
 		t.Fatalf("trace routes = %s, want order []", b)
 	}
-	if _, c := s.trace.sessionLatest(context.Background(), "", 0, 0); c == nil || c.Order == nil {
+	if _, c := s.trace.sessionLatest(context.Background(), "", "", 0, 0); c == nil || c.Order == nil {
 		t.Fatalf("session's latest route = %+v, want a non-nil order", c)
 	}
 }

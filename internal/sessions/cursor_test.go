@@ -249,6 +249,10 @@ func TestCursor(t *testing.T) {
 	want := "cursor-agent --resume " + curMain
 	if runtime.GOOS != "windows" {
 		want = "cd '/work/cur' && " + want
+	} else {
+		// the same prefix every other resume here gets on Windows
+		// (sessions.go's resumeCommand), as TestCarryPiToOmp expects
+		want = "Set-Location -LiteralPath '/work/cur'; " + want
 	}
 	if s.Resume != want {
 		t.Fatalf("resume %q, want %q", s.Resume, want)
@@ -279,10 +283,10 @@ func TestCursor(t *testing.T) {
 	tools := map[string]int{}
 	for _, f := range cursorFiles() {
 		if st := cache[f.path]; st != nil && f.key == "cursor:"+curMain {
-			if st.Days[date] == nil {
+			if st.Days.of(date) == nil {
 				t.Fatalf("%s counts no day %s: %v", f.path, date, st.Days)
 			}
-			for name, n := range st.Days[date].Tools {
+			for name, n := range st.Days.of(date).Tools.all() {
 				tools[name] += n
 			}
 		}

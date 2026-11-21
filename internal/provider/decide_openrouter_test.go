@@ -200,3 +200,78 @@ func TestOpenRouterDecisionListRefreshed(t *testing.T) {
 		t.Fatal("a list with its facts was fetched again")
 	}
 }
+
+// A routing group's pickers offer an OpenRouter provider's decision models
+// as its picks say (coeo91 on Discord: two free models picked, and a new
+// group's picker listed OpenRouter's decision models after them, which the
+// provider's editor showed unpicked). With none picked every one is
+// offered; one a group names already is offered whatever the picks; and
+// the gateway still answers each, picked or not.
+func TestOpenRouterDecidersOfferedAsPicked(t *testing.T) {
+	h := t.TempDir()
+	t.Setenv("HOME", h)
+	t.Setenv("USERPROFILE", h)
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	fakeOpenRouter(t)
+
+	ids := func(es []Entry) []string {
+		var out []string
+		for _, e := range es {
+			out = append(out, e.ID)
+		}
+		return out
+	}
+	all := []string{"openrouter/perplexity/pplx-decider-v1-27b", "openrouter/liquid/d1", "openrouter/~typesafe/jev-latest"}
+	save := func(picks ...string) {
+		t.Helper()
+		if err := Save(Provider{ID: "openrouter", Name: "OpenRouter", Preset: "openrouter", Key: "k",
+			Chat: "https://openrouter.ai/api/v1", Decide: "https://openrouter.ai/api/v1", Models: picks}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	save()
+	p, err := Find("openrouter")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.Fetch(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// none picked: every decision model, as before
+	if got := ids(OfferedDeciders(nil)); !slices.Equal(got, all) {
+		t.Fatalf("none picked, offered: %v", got)
+	}
+
+	// two chat models picked: no decision model is offered, while the
+	// gateway still lists and answers each
+	save("openai/gpt-5", "typesafe/jev-router")
+	if got := ids(OfferedDeciders(nil)); len(got) != 0 {
+		t.Fatalf("chat models picked, offered: %v", got)
+	}
+	if got := ids(Deciders()); !slices.Equal(got, all) {
+		t.Fatalf("the gateway's: %v", got)
+	}
+	if _, m, err := RouteDecider("openrouter/liquid/d1"); err != nil || m != "liquid/d1" {
+		t.Fatalf("an unpicked decision model isn't answered: %s %v", m, err)
+	}
+
+	// one a group names is offered still, the rest not
+	named := func(id string) bool { return id == "openrouter/~typesafe/jev-latest" }
+	if got := ids(OfferedDeciders(named)); !slices.Equal(got, []string{"openrouter/~typesafe/jev-latest"}) {
+		t.Fatalf("named by a group, offered: %v", got)
+	}
+
+	// one decision model picked beside a chat model: that one alone
+	save("openai/gpt-5", "liquid/d1")
+	if got := ids(OfferedDeciders(nil)); !slices.Equal(got, []string{"openrouter/liquid/d1"}) {
+		t.Fatalf("liquid/d1 picked, offered: %v", got)
+	}
+	// and agents are still not offered it as a chat model
+	for _, e := range providerEntries() {
+		if e.Model == "liquid/d1" {
+			t.Fatal("a picked decision model is offered to agents")
+		}
+	}
+}

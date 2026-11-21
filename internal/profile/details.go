@@ -1,12 +1,12 @@
 package profile
 
 import (
-	"regexp"
 	"slices"
 	"sort"
 	"strings"
 
 	"github.com/yetone/magpie/internal/agent"
+	"github.com/yetone/magpie/internal/lazyre"
 )
 
 // Group is what a profile holds for one agent, to be read before it is
@@ -22,6 +22,17 @@ type Group struct {
 	Servers      []string `json:"servers,omitempty"`
 	Skills       []string `json:"skills,omitempty"`
 	Instructions bool     `json:"instructions,omitempty"`
+	// Models is the model list it is switched to (#1368); nil when the
+	// profile keeps none for it, which leaves its list as it is
+	Models *Models `json:"models,omitempty"`
+}
+
+// Models is a model list as a profile's details tell it: how many models
+// are taken out, or, Only, how many are the only ones picked.
+type Models struct {
+	Hidden int  `json:"hidden"`
+	Only   bool `json:"only,omitempty"`
+	Picked int  `json:"picked,omitempty"`
 }
 
 // Item is one saved field. Value "" is the agent's own default, or, with
@@ -41,8 +52,8 @@ type Item struct {
 // model or provider id has). No agent field holds one today, but
 // profiles.json is a file anyone can edit.
 var (
-	secretName  = regexp.MustCompile(`(?i)(key|token|secret|passw|credential|cookie)`)
-	secretValue = regexp.MustCompile(`^(sk-|sk_|ghp_|gho_|ghu_|github_pat_|xox[abpr]-|AIza|eyJ)|[A-Za-z0-9]{32,}`)
+	secretName  = lazyre.New(`(?i)(key|token|secret|passw|credential|cookie)`)
+	secretValue = lazyre.New(`^(sk-|sk_|ghp_|gho_|ghu_|github_pat_|xox[abpr]-|AIza|eyJ)|[A-Za-z0-9]{32,}`)
 )
 
 func secret(key, label, value string) bool {
@@ -55,10 +66,15 @@ func secret(key, label, value string) bool {
 // follows: Claude Code's four tiers are all there, one that follows the main
 // model saying so (#480: opus and fable, following it, were missing, and
 // read as not set). What applying the profile writes is unchanged.
-func Details(p Profile) []Group {
-	known := map[string]*agent.Agent{}
-	var order []string
-	for _, a := range agent.All() {
+func Details(p Profile) []Group { return DetailsIn(p, agent.All()) }
+
+// DetailsIn is Details over all, the agents a page already built for its
+// request: the state route lists every profile, and building the agents
+// again for each one was the page's largest single cost after its own.
+func DetailsIn(p Profile, all []*agent.Agent) []Group {
+	known := make(map[string]*agent.Agent, len(all))
+	order := make([]string, 0, len(all))
+	for _, a := range all {
 		known[a.ID] = a
 		order = append(order, a.ID)
 	}
@@ -88,6 +104,13 @@ func Details(p Profile) []Group {
 			take(id)
 		}
 		for id := range l.Instructions.Extra {
+			take(id)
+		}
+	}
+	// a list nobody picked for is told only beside the agent's model: an
+	// agent of no fields and no list of its own is no line of the details
+	for id, ml := range p.Models {
+		if !ml.Default() {
 			take(id)
 		}
 	}
@@ -147,7 +170,10 @@ func Details(p Profile) []Group {
 			i := l.Instructions
 			g.Instructions = i.Extra[id] != "" || i.Shared != "" && slices.Contains(i.Agents, id)
 		}
-		if len(g.Fields) == 0 && len(g.Servers) == 0 && len(g.Skills) == 0 && !g.Instructions {
+		if ml, ok := p.Models[id]; ok && (!ml.Default() || len(g.Fields) > 0) {
+			g.Models = &Models{Hidden: len(ml.Hidden), Only: ml.Only, Picked: len(ml.Picked)}
+		}
+		if len(g.Fields) == 0 && len(g.Servers) == 0 && len(g.Skills) == 0 && !g.Instructions && g.Models == nil {
 			continue
 		}
 		out = append(out, g)

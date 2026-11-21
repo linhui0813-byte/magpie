@@ -4,10 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/yetone/magpie/internal/provider"
 	"github.com/yetone/magpie/internal/testenv"
@@ -43,6 +46,7 @@ func TestWarmClaudeAsksClaudeCodeOnce(t *testing.T) {
 	b, _ := os.ReadFile(log)
 	got := string(b)
 	for _, want := range []string{"[-p]", "[--model][haiku]", "[--tools][]", "[--setting-sources][]", "[--no-session-persistence]",
+		`[--settings][{"disableDeepLinkRegistration":"disable",`,
 		"dir:/saved/account\n", "base:\n", "stdin:hi", "magpie-claude-"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("run lacks %q:\n%s", want, got)
@@ -110,14 +114,80 @@ func TestClaudeUsageRunsClaudeCode(t *testing.T) {
 	testenv.Program(t, filepath.Join(dir, "claude"), script)
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "leaked")
-	got, err := claudeUsage(context.Background())
+	got, err := claudeUsage(context.Background(), "")
 	if err != nil || got != text {
 		t.Fatalf("usage %q %v", got, err)
 	}
 	b, _ = os.ReadFile(log)
-	for _, want := range []string{"[-p][/usage]", "[--setting-sources][]", "[--strict-mcp-config]", "[--no-session-persistence]", "token:\n"} {
+	for _, want := range []string{"[-p][/usage]", "[--setting-sources][]", "[--strict-mcp-config]", "[--no-session-persistence]", "token:\n",
+		`[--settings][{"disableDeepLinkRegistration":"disable",`} {
 		if !strings.Contains(string(b), want) {
 			t.Errorf("run lacks %q:\n%s", want, b)
+		}
+	}
+}
+
+// Claude Code's -p /usage prints no figure for extra usage (usage
+// credits), but its verbose json carries a usage_report with the month's cap
+// and spend (Shinji_Zl on X). The read adds them as a line for the card, and
+// adds none for an account with it off, no cap, or a Claude Code that sends
+// no report.
+func TestClaudeUsageCredits(t *testing.T) {
+	text := "Current session: 13% used · resets 4pm (Asia/Shanghai)"
+	msgs := func(extra string) string {
+		report := ``
+		if extra != "" {
+			report = `,"usage_report":{"rate_limits":{"limits":null,"extra_usage":` + extra + `}}`
+		}
+		return `[{"type":"system","subtype":"init"},{"type":"assistant"` + report + `},{"type":"result","is_error":false,"result":"` + text + `"}]`
+	}
+	for _, c := range []struct{ name, extra, want string }{
+		{"on", `{"is_enabled":true,"monthly_limit":50000,"used_credits":27140,"utilization":54,"currency":"USD"}`, "\nExtra usage: 271.40 / 500.00 USD spent"},
+		{"unused", `{"is_enabled":true,"monthly_limit":2000,"used_credits":null,"utilization":null,"currency":"USD"}`, "\nExtra usage: 0.00 / 20.00 USD spent"},
+		{"off", `{"is_enabled":false,"monthly_limit":null,"used_credits":null,"utilization":null,"currency":null}`, ""},
+		{"no cap", `{"is_enabled":true,"monthly_limit":null,"used_credits":100,"utilization":null,"currency":"USD"}`, ""},
+		{"no report", "", ""},
+	} {
+		fakeWarmClaude(t, msgs(c.extra), 0)
+		got, err := claudeUsage(context.Background(), "")
+		want := text + c.want
+		if err != nil || got != want {
+			t.Errorf("%s: usage %q %v, want %q", c.name, got, err, want)
+		}
+	}
+}
+
+// A Claude Enterprise seat's -p /usage printed only the subscription line
+// (@andy_chen1997 on X): its meters came as the usage endpoint's rows
+// (limits[]), which Claude Code's text doesn't draw. The read adds them as
+// /usage's own lines; a report of no meters ([]) as the plan having none;
+// a null one, a fetch that failed or a server before rows, adds nothing.
+// The rows follow Claude Code 2.1.328's usage_report schema; no Enterprise
+// account was at hand.
+func TestClaudeUsageRows(t *testing.T) {
+	const sub = "You are currently using your subscription to power your Claude Code usage"
+	msgs := func(text, limits string) string {
+		return `[{"type":"system","subtype":"init"},{"type":"assistant","usage_report":{"rate_limits":` + limits + `}},{"type":"result","is_error":false,"result":"` + text + `"}]`
+	}
+	rows := `{"limits":[` +
+		`{"kind":"session","group":"session","percent":37.5,"resets_at":"2026-11-19T15:00:00.000Z","scope":null,"severity":"normal","is_active":true},` +
+		`{"kind":"weekly_scoped","group":"weekly","percent":4,"resets_at":null,"scope":{"model":{"display_name":"Fable"}}},` +
+		`{"kind":"weekly_scoped","group":"weekly","percent":9,"resets_at":null,"scope":{"surface":{"display_name":"Claude Design"}}},` +
+		`{"kind":"new_meter","group":"x","percent":50,"resets_at":null}` +
+		`],"extra_usage":null}`
+	for _, c := range []struct{ name, text, limits, want string }{
+		{"rows", sub, rows, "\nCurrent session: 37.5% used · resets 2026-11-19T15:00:00.000Z\nCurrent week (Fable): 4% used"},
+		{"text drew its own", "Current session: 13% used", rows, ""},
+		{"no meters", sub, `{"limits":[],"extra_usage":null}`, "\n" + provider.ClaudeNoLimitsLine},
+		{"no meters, credits", sub, `{"limits":[],"extra_usage":{"is_enabled":true,"monthly_limit":50000,"used_credits":100,"currency":"USD"}}`, "\n" + provider.ClaudeNoLimitsLine + "\nExtra usage: 1.00 / 500.00 USD spent"},
+		{"a row of another shape", sub, `{"limits":[{"kind":"session","percent":"most"}],"extra_usage":{"is_enabled":true,"monthly_limit":50000,"used_credits":100,"currency":"USD"}}`, "\nExtra usage: 1.00 / 500.00 USD spent"},
+		{"rows unknown", sub, `{"limits":null,"extra_usage":null}`, ""},
+		{"fetch failed", sub, `null`, ""},
+	} {
+		fakeWarmClaude(t, msgs(c.text, c.limits), 0)
+		got, err := claudeUsage(context.Background(), "")
+		if want := c.text + c.want; err != nil || got != want {
+			t.Errorf("%s: usage %q %v, want %q", c.name, got, err, want)
 		}
 	}
 }
@@ -130,7 +200,7 @@ func TestClaudeUsageSendsItsRequest(t *testing.T) {
 	for _, k := range []string{"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "DISABLE_TELEMETRY", "DISABLE_ERROR_REPORTING", "DISABLE_AUTOUPDATER"} {
 		t.Setenv(k, "")
 	}
-	if _, err := claudeUsage(context.Background()); err != nil {
+	if _, err := claudeUsage(context.Background(), ""); err != nil {
 		t.Fatal(err)
 	}
 	b, _ := os.ReadFile(log)
@@ -146,11 +216,31 @@ func TestClaudeUsageSendsItsRequest(t *testing.T) {
 		t.Errorf("warm-up lacks CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:\n%s", b)
 	}
 	t.Setenv("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
-	if _, err := claudeUsage(context.Background()); err != nil {
+	if _, err := claudeUsage(context.Background(), ""); err != nil {
 		t.Fatal(err)
 	}
 	if b, _ := os.ReadFile(log); !strings.Contains(string(b), "traffic:1\n") {
 		t.Errorf("/usage run dropped the user's CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:\n%s", b)
+	}
+}
+
+func TestClaudeUsageRunsInSavedAccountDirectory(t *testing.T) {
+	log := fakeWarmClaude(t, `{"type":"result","is_error":false,"result":"Current session: 17% used"}`, 0)
+	t.Setenv("CLAUDE_CONFIG_DIR", "/the/users/own")
+	t.Setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", "/another/account")
+	got, err := claudeUsage(context.Background(), "/saved/account")
+	if err != nil || got != "Current session: 17% used" {
+		t.Fatalf("usage %q %v", got, err)
+	}
+	b, err := os.ReadFile(log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), "dir:/saved/account\n") || !strings.Contains(string(b), "[-p][/usage]") {
+		t.Fatalf("saved account's /usage ran in the wrong directory:\n%s", b)
+	}
+	if os.Getenv("CLAUDE_CONFIG_DIR") != "/the/users/own" || os.Getenv("CLAUDE_SECURESTORAGE_CONFIG_DIR") != "/another/account" {
+		t.Fatal("reading saved usage changed the caller's account directory")
 	}
 }
 
@@ -165,7 +255,7 @@ func TestClaudeVerboseOutput(t *testing.T) {
 		{"type": "result", "subtype": "success", "is_error": false, "result": text},
 	})
 	fakeWarmClaude(t, string(b), 0)
-	got, err := claudeUsage(context.Background())
+	got, err := claudeUsage(context.Background(), "")
 	if err != nil || got != text {
 		t.Fatalf("usage %q %v", got, err)
 	}
@@ -176,5 +266,72 @@ func TestClaudeVerboseOutput(t *testing.T) {
 	fakeWarmClaude(t, string(b), 1)
 	if err := warmClaude(context.Background(), ""); err == nil || !strings.Contains(err.Error(), "Please run /login") || strings.Contains(err.Error(), "init") {
 		t.Fatalf("got %v", err)
+	}
+}
+
+// heng91 on #1894: claude processes in Task Manager with no Claude session
+// open. A test or /usage run of Claude Code that outlives its time is
+// killed, and what it started goes with it: npm's claude.cmd is cmd.exe
+// running node, and only cmd.exe was killed. A script stands in, which
+// starts a child and hangs; once the run is given up on, the child is gone.
+func TestClaudeRunEndsWhatItStarted(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("a shell script stands in for Claude Code")
+	}
+	for _, run := range []struct {
+		name string
+		f    func(ctx context.Context) error
+	}{
+		{"test", func(ctx context.Context) error { return askClaude(ctx, "", "haiku") }},
+		{"usage", func(ctx context.Context) error { _, err := claudeUsage(ctx, ""); return err }},
+	} {
+		t.Run(run.name, func(t *testing.T) {
+			dir := t.TempDir()
+			pidFile := filepath.Join(dir, "child")
+			testenv.Program(t, filepath.Join(dir, "claude"), "#!/bin/sh\nsleep 300 </dev/null >/dev/null 2>&1 &\necho $! > "+pidFile+"\nsleep 300\n")
+			t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+			var pid int
+			t.Cleanup(func() {
+				if pid > 0 {
+					if p, err := os.FindProcess(pid); err == nil {
+						p.Kill()
+					}
+				}
+			})
+			// given up on once it has started its child, however busy the
+			// machine: a timeout that came first had nothing to leave behind
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			go func() {
+				for ctx.Err() == nil {
+					if b, _ := os.ReadFile(pidFile); strings.HasSuffix(string(b), "\n") {
+						cancel()
+						return
+					}
+					time.Sleep(10 * time.Millisecond)
+				}
+			}()
+			if err := run.f(ctx); err == nil {
+				t.Fatal("a run that never answered passed")
+			}
+			b, err := os.ReadFile(pidFile)
+			if err != nil {
+				t.Fatal(err)
+			}
+			pid, _ = strconv.Atoi(strings.TrimSpace(string(b)))
+			if pid <= 0 {
+				t.Fatalf("pid %q", b)
+			}
+			// gone, or a zombie waiting for init to reap it
+			for end := time.Now().Add(5 * time.Second); ; time.Sleep(20 * time.Millisecond) {
+				out, _ := exec.Command("ps", "-o", "stat=", "-p", strconv.Itoa(pid)).Output()
+				if st := strings.TrimSpace(string(out)); st == "" || strings.HasPrefix(st, "Z") {
+					break
+				}
+				if time.Now().After(end) {
+					t.Fatalf("what Claude Code started is still running (%d)", pid)
+				}
+			}
+		})
 	}
 }

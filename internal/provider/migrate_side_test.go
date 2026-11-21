@@ -13,10 +13,10 @@ import (
 	"github.com/yetone/magpie/internal/update"
 )
 
-// moveAndBack does what Move and MoveBack do with a mover's accounts, but
-// for the plugin in between: the accounts go out, the built-in's saved ones
-// go aside, extra (sign-ins made through the plugin since) join them, and
-// every one comes back. It gives the accounts that went out and the saved
+// moveAndBack does what Move, and putBack after a failed one, do with a
+// mover's accounts, but for the plugin in between: the accounts go out,
+// the built-in's saved ones go aside, extra (sign-ins made through the
+// plugin since) join them, and every one comes back. It gives the accounts that went out and the saved
 // accounts before and after.
 func moveAndBack(t *testing.T, id string, extra ...map[string]any) (out []Moving, before, after []savedLogin) {
 	t.Helper()
@@ -114,13 +114,13 @@ func TestMoveDevin(t *testing.T) {
 
 	out, before, after := moveAndBack(t, "devin",
 		// the CLI's account, its key since rotated in the CLI: still the CLI's
-		map[string]any{"type": "api", "key": "key-stale", "metadata": map[string]any{"email": "dev@example.com", "cli": true}},
+		map[string]any{"type": "api", "key": "key-stale", "metadata": map[string]any{"email": "dev@example.com", "cli": "true"}},
 		map[string]any{"type": "api", "key": "key-three", "metadata": map[string]any{"email": "three@example.com", "plan": "Pro"}})
 	if len(out) != 2 || out[0].User != "two@example.com" || !out[0].First || out[0].Own ||
 		out[0].Auth["key"] != "key-two" || out[0].Auth["metadata"].(map[string]any)["server"] != "https://eu.codeium.com" ||
 		out[0].Auth["metadata"].(map[string]any)["plan"] != "Devin Max" ||
 		out[1].User != "dev@example.com" || !out[1].Own || out[1].Auth["key"] != "key-own" || out[1].Auth["metadata"].(map[string]any)["server"] != nil ||
-		out[1].Auth["metadata"].(map[string]any)["cli"] != true || out[0].Auth["metadata"].(map[string]any)["cli"] != nil {
+		out[1].Auth["metadata"].(map[string]any)["cli"] != "true" || out[0].Auth["metadata"].(map[string]any)["cli"] != nil {
 		t.Fatalf("out %+v", out)
 	}
 	ls := loginsOfAgent(after, "devin")

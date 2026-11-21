@@ -11,7 +11,6 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"regexp"
 	"runtime"
 	"slices"
 	"strconv"
@@ -21,12 +20,13 @@ import (
 	"github.com/pelletier/go-toml/v2"
 	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/edit"
+	"github.com/yetone/magpie/internal/lazyre"
 	"github.com/yetone/magpie/internal/provider"
 )
 
 const reasonixKey = "MAGPIE_REASONIX_API_KEY"
 
-var reasonixKeyLine = regexp.MustCompile(`(?m)^\s*(?:export\s+)?` + reasonixKey + `\s*=`)
+var reasonixKeyLine = lazyre.New(`(?m)^\s*(?:export\s+)?` + reasonixKey + `\s*=`)
 
 // Every API request and catalog sync constructs its own Agent. The transaction
 // must cover the whole edit and rollback across those instances, including reads.
@@ -88,7 +88,7 @@ func reasonixIn(at place) *Agent {
 	if at.spell != nil {
 		goos, getenv = "linux", func(string) string { return "" }
 	}
-	dir := reasonixHome(goos, at.home, getenv)
+	dir := at.open(reasonixHome(goos, at.home, getenv))
 	gwKey := func() string { return agentKeyAt("reasonix", at.gw()) }
 	if absolute, err := filepath.Abs(dir); err == nil {
 		dir = absolute
@@ -261,7 +261,7 @@ func reasonixIn(at place) *Agent {
 			}
 			currentState.AddedAccess = true
 		}
-		if token, _ := edit.GetEnvFile(env, reasonixKey); token != gwKey() {
+		if token, _ := edit.GetEnvFile(env, reasonixKey); !keyHolds(token, gwKey()) {
 			if err := edit.SetEnvFile(env, edit.KV{Path: reasonixKey, Value: gwKey()}); err != nil {
 				return err
 			}
@@ -297,11 +297,11 @@ func reasonixIn(at place) *Agent {
 	}
 
 	a := &Agent{
-		ID: "reasonix", Name: "Reasonix Studio", Icon: "reasonix-color", Aliases: []string{"reasonix-studio"},
+		ID: "reasonix", Name: "Reasonix Studio", Icon: "reasonix-color", Aliases: []string{"reasonix-studio"}, NoNames: true,
 		Bin: "reasonix", Dir: dir, Path: path, UA: []string{"reasonix"},
 		detect: func() bool { return reasonixDetected(at.home) },
 		Notice: func() string {
-			return "Reasonix Studio 2.x and the native 1.39.x/2.x CLI read global settings at startup. Start a new process to load changes. Project/session models can override Executor and Plan."
+			return noticeReasonix.String()
 		},
 		Check: func() string {
 			ref, on := strings.CutPrefix(model(), magpieID+"/")
@@ -328,10 +328,10 @@ func reasonixIn(at place) *Agent {
 			if err := checkOwner(cfg, state); err != nil {
 				return err.Error()
 			}
-			if p.Kind != "openai" || p.BaseURL != at.v1() {
+			if p.Kind != "openai" || p.BaseURL != at.v1() && !reachesMagpie(p.BaseURL, at.v1()) {
 				return "Reasonix's magpie base_url or kind changed"
 			}
-			if token, _ := edit.GetEnvFile(env, reasonixKey); token != gwKey() {
+			if token, _ := edit.GetEnvFile(env, reasonixKey); !keyHolds(token, gwKey()) {
 				return "Reasonix's gateway credential changed"
 			}
 			if !slices.Contains(p.Models, ref) || cfg.Agent.Planner != nil && usesMagpie(*cfg.Agent.Planner) && !slices.Contains(p.Models, strings.TrimPrefix(*cfg.Agent.Planner, magpieID+"/")) {
@@ -393,7 +393,7 @@ func reasonixIn(at place) *Agent {
 						addNative(*state.Default)
 					}
 					addNative(cur["model"])
-					return append(group("Reasonix Studio", own), viaMagpie("reasonix", magpieID+"/")...)
+					return withVia(group("Reasonix Studio", own), "reasonix", magpieID+"/")
 				},
 			},
 			{Key: "effort", Label: "effort", Quiet: true,
@@ -672,3 +672,8 @@ func reasonixArray(values []string) edit.Raw {
 	}
 	return edit.Raw("[" + strings.Join(quoted, ", ") + "]")
 }
+
+// what reasonix says after a change (notice.go)
+var (
+	noticeReasonix = newNotice("Reasonix Studio 2.x and the native 1.39.x/2.x CLI read global settings at startup. Start a new process to load changes. Project/session models can override Executor and Plan.")
+)

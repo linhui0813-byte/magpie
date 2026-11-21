@@ -72,6 +72,24 @@ func antigravityNameEffort(name string) (string, string) {
 	return strings.TrimSpace(name[:open]), level
 }
 
+// antigravityNameSpells is whether a name, without the level in brackets,
+// is the id's family written out: "Gemini 3.5 Flash Lite" spells
+// gemini-3.5-flash-lite, "Gemini 3.7 Flash (Low)" gemini-3.7-flash-low;
+// "Gemini 3.5 Flash Lite" doesn't spell gemini-2.5-flash.
+func antigravityNameSpells(name, id string) bool {
+	n, _ := antigravityNameEffort(name)
+	n = strings.Join(strings.Fields(n), "-")
+	return n != "" && strings.EqualFold(n, EffortFamily(id))
+}
+
+// antigravityEnumNames is whether Antigravity's enum for a model names that
+// id itself (MODEL_GOOGLE_GEMINI_2_5_FLASH is gemini-2.5-flash); the
+// models it names for themselves have placeholders (MODEL_PLACEHOLDER_M198).
+func antigravityEnumNames(enum, id string) bool {
+	e, ok := strings.CutPrefix(enum, "MODEL_GOOGLE_")
+	return ok && e != "" && strings.EqualFold(e, strings.NewReplacer("-", "_", ".", "_").Replace(id))
+}
+
 // antigravityFamily is one family of Antigravity's ids.
 type antigravityFamily struct {
 	id       string
@@ -173,7 +191,10 @@ func antigravityFamilies(raw []catalog.Model) []*antigravityFamily {
 // level the request asks), so an agent's list showed it as its bare id,
 // magpie/antigravity/gemini-3.7-flash-tiered (EZN7L2C3, #955): it is
 // named for the model it is a tier of, "Gemini 3.7 Flash (Tiered)", and
-// any other model Antigravity leaves unnamed by its id.
+// any other model Antigravity leaves unnamed by its id. It thinks at the
+// levels that model has, and says so: with none, Pi, Codex and the rest
+// offered no effort for it (PapainTea on X), while sent low, medium or
+// high it thinks ~650, ~3800 or ~10000 tokens on one question.
 func collapseAntigravityModels(raw []catalog.Model) []catalog.Model {
 	var out []catalog.Model
 	for _, f := range antigravityFamilies(raw) {
@@ -183,17 +204,22 @@ func collapseAntigravityModels(raw []catalog.Model) []catalog.Model {
 		}
 		out = append(out, f.model())
 	}
-	names := map[string]string{}
+	byID := map[string]catalog.Model{}
 	for _, m := range out {
-		names[m.ID] = m.Name
+		byID[m.ID] = m
 	}
 	for i, m := range out {
+		b, tiered := strings.CutSuffix(m.ID, "-tiered")
+		base, ok := byID[b]
+		if tiered && ok && len(m.Efforts) == 0 {
+			out[i].Efforts = slices.Clone(base.Efforts)
+		}
 		if m.Name != "" {
 			continue
 		}
 		out[i].Name = m.ID
-		if b, ok := strings.CutSuffix(m.ID, "-tiered"); ok && names[b] != "" && names[b] != b {
-			out[i].Name = names[b] + " (Tiered)"
+		if tiered && ok && base.Name != "" && base.Name != b {
+			out[i].Name = base.Name + " (Tiered)"
 		}
 	}
 	return out

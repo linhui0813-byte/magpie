@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/yetone/magpie/internal/access"
+	"github.com/yetone/magpie/internal/edit"
 	"github.com/yetone/magpie/internal/provider"
 )
 
@@ -16,12 +18,16 @@ func codexHome(t *testing.T, auth, config string) (home string, read func() stri
 	t.Setenv("USERPROFILE", home)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
 	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
+	// an app's data on Linux (Grok App's, #1668)
+	t.Setenv("XDG_DATA_HOME", filepath.Join(home, ".local", "share"))
+	t.Setenv("XDG_STATE_HOME", filepath.Join(home, ".local", "state"))
 	t.Setenv("CODEX_HOME", "")
 	t.Setenv("HANA_HOME", "")
 	// folders an agent's own variable moves out of the sandbox home
 	t.Setenv("OPENCODE_CONFIG_DIR", "")
 	t.Setenv("OPENCHAMBER_DATA_DIR", "")
 	t.Setenv("MIMOCODE_HOME", "")
+	t.Setenv("DEVECO_CONFIG_DIR", "")
 	t.Setenv("MINIMAX_DATA_DIR", "")
 	// Windows' own folders too: Claude Desktop's are in LOCALAPPDATA
 	t.Setenv("APPDATA", filepath.Join(home, "AppData", "Roaming"))
@@ -209,6 +215,64 @@ func TestCodexSubagentModel(t *testing.T) {
 	}
 }
 
+// #1633 (laacmilan): the model magpie puts every Codex subagent on offers
+// another provider's models, not only a ChatGPT account's, and takes one;
+// one of Codex's own bare names, which magpie can't put a request on, is
+// refused.
+func TestCodexSubagentModelTakesAnyProvider(t *testing.T) {
+	home, _ := codexHome(t, `{"tokens":{"access_token":"x","id_token":"x.e30.x"}}`, "model = \"gpt-5.5\"\n")
+	sub := codex(home).Field("subagent_model")
+	if sub == nil {
+		t.Fatal("no subagent model field")
+	}
+	offered := false
+	for _, o := range sub.Options(nil) {
+		offered = offered || o.Value == "fake/m1"
+	}
+	if !offered {
+		t.Fatalf("fake/m1 not offered: %+v", sub.Options(nil))
+	}
+	if err := sub.Set("fake/m1"); err != nil {
+		t.Fatal(err)
+	}
+	if got := sub.Get(); got != "fake/m1" {
+		t.Fatalf("subagent model = %q", got)
+	}
+	if err := sub.Set("gpt-5.5"); err == nil {
+		t.Error("a bare name of Codex's own was taken")
+	}
+	if err := sub.Set(""); err != nil || sub.Get() != "" {
+		t.Fatalf("Default: %v %q", err, sub.Get())
+	}
+}
+
+// The GUI shows one setting for the subagents' model, the one magpie puts
+// them all on: a pick there, Default too, takes away Codex's own [agents]
+// default_subagent_model, which read the same and nobody could tell apart,
+// and keeps the user's other [agents] keys; a refused pick leaves it.
+func TestCodexSubagentModelReplacesConfigs(t *testing.T) {
+	for _, pick := range []string{"fake/m1", ""} {
+		home, read := codexHome(t, `{"tokens":{"access_token":"x","id_token":"x.e30.x"}}`,
+			"model = \"gpt-5.5\"\n\n[agents]\nmax_threads = 6\ndefault_subagent_model = \"gpt-5.4-mini\"\n")
+		sub := codex(home).Field("subagent_model")
+		if err := sub.Set("gpt-5.5"); err == nil {
+			t.Fatal("a bare name of Codex's own was taken")
+		}
+		if cfg := read(); !strings.Contains(cfg, "default_subagent_model") {
+			t.Fatalf("a refused pick took Codex's away:\n%s", cfg)
+		}
+		if err := sub.Set(pick); err != nil {
+			t.Fatal(err)
+		}
+		if cfg := read(); strings.Contains(cfg, "default_subagent_model") || !strings.Contains(cfg, "max_threads = 6") {
+			t.Fatalf("pick %q:\n%s", pick, cfg)
+		}
+		if got := sub.Get(); got != pick {
+			t.Fatalf("subagent model = %q, want %q", got, pick)
+		}
+	}
+}
+
 // Subagents can start at an effort of their own (#469): Codex's [agents]
 // default_subagent_reasoning_effort, used when a spawn names none. Codex
 // refuses a spawn at a level the subagents' model lacks, so magpie takes
@@ -379,5 +443,44 @@ func TestCodexSyncPutsProviderTableBack(t *testing.T) {
 	}
 	if cfg := read(); cfg != "model = \"gpt-5.5\"\n" {
 		t.Fatalf("own model:\n%s", cfg)
+	}
+}
+
+// #2545: a key made under Gateway keys, put in the provider table's
+// experimental_bearer_token in place of magpie's, goes through magpie all
+// the same, so a model pick keeps it, as a sync keeps one. A key the
+// gateway doesn't take is still wired over.
+func TestCodexPickKeepsAGatewayKeyOfTheUsers(t *testing.T) {
+	home, read := codexHome(t, `{"tokens":{"access_token":"x","id_token":"x.e30.x"}}`,
+		"model = \"gpt-5.5\"\n\n[projects.\"/x\"]\ntrust_level = \"trusted\"\n")
+	cx := codex(home)
+	if err := cx.Fields[0].Set("fake/m1"); err != nil {
+		t.Fatal(err)
+	}
+	if cfg := read(); !strings.Contains(cfg, `experimental_bearer_token = "magpie"`) {
+		t.Fatalf("not wired:\n%s", cfg)
+	}
+	secret, err := access.Update("add-key", access.Change{Name: "codex"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(home, ".codex", "config.toml")
+	if err := edit.SetTOMLKey(path, "model_providers.magpie", "experimental_bearer_token", secret); err != nil {
+		t.Fatal(err)
+	}
+	if err := cx.Fields[0].Set("fake/m1"); err != nil {
+		t.Fatal(err)
+	}
+	if cfg := read(); !strings.Contains(cfg, `experimental_bearer_token = "`+secret+`"`) {
+		t.Fatalf("a model pick wrote over the user's caller key:\n%s", cfg)
+	}
+	if err := edit.SetTOMLKey(path, "model_providers.magpie", "experimental_bearer_token", "sk-not-this-gateways"); err != nil {
+		t.Fatal(err)
+	}
+	if err := cx.Fields[0].Set("fake/m1"); err != nil {
+		t.Fatal(err)
+	}
+	if cfg := read(); strings.Contains(cfg, `experimental_bearer_token = "sk-not-this-gateways"`) {
+		t.Fatalf("a key the gateway doesn't take is kept:\n%s", cfg)
 	}
 }

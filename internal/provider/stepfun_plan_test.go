@@ -8,6 +8,7 @@ import (
 	"os"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -21,6 +22,9 @@ type fakeStepFun struct {
 	renewed  atomic.Int32
 	account  string // who a renewal says it is
 	rateBody string
+	// others are other accounts' access tokens it takes too, each with
+	// the windows it tells that account
+	others sync.Map
 }
 
 func newFakeStepFun(t *testing.T, site string) *fakeStepFun {
@@ -47,13 +51,18 @@ func newFakeStepFun(t *testing.T, site string) *fakeStepFun {
 			io.WriteString(w, `{"accessToken":{"raw":"`+n+`","duration":1800},"refreshToken":{"raw":"`+ref+`"}}`)
 			return
 		}
+		body := f.rateBody
 		if acc != f.access.Load().(string) {
-			http.Error(w, `{"code":"unauthenticated","message":"auth failed: token is expired"}`, http.StatusUnauthorized)
-			return
+			other, ok := f.others.Load(acc)
+			if !ok {
+				http.Error(w, `{"code":"unauthenticated","message":"auth failed: token is expired"}`, http.StatusUnauthorized)
+				return
+			}
+			body = other.(string)
 		}
 		switch r.URL.Path {
 		case "/api/step.openapi.devcenter.Dashboard/QueryStepPlanRateLimit":
-			io.WriteString(w, f.rateBody)
+			io.WriteString(w, body)
 		case "/api/step.openapi.devcenter.Dashboard/GetStepPlanStatus":
 			io.WriteString(w, `{"subscription":{"plan_type":"2","name":"Plus","expired_at":"1793000000","auto_renew":true},"plan_definition":{"price":"9900"}}`)
 		default:
@@ -132,34 +141,34 @@ func TestStepFunSession(t *testing.T) {
 
 	anon, ref := stepfunTokens("999", time.Now().Add(time.Hour), false)
 	f.access.Store(anon)
-	if err := SaveStepFunSession(ctx, "ai", anon, ref, "web-1"); err == nil || StepFunSignedIn("ai") {
+	if err := SaveStepFunSession(ctx, "stepfun", "ai", anon, ref, "web-1"); err == nil || StepFunSignedIn("stepfun") {
 		t.Fatalf("an anonymous session was kept: %v", err)
 	}
 
 	// three minutes left: kept, then renewed before it is used
 	acc, ref := stepfunTokens("4161", time.Now().Add(3*time.Minute), true)
 	f.access.Store(acc)
-	if err := SaveStepFunSession(ctx, "ai", acc, ref, "web-1"); err != nil {
+	if err := SaveStepFunSession(ctx, "stepfun", "ai", acc, ref, "web-1"); err != nil {
 		t.Fatal(err)
 	}
 	if fi, err := os.Stat(stepfunPath()); err != nil || runtime.GOOS != "windows" && fi.Mode().Perm() != 0o600 {
 		t.Fatalf("session file: %v %v", fi, err)
 	}
-	p := Provider{ID: "stepfun", Name: "StepFun", Icon: "stepfun-color", Chat: "https://api.stepfun.ai/step_plan/v1"}
-	q := stepPlanQuota(ctx, "ai", p)
+	p := Provider{ID: "stepfun", Name: "StepFun", Icon: "stepfun", Chat: "https://api.stepfun.ai/step_plan/v1"}
+	q := stepPlanQuota(ctx, p)
 	if q.Error != "" || q.Plan != "Plus" || len(q.Windows) != 3 || q.Renew != "auto" || q.Until == nil || q.Until.Unix() != 1793000000 {
 		t.Fatalf("card: %+v", q)
 	}
 	if f.renewed.Load() != 1 {
 		t.Errorf("renewed %d times, want 1", f.renewed.Load())
 	}
-	if s := loadStepFun()["ai"]; s.Access != f.access.Load().(string) {
+	if s := loadStepFun()["stepfun"]; s.Access != f.access.Load().(string) {
 		t.Error("the renewed session wasn't kept")
 	}
 
 	// the platform expires the session early: renewed once, and asked again
 	f.access.Store("something-else")
-	if q := stepPlanQuota(ctx, "ai", p); q.Error != "" || len(q.Windows) != 3 {
+	if q := stepPlanQuota(ctx, p); q.Error != "" || len(q.Windows) != 3 {
 		t.Fatalf("after an early expiry: %+v", q)
 	}
 
@@ -167,11 +176,11 @@ func TestStepFunSession(t *testing.T) {
 	// anonymous: signed out, not another account's windows
 	f.account = "777"
 	f.access.Store("expired")
-	if q := stepPlanQuota(ctx, "ai", p); q.Error != errStepFunSession.Error() || len(q.Windows) != 0 {
+	if q := stepPlanQuota(ctx, p); q.Error != errStepFunSession.Error() || len(q.Windows) != 0 {
 		t.Fatalf("renewed as another: %+v", q)
 	}
 
-	if err := SignOutStepFun("ai"); err != nil || StepFunSignedIn("ai") {
+	if err := SignOutStepFun("stepfun"); err != nil || StepFunSignedIn("stepfun") {
 		t.Fatalf("signed out: %v", err)
 	}
 }
@@ -192,20 +201,20 @@ func TestSaveStepFunPaste(t *testing.T) {
 		stepfunPaste + `{"site":"ai","access":"` + acc + `","refresh":"` + ref + `"}`,
 		stepfunPaste + `{not json`,
 	} {
-		if err := SaveStepFunPaste(ctx, "com", bad); err == nil || StepFunSignedIn("com") {
+		if err := SaveStepFunPaste(ctx, "stepfun-cn", "com", bad); err == nil || StepFunSignedIn("stepfun-cn") {
 			t.Fatalf("%.40q was kept: %v", bad, err)
 		}
 	}
 	// the page's web id is the refresh token's device, even when the
 	// bookmarklet found none
-	if err := SaveStepFunPaste(ctx, "com", "  "+stepfunPaste+`{"site":"com","access":"`+acc+`","refresh":"`+ref+`","webId":""}`+"\n"); err != nil || !StepFunSignedIn("com") {
+	if err := SaveStepFunPaste(ctx, "stepfun-cn", "com", "  "+stepfunPaste+`{"site":"com","access":"`+acc+`","refresh":"`+ref+`","webId":""}`+"\n"); err != nil || !StepFunSignedIn("stepfun-cn") {
 		t.Fatalf("the bookmarklet's copy: %v", err)
 	}
-	if s := loadStepFun()["com"]; s.WebID != "web-1" || s.Account != "4161" {
+	if s := loadStepFun()["stepfun-cn"]; s.WebID != "web-1" || s.Account != "4161" {
 		t.Errorf("kept %+v", s)
 	}
-	SignOutStepFun("com")
-	if err := SaveStepFunPaste(ctx, "com", "Oasis-Token="+acc+"..."+ref+"; Path=/"); err != nil || !StepFunSignedIn("com") {
+	SignOutStepFun("stepfun-cn")
+	if err := SaveStepFunPaste(ctx, "stepfun-cn", "com", "Oasis-Token="+acc+"..."+ref+"; Path=/"); err != nil || !StepFunSignedIn("stepfun-cn") {
 		t.Fatalf("the cookie: %v", err)
 	}
 }

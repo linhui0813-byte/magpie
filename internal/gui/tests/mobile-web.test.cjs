@@ -2,14 +2,18 @@
 // Phone navigation and content stay usable in both languages (#391). The
 // desktop screenshots match BASE_REF within a small rendering tolerance
 // (origin/main by default), but for the Agents page while BASE_REF hasn't its
-// 「接入」 rows yet; only API boundaries are faked, never the page's layout or
-// scrolling helpers.
+// 「接入」 rows yet. Until BASE_REF has the visibility manager, its new footer
+// alone is excluded; agent-bulk-visibility and agent-grip cover that footer's
+// layout and controls. Its height is rounded only for the pixel comparison,
+// so unchanged text below keeps the baseline's subpixel antialiasing. API
+// boundaries are faked; the page's scrolling helpers are left intact.
 const assert = require("node:assert/strict");
 const fs = require("node:fs/promises");
 const path = require("node:path");
 const { execFileSync } = require("node:child_process");
 const { test } = require("node:test");
 const { chromium, webkit } = require("playwright");
+const { reach, openPage } = require("./reader.cjs");
 const { PNG } = require("playwright-core/lib/utilsBundle");
 
 const assets = path.resolve(__dirname, "../assets");
@@ -43,12 +47,35 @@ const agentRows = [
     modelField("small", "smol"), modelField("slow", "slow"),
   ] },
 ];
+// the labels app.js groups into omp's roles square (OMP_ROLES)
+const OMP_ROLES = ["subagents", "smol", "slow", "plan", "vision", "advisor"];
 const views = ["agents", "providers", "gateway", "routing", "usage", "library", "plugins", "settings"];
 
+// BASE_REF's assets, all read in one git call the first time one is asked
+// for. A git show per file blocked the fake server for each of the ~100
+// the original page loads: under load its goto passed the 5s timeout, or
+// its icons came after the screenshot (WebKit, the two OpenAI marks on
+// Providers, 338 pixels).
 function baselineFile(file) {
-  if (!baseline.has(file)) baseline.set(file, execFileSync("git", ["show", `${base}:internal/gui/assets/${file}`], { cwd: assets, maxBuffer: 4 * 1024 * 1024 }));
+  if (!baseline.size) {
+    const root = path.resolve(assets, "../../.."), dir = "internal/gui/assets/";
+    const names = execFileSync("git", ["ls-tree", "-r", "--name-only", base, dir], { cwd: root }).toString().split("\n").filter(Boolean);
+    const out = execFileSync("git", ["cat-file", "--batch"], { cwd: root, input: names.map((n) => `${base}:${n}\n`).join(""), maxBuffer: 256 * 1024 * 1024 });
+    let at = 0;
+    for (const name of names) {
+      const nl = out.indexOf(10, at);
+      const size = Number(out.subarray(at, nl).toString().split(" ")[2]);
+      baseline.set(name.slice(dir.length), out.subarray(nl + 1, nl + 1 + size));
+      at = nl + 1 + size + 1;
+    }
+  }
+  if (!baseline.has(file)) throw new Error(`${file} isn't in ${base}`);
   return baseline.get(file);
 }
+
+// the files being served now: a picture still on its way (an icon's mask is
+// fetched by the page itself, apart from any preload) isn't drawn yet
+let serving = 0;
 
 function server(lang, original = false, opened = []) {
   return async route => {
@@ -78,18 +105,20 @@ function server(lang, original = false, opened = []) {
     if (url.pathname.startsWith("/api/")) return json({});
     const file = url.pathname === "/" ? "index.html" : url.pathname.slice(1);
     const contentType = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".svg": "image/svg+xml", ".png": "image/png" }[path.extname(file)];
+    serving++;
     try {
       let body;
       if (original) body = baselineFile(file);
       else body = await fs.readFile(path.join(assets, file));
       await route.fulfill({ body, contentType });
-    } catch { await route.fulfill({ status: 404 }); }
+    } catch { await route.fulfill({ status: 404 }); } finally { serving--; }
   };
 }
 
 async function open(browser, lang, width, { original = false, touch = true, opened = [] } = {}) {
   const page = await browser.newPage({ viewport: { width, height: 900 }, hasTouch: touch, reducedMotion: "reduce", colorScheme: "light" });
   page.setDefaultTimeout(5000);
+  page.setDefaultNavigationTimeout(60000);
   await page.addInitScript(at => {
     const RealDate = Date;
     window.Date = class extends RealDate {
@@ -104,10 +133,10 @@ async function open(browser, lang, width, { original = false, touch = true, open
 }
 
 async function go(page, view) {
-  // Playwright scrolls each real navigation button into sight before clicking;
-  // this exercises the phone's horizontal navigation strip too.
-  await page.locator(view === "settings" ? "#prefs" : `#nav [data-view="${view}"]`).click();
-  await page.locator(`#view-${view}`).waitFor();
+  // the page's tab, or on a phone's tab bar More and its row for a page
+  // past the fifth (phonetabs.js)
+  if (view === "settings") await page.locator("#prefs").click();
+  await (view === "settings" ? page.locator(`#view-${view}`).waitFor() : openPage(page, view));
   if (view === "library") await page.locator("#view-library .lib-more:not(:disabled)").waitFor();
   if (view === "plugins") await page.locator("#view-plugins .pm-find").waitFor();
   if (view === "usage") {
@@ -115,7 +144,27 @@ async function go(page, view) {
     await page.locator("#quotaHead").waitFor({ state: "hidden" });
   }
   await page.evaluate(() => document.fonts.ready);
+  // every icon drawn: a mask's picture paints once it has come, which the
+  // 800ms below doesn't promise on a loaded machine (nothing served for a
+  // while, then a frame)
+  for (let quiet = 0; quiet < 3; quiet = serving ? 0 : quiet + 1) await page.waitForTimeout(50);
+  await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
   await page.waitForTimeout(800); // let the tab's spring and content entrance settle
+}
+
+// a screenshot once two in a row are the same: WebKit fetches a mask's
+// picture first when it paints it, which a screenshot can be the first to do
+// (an icon still on its way when the page was drawn), so the screenshot
+// waits for what it asked for and is taken again
+async function still(page) {
+  let last;
+  for (let i = 0; i < 10; i++) {
+    const png = await page.screenshot({ animations: "disabled" });
+    if (last && png.equals(last)) break;
+    last = png;
+    for (let quiet = 0; quiet < 3; quiet = serving ? 0 : quiet + 1) await page.waitForTimeout(50);
+  }
+  return last;
 }
 
 async function save(page, name) {
@@ -136,7 +185,10 @@ async function agentsFit(page) {
   for (const agent of agentRows) {
     const row = page.locator(`.row.agent[data-id="${agent.id}"]`);
     await row.waitFor();
-    // opened, its pickers in the row
+    // opened, its pickers in the row; the last row opened can push this one
+    // out of sight, so it is wheeled to once that one has slid open
+    await page.waitForFunction(() => !document.getAnimations().length);
+    await reach(page, row.locator(".ag-link"));
     await row.locator(".ag-link").click();
     await row.locator(".ag-exp").waitFor();
     const bad = await row.evaluate(row => {
@@ -150,12 +202,25 @@ async function agentsFit(page) {
       return bad;
     });
     assert.deepEqual(bad, [], agent.name + ": every control and model name must be visible");
-    for (const field of agent.fields) {
-      await row.locator(`.field[data-key="${field.key}"]`).click();
-      await page.locator("#pop").waitFor();
-      assert.equal(await page.locator("#pop").isVisible(), true, agent.name + ": " + field.key + " opens");
-      await page.locator('#nav [data-view="agents"]').click();
-      await page.locator("#pop").waitFor({ state: "hidden" });
+    // omp's subagents, smol and slow roles share one square, as Claude
+    // Code's tiers do (#1397, fc5dfa3c): it opens their menu
+    const keys = [...new Set(agent.fields.map((f) => agent.id === "omp" && OMP_ROLES.includes(f.label) ? "tiers" : f.key))];
+    for (const key of keys) {
+      try {
+        const field = row.locator(`.field[data-key="${key}"]`);
+        await page.waitForFunction(() => !document.getAnimations().length);
+        await reach(page, field);
+        await field.click();
+        await page.locator("#pop").waitFor();
+      } catch (e) { throw new Error(`${agent.id} ${key} open: ${e.message.split("\n")[0]}`); }
+      assert.equal(await page.locator("#pop").isVisible(), true, agent.name + ": " + key + " opens");
+      // shut by a tap on the header's name: a picker opened low in a tall
+      // row (Codex's holds its own settings) can cover the phone's tab bar,
+      // and the page's lead line can be scrolled under the header's tabs
+      const brand = await page.locator("header.top .brand").boundingBox();
+      await page.mouse.click(brand.x + brand.width / 2, brand.y + brand.height / 2);
+      try { await page.locator("#pop").waitFor({ state: "hidden" }); }
+      catch (e) { throw new Error(`${agent.id} ${key} shut: ${e.message.split("\n")[0]}`); }
     }
   }
 }
@@ -187,7 +252,7 @@ async function usageFits(page) {
     return bad;
   });
   assert.deepEqual(bad, []);
-  for (const selector of ["#usageAgents .cost", "#usageModels .cost"]) assert.match(await page.locator(selector).first().textContent(), /≈\$12\.34/);
+  for (const selector of ["#usageAgents .cost", "#usageModels .cost"]) assert.match(await page.locator(selector).first().textContent(), /^\$12\.34$/);
 }
 
 for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium", "webkit"])) {
@@ -265,16 +330,104 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
               await current.mouse.move(0, 0); await original.mouse.move(0, 0);
               // Removing hover can repaint the tab's shadow in a later frame.
               await current.waitForTimeout(350); await original.waitForTimeout(350);
-              const before = PNG.sync.read(await original.screenshot({ animations: "disabled" }));
-              const after = PNG.sync.read(await current.screenshot({ animations: "disabled" }));
+              // The new management footer intentionally differs from main.
+              // Compare the rest at its new position: the footer also moves
+              // Profiles down. Compare the footer too once main contains it.
+              // Do not skip the Agents page or increase the pixel tolerance.
+              let addedFooter = view === "agents" && !baselineFile("app.js").includes("function agentsManageButton")
+                ? await current.locator("#agentsManage").boundingBox() : null;
+              if (addedFooter) {
+                // A fractional new height changes text antialiasing below it,
+                // even after translating the screenshot back. Normalize only
+                // that new height; the footer's real layout is tested separately.
+                await current.locator("#agentsManage").evaluate((bar, height) => {
+                  bar.style.boxSizing = "border-box";
+                  bar.style.height = Math.ceil(height) + "px";
+                }, addedFooter.height);
+                addedFooter = await current.locator("#agentsManage").boundingBox();
+              }
+              // Plugins' Built-in tab is new: until BASE_REF has it, the
+              // page is compared with that tab taken out of its strip (the
+              // sidebar's list follows the strip); builtins.test.cjs covers
+              // the tab and its list.
+              if (view === "plugins" && !baselineFile("plugins.js").includes("function drawBuiltin")) {
+                await current.locator("#view-plugins .lib-tabs .opt").first().evaluate((b) => b.remove());
+                await current.waitForTimeout(350);
+              }
+              // Usage's lists fold under their headings and the tokens tile's
+              // label is a pop-up (#2378): until BASE_REF has them, each is
+              // put back to the plain label it was, and the rest of the page
+              // is compared as ever; usage-overview-fold.test.cjs covers them.
+              if (view === "usage" && !baselineFile("plugins/usage/page.js").toString().includes("function mountUsageFolds")) {
+                await current.evaluate(() => {
+                  for (const b of document.querySelectorAll("#usagePane .row-head .fold, #stats .kpi-pick")) b.replaceWith(b.querySelector(".label, span"));
+                });
+                await current.waitForTimeout(350);
+              }
+              // Usage's lists' order picks are new (onducoder on X): until
+              // BASE_REF has them, they are taken out; usage-sort.test.cjs
+              // covers them.
+              if (view === "usage" && !baselineFile("plugins/usage/page.js").toString().includes("function usageSortPick")) {
+                await current.evaluate(() => { for (const b of document.querySelectorAll("#usagePane .row-head .us-sort, #usagePane .row-head .us-sort-gap")) b.remove(); });
+                await current.waitForTimeout(350);
+              }
+              // Replies' Short Claude system prompt row is new: until BASE_REF
+              // has it, the page is compared with the row taken out;
+              // claude-lean-prompt-setting.test.cjs covers the row.
+              if (view === "settings" && !baselineFile("app.js").includes("claudeLeanRow")) {
+                await current.locator("#claudeLeanRow").evaluate((r) => r.remove());
+                await current.waitForTimeout(350);
+              }
+              // The Routing page's Settings › button is new: until BASE_REF
+              // has it, the page is compared with the button taken out;
+              // settings-places.test.cjs covers it.
+              if (view === "routing" && !baselineFile("plugins/routing/client.js").toString().includes("rtToSet")) {
+                await current.locator("#rtToSet").evaluate((b) => b.remove());
+                await current.waitForTimeout(350);
+              }
+              // So is the Usage page's, in the allowances' head.
+              if (view === "usage" && !baselineFile("plugins/usage/client.js").toString().includes("usageToSet")) {
+                await current.locator("#usageToSet").evaluateAll((bs) => bs.forEach((b) => b.remove()));
+                await current.waitForTimeout(350);
+              }
+              // A setting row's line wraps whole (arculongus on Discord):
+              // until BASE_REF has that, the page is compared with the lines
+              // held to one line as they were; settings-lines-wrap.test.cjs
+              // covers the wrapping.
+              if (view === "settings" && !baselineFile("app.css").includes("arculongus")) {
+                await current.addStyleTag({ content: ".row.pref .sub { white-space: nowrap; overflow-wrap: normal; }" });
+                await current.waitForTimeout(350);
+              }
+              // The sidebar's button sits ahead of the magpie in both layouts
+              // (ztf4080 on X), so the header beside the sidebar no longer
+              // starts with it: until BASE_REF has it, the button, the magpie
+              // and the header beside the sidebar are left out of both pictures and the rest
+              // compared as ever; side-toggle.test.cjs covers where they are.
+              if (!baselineFile("app.js").includes("append(btn, brand)")) {
+                for (const p of [current, original]) await p.addStyleTag({ content: "#sideToggle, .brand, body.side-nav .top { visibility: hidden !important; }" });
+                await current.waitForTimeout(350);
+              }
+              const before = PNG.sync.read(await still(original));
+              const after = PNG.sync.read(await still(current));
               const sameSize = before.width === after.width && before.height === after.height;
               let changedPixels = 0;
               // Chromium can repaint antialiased edges differently even when
               // comparing HEAD with itself. Count a pixel once only when one
               // of its channels changes by more than 48; size changes always fail.
+              const scale = before.width / width;
               if (sameSize) for (let i = 0; i < before.data.length; i += 4) {
+                const row = Math.floor(i / 4 / before.width), col = (i / 4) % before.width;
+                // Only the footer's own column moves: the sidebar beside the
+                // list (at 1280) stays where it was.
+                const shifted = addedFooter && row >= Math.floor(addedFooter.y * scale)
+                  && col >= Math.floor(addedFooter.x * scale) && col < Math.ceil((addedFooter.x + addedFooter.width) * scale)
+                  ? Math.round(addedFooter.height * scale) : 0;
+                // Both images retain their real viewport size. The added
+                // footer pushes this last slice below the current viewport.
+                if (row + shifted >= after.height) continue;
+                const j = i + shifted * after.width * 4;
                 for (let channel = 0; channel < 4; channel++) {
-                  if (Math.abs(before.data[i + channel] - after.data[i + channel]) > 48) {
+                  if (Math.abs(before.data[i + channel] - after.data[j + channel]) > 48) {
                     changedPixels++;
                     break;
                   }

@@ -10,7 +10,9 @@ import (
 )
 
 // Every command magpie runs is made here, or the desktop app on Windows
-// opens a console window for it again.
+// opens a console window for it again. internal/testenv is left out: only
+// tests import it, never the app, and it can't import proc, whose own tests
+// import it.
 func TestNoCommandBypassesProc(t *testing.T) {
 	root, _ := filepath.Abs(filepath.Join("..", ".."))
 	bare := regexp.MustCompile(`\bexec\.Command(Context)?\(`)
@@ -19,7 +21,7 @@ func TestNoCommandBypassesProc(t *testing.T) {
 			return err
 		}
 		if d.IsDir() {
-			if path != root && (strings.HasPrefix(d.Name(), ".") || d.Name() == "node_modules" || path == filepath.Join(root, "internal", "proc")) {
+			if path != root && (strings.HasPrefix(d.Name(), ".") || d.Name() == "node_modules" || path == filepath.Join(root, "internal", "proc") || path == filepath.Join(root, "internal", "testenv")) {
 				return filepath.SkipDir
 			}
 			return nil

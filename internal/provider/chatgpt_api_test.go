@@ -392,6 +392,48 @@ func TestChatGPTAPIBody(t *testing.T) {
 	}
 }
 
+// A ChatGPT sign-in's request names its conversation as a Codex account's
+// does: the client's prompt_cache_key, or one taken from how the
+// conversation starts, in the body and in session-id and thread-id (#933).
+func TestChatGPTAPISession(t *testing.T) {
+	claudeHome(t)
+	f := newFakeOpenAI(t)
+	if st := signInVia(t, f, "oaiapp_9", same); st.State != "done" {
+		t.Fatalf("sign-in %+v", st)
+	}
+	p, ok := siwcAccount()
+	if !ok {
+		t.Fatal("no ChatGPT API account")
+	}
+	turn := func(body string) (string, http.Header) {
+		t.Helper()
+		out := p.Prepare([]byte(body))
+		var m struct {
+			Key string `json:"prompt_cache_key"`
+		}
+		json.Unmarshal(out, &m)
+		req, _ := http.NewRequest("POST", p.Responses+"/responses", nil)
+		if err := p.Sign(context.Background(), req, Responses, out); err != nil {
+			t.Fatal(err)
+		}
+		return m.Key, req.Header
+	}
+	// Codex names its thread
+	key, h := turn(`{"model":"gpt-6.1-sol","prompt_cache_key":"019a-thread","input":"hi"}`)
+	if key != "019a-thread" || h.Get("session-id") != "019a-thread" || h.Get("thread-id") != "019a-thread" {
+		t.Fatalf("key %q headers %v", key, h)
+	}
+	// a client that doesn't: the same name on every turn
+	user := `{"type":"message","role":"user","content":[{"type":"input_text","text":"fix the bug"}]}`
+	k1, h1 := turn(`{"model":"gpt-6.1-sol","instructions":"You are omp.","input":[` + user + `]}`)
+	k2, h2 := turn(`{"model":"gpt-6.1-sol","instructions":"You are omp.","input":[` + user +
+		`,{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]},` +
+		`{"type":"message","role":"user","content":[{"type":"input_text","text":"and the test?"}]}]}`)
+	if k1 == "" || k1 != k2 || h1.Get("session-id") != k1 || h2.Get("thread-id") != k1 {
+		t.Fatalf("keys %q %q, headers %v %v", k1, k2, h1, h2)
+	}
+}
+
 // OpenAI's refusals of a ChatGPT token say what to do: the plan's usage
 // shared with ChatGPT, an account that isn't eligible, a capability the
 // token can't use.
@@ -412,5 +454,28 @@ func TestChatGPTAPIExplain(t *testing.T) {
 		if tt.want == "" && got != "" || !strings.Contains(got, tt.want) {
 			t.Errorf("%d %s: %q", tt.status, tt.body, got)
 		}
+	}
+}
+
+// A ChatGPT API account's usage line says why there is none, and where it
+// is told, rather than a read that failed (danzi002 on Discord: accounts
+// added through the API show no allowance, ones signed in as ChatGPT do).
+// OpenAI's API is asked nothing for it.
+func TestChatGPTAPIUsageSaysWhere(t *testing.T) {
+	claudeHome(t)
+	f := newFakeOpenAI(t)
+	if st := signInVia(t, f, "oaiapp_9", same); st.State != "done" {
+		t.Fatalf("sign-in %+v", st)
+	}
+	n := len(f.forms)
+	q, ok := LoginUsage(context.Background(), ChatGPTAPIID)["me@example.com"]
+	if !ok || q.Error != siwcNoUsage || q.SeeAt != SIWCUsageURL || len(q.Windows) != 0 {
+		t.Fatalf("read %+v (%v)", q, ok)
+	}
+	if !strings.Contains(q.Error, "chatgpt.com/settings/usage") || !strings.Contains(q.Error, "added as ChatGPT") || strings.Contains(q.Error, "side by side") {
+		t.Fatalf("said %q", q.Error)
+	}
+	if len(f.forms) != n {
+		t.Errorf("OpenAI was asked %d times for it", len(f.forms)-n)
 	}
 }

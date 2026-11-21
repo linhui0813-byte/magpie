@@ -1,18 +1,37 @@
 package sessions
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/yetone/magpie/internal/testenv"
 )
 
-// inZone runs the test with the local time zone at a fixed offset.
+// inZone runs the test with the local time zone at a fixed offset. The
+// background cache writer (saveCache) reads time.Local, and one started by
+// this or an earlier test's List can still be running, so it is drained
+// before the zone is swapped and again before it is put back (cleanups run
+// last-in first-out).
 func inZone(t *testing.T, hours int) {
+	savesDone()
 	testenv.Zone(t, time.FixedZone("test", hours*3600))
+	t.Cleanup(savesDone)
+}
+
+// savesDone waits for the background cache writer to finish.
+func savesDone() {
+	saving.Lock()
+	for saving.running {
+		saving.Wait()
+	}
+	saving.Unlock()
 }
 
 // ccMsg is a line of a Claude Code reply at a time.
@@ -124,8 +143,8 @@ func TestStatsMidnight(t *testing.T) {
 	check("read on", after20, after21, 180, 240)
 
 	// the same from the start, and from the parse kept on disk
-	full := parse(file{agent: "claude", path: path, main: true, size: int64(len(first + rest)), mod: time.Now()}, nil)
-	if got := full.Days["2026-09-21"].Models["claude-opus-5-5"]; got != after21 {
+	full := parse(file{agent: "claude", path: path, main: true, size: int64(len(first + rest)), mod: modOf(time.Now())}, nil)
+	if got := full.Days.of("2026-09-21").Models.of("claude-opus-5-5"); got != after21 {
 		t.Fatalf("read whole: %+v", got)
 	}
 	Reset()
@@ -183,11 +202,15 @@ func TestStatsHoursAndSessions(t *testing.T) {
 		ccMsg("m2", "2026-09-20T15:59:00.000Z", 200, 20)+ // 23:59
 		ccMsg("m3", "2026-09-20T16:03:00.000Z", 400, 40)), 0o644) // 00:03
 
+	// as the page reads them: 24 numbers of seconds
 	hours := func(s Stats, date string) []int64 {
 		for _, d := range s.Days {
 			for _, a := range d.Active {
 				if d.Date == date && a.Cwd == "/work/night" {
-					return a.Hours
+					var all struct{ Hours []int64 }
+					b, _ := json.Marshal(a)
+					json.Unmarshal(b, &all)
+					return all.Hours
 				}
 			}
 		}
@@ -219,6 +242,10 @@ func TestStatsHoursAndSessions(t *testing.T) {
 	if !sortedByLast(s.Sessions) || len(s.Sessions) < 3 {
 		t.Fatalf("sessions %+v", s.Sessions)
 	}
+	// each range keeps its list, so it holds its rows and no more (#2278)
+	if cap(s.Sessions) != len(s.Sessions) || cap(s.Keys) != len(s.Keys) {
+		t.Fatalf("%d sessions held in %d, %d keys in %d", len(s.Sessions), cap(s.Sessions), len(s.Keys), cap(s.Keys))
+	}
 	// a range counts only its own days
 	day := statsAt(1, time.Date(2026, 9, 21, 12, 0, 0, 0, time.UTC))
 	if x := find(day); x == nil || x.Tokens != (Tokens{400, 40, 10, 0, 0}) || x.Active != 240 || len(x.Days) != 1 || x.Days[0] != 0 {
@@ -226,6 +253,27 @@ func TestStatsHoursAndSessions(t *testing.T) {
 	}
 	if len(day.Sessions) != 1 {
 		t.Fatalf("the 21st: %d sessions", len(day.Sessions))
+	}
+	// Keys names the same sessions, in the same order: the page's list is
+	// every session ever, so it is told which of them the range counted
+	keysOf := func(s Stats) []string {
+		out := make([]string, len(s.Sessions))
+		for i, x := range s.Sessions {
+			out[i] = x.Key
+		}
+		return out
+	}
+	if !slices.Equal(s.Keys, keysOf(s)) || !slices.Equal(day.Keys, keysOf(day)) {
+		t.Fatalf("keys %v of %v, the 21st's %v of %v", s.Keys, keysOf(s), day.Keys, keysOf(day))
+	}
+	// and a range the session was not at work in does not name it: it was
+	// last at work on the 21st, so the 22nd alone leaves it out
+	after := statsAt(1, time.Date(2026, 9, 22, 12, 0, 0, 0, time.UTC))
+	if slices.Contains(after.Keys, key) {
+		t.Fatalf("the 21st's work is not in a range of the 22nd: %v", after.Keys)
+	}
+	if len(after.Keys) != 0 || len(after.Keys) != len(after.Sessions) {
+		t.Fatalf("the 22nd: %v", after.Keys)
 	}
 
 	// Get reads a session by its key, as Find does past the listed ones
@@ -253,6 +301,16 @@ func TestStatsHoursAndSessions(t *testing.T) {
 	}
 	if clip("abcdef", 4) != "abc…" || clip("abc", 4) != "abc" {
 		t.Fatal("clip")
+	}
+}
+
+// The overview's title of a long first prompt is the session's own string:
+// cut again to 160, it was a new copy of every title in each range kept.
+func TestStatsTitleIsTheSessionsOwn(t *testing.T) {
+	long := title(strings.Repeat("写一个很长的提示词", 40))
+	got := clip(long, titleKept)
+	if got != long || unsafe.StringData(got) != unsafe.StringData(long) {
+		t.Fatalf("clipped again: %q", got)
 	}
 }
 

@@ -72,3 +72,43 @@ func TestHostListIsNoMakersWord(t *testing.T) {
 		t.Error("relay's kimi-k2.5 is said to have no levels")
 	}
 }
+
+func TestBorrowedOffLevelIsNotAdvertised(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
+	body, err := os.ReadFile(filepath.Join("..", "catalog", "testdata", "models.dev-2026-10-09.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(catalog.CachePath()), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(catalog.CachePath(), body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	catalog.Reset()
+	t.Cleanup(catalog.Reset)
+
+	for _, p := range []Provider{
+		{ID: "relay", Name: "Relay", Chat: "https://relay.test/v1", Key: "k", Models: []string{"deepseek-v4-pro"}},
+		{ID: "th", Name: "TokenHub", Chat: "https://tokenhub.test/v1", Key: "k", Catalog: "tencent-tokenhub", Models: []string{"deepseek-v4-pro"}},
+	} {
+		if err := Save(p); err != nil {
+			t.Fatal(err)
+		}
+		if err := catalog.SaveLive(p.ID, p.Chat, []catalog.Model{{ID: "deepseek-v4-pro"}}); err != nil {
+			t.Fatal(err)
+		}
+		got, err := Find(p.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if efforts := got.Efforts("deepseek-v4-pro"); !slices.Equal(efforts, []string{"low", "high", "max"}) {
+			t.Errorf("%s borrowed efforts = %v, want [low high max]", p.ID, efforts)
+		}
+	}
+
+}

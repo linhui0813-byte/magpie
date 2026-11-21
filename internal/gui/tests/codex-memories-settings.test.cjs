@@ -1,12 +1,14 @@
 // Run with Node's test runner and Playwright on the module path; see README.md.
-// Settings' "Codex memories model" (#985, Hu9956: the model Codex writes its
+// Codex's "Codex memories model" (#985, Hu9956: the model Codex writes its
 // memories with was only the notebook square on Codex's card, beside the
-// subagent squares, and wasn't found). The row sits under "Codex auto-review
-// model" with a title and a line that says what happens; unset it is
-// Codex's own pick. It opens the app's model picker (no native select), and
-// a pick posts Codex's memories field as the card's square does: the square
-// lights with it, and Default picked on the square puts the row back. No
-// Codex with the field: no row. The square's label names it. No click
+// subagent squares, and wasn't found), in its settings on its opened row
+// (Settings had them till the owner, 10-20). The row sits under "Codex auto-review
+// model" with its name alone (1ooogle on X); unset it is
+// the same as the session (cybercaius). It opens the app's model picker (no native select), and
+// a pick posts Codex's memories field, and Default puts the session's back.
+// The card has no square for it beside the row, the same setting twice (the
+// owner, 10-25). No Codex with the field: no row, and Claude Code's settings
+// haven't it. No click
 // scrolls the page. Chromium and WebKit, en/zh/ja/de, 440px and wide; no
 // backend, the API is faked here.
 const assert = require("node:assert/strict");
@@ -14,6 +16,7 @@ const fs = require("node:fs/promises");
 const path = require("node:path");
 const { test } = require("node:test");
 const { chromium, webkit } = require("playwright");
+const { watchSettingsReads, openAgentSettings } = require("./reader.cjs");
 
 const assets = path.resolve(__dirname, "../assets");
 const models = [{ value: "gpt-5.5", label: "GPT-5.5", ref: "openai/gpt-5.5" }, { value: "gpt-5.4-mini", label: "GPT-5.4 mini", ref: "openai/gpt-5.4-mini" }];
@@ -24,7 +27,7 @@ const agents = (codex) => codex ? [{
     { key: "subagent", label: "subagents", value: "", options: models },
     { key: "memories", label: "memories", value: "", options: models },
   ],
-}] : [{ id: "claude", name: "Claude Code", path: "/test/settings.json", icon: "claude-color", fields: [{ key: "model", label: "model", value: "", options: [] }] }];
+}] : [{ id: "claude", name: "Claude Code", path: "/test/settings.json", icon: "claude-color", wired: true, fields: [{ key: "model", label: "model", value: "relay/m1", options: [{ value: "relay/m1", label: "m1", ref: "relay/m1" }] }] }];
 
 const settings = (lang) => ({
   theme: "light", lang, tray: "panel", quotaLeft: false, currency: "usd",
@@ -71,22 +74,23 @@ function server(lang, sets, codex) {
 
 // the words as i18n.js has them
 const W = {
-  en: { name: "Codex memories model", own: "Codex’s own pick", subOwn: /gpt-5\.6-luna and gpt-5\.6-terra/, subSet: /with this model/, square: "Codex memories model: GPT-5.4 mini", def: "Default" },
-  zh: { name: "Codex 记忆整理模型", own: "由 Codex 决定", subOwn: /gpt-5\.6-luna 和 gpt-5\.6-terra/, subSet: /用这个模型/, square: "Codex 记忆整理模型：GPT-5.4 mini", def: "默认" },
-  ja: { name: "Codex メモリ整理のモデル", own: null, subOwn: /gpt-5\.6-luna と gpt-5\.6-terra/, subSet: /このモデルで/, square: null, def: null },
-  de: { name: "Codex-Modell für Erinnerungen", own: null, subOwn: /gpt-5\.6-luna und gpt-5\.6-terra/, subSet: /mit diesem Modell/, square: null, def: null },
+  en: { name: "Codex memories model", own: "Same as the session", def: "Default" },
+  zh: { name: "Codex 记忆整理模型", own: "跟随当前会话", def: "默认" },
+  ja: { name: "Codex メモリ整理のモデル", own: "セッションと同じ", def: null },
+  de: { name: "Codex-Modell für Erinnerungen", own: "Wie die Sitzung", def: null },
 };
-const view = (page) => page.locator("#view-settings").evaluate((v) => v.scrollTop);
+const view = (page) => page.locator("#view-agents").evaluate((v) => v.scrollTop);
 
 for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium", "webkit"])) {
   for (const width of [440, 1100]) {
     for (const lang of ["en", "zh", "ja", "de"]) {
-      test(`${engine} ${width}px ${lang}: Settings picks the model Codex writes its memories with, the card's square in step`, async (t) => {
+      test(`${engine} ${width}px ${lang}: Codex's settings pick the model it writes its memories with, no square beside them`, async (t) => {
         const w = W[lang];
         const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: "chromium" }));
         const context = await browser.newContext({ viewport: { width, height: 520 }, reducedMotion: "reduce" });
         const page = await context.newPage();
         page.setDefaultTimeout(5000);
+        page.setDefaultNavigationTimeout(60000);
         const errors = [], sets = [];
         page.on("pageerror", (e) => errors.push(e.message));
         await page.route("**/*", server(lang, sets, true));
@@ -97,7 +101,9 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
           }
           await browser.close();
         });
-        await page.goto("http://magpie.test/?view=settings");
+        await watchSettingsReads(page);
+        await page.goto("http://magpie.test/?view=agents");
+        await openAgentSettings(page);
         const row = page.locator("#codexMemoriesRow");
         const pick = page.locator("#codexMemoriesPick button");
         await pick.waitFor();
@@ -105,8 +111,8 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         assert.equal(await page.evaluate(() => document.querySelector("#codexAutoReviewRow").nextElementSibling?.id), "codexMemoriesRow");
         assert.equal(await row.locator("select").count(), 0, "no native select");
         assert.equal((await row.locator(".name").textContent()).trim(), w.name);
-        if (w.own) assert.equal((await pick.textContent()).trim(), w.own, "Codex's own pick by default");
-        assert.match(await row.locator(".sub").textContent(), w.subOwn);
+        if (w.own) assert.equal((await pick.textContent()).trim(), w.own, "the session's by default (cybercaius)");
+        assert.equal(await row.locator(".sub").count(), 0, "the row says its name alone, its button the choice (1ooogle on X)");
         // the title, its line and the button fit the row
         const fit = await row.evaluate((r) => {
           const box = r.getBoundingClientRect();
@@ -119,12 +125,12 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
 
         // scrolled by a wheel till the row is mid-view, so a click that
         // moved the page would show
-        const box = await page.locator("#view-settings").boundingBox();
+        const box = await page.locator("#view-agents").boundingBox();
         await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
         const top = () => pick.evaluate((e) => e.getBoundingClientRect().top);
         for (let i = 0; i < 60 && (await top()) > 200; i++) { await page.mouse.wheel(0, 100); await page.waitForTimeout(30); }
         const before = await view(page);
-        assert(before > 0, "the settings list must scroll to the row");
+        assert(before > 0, "the agents list must scroll to the row");
 
         // the app's model picker, Default first
         await pick.click();
@@ -135,29 +141,22 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await page.locator("#pop #list li", { hasText: "GPT-5.4 mini" }).first().click();
         await page.locator("#codexMemoriesPick button", { hasText: "GPT-5.4 mini" }).waitFor();
         assert.deepEqual(sets, [{ agent: "codex", field: "memories", value: "gpt-5.4-mini" }]);
-        assert.match(await row.locator(".sub").textContent(), w.subSet);
+        assert.equal(await row.locator(".sub").count(), 0);
         await page.waitForTimeout(300);
         assert.equal(await view(page), before, "picking a model scrolled the page");
 
-        // the card's square is the same setting, and says what it is
-        await page.evaluate(() => show("agents"));
-        const codex = '.row.agent[data-id="codex"]';
-        await page.locator(`${codex} .ag-link`).click();
-        const square = page.locator(`${codex} .extras-cell .field.extra.set[data-key="memories"]`);
-        await square.waitFor();
-        if (w.square) assert.equal(await square.getAttribute("aria-label"), w.square);
-        assert.equal(await square.getAttribute("title"), await square.getAttribute("aria-label"));
-        assert((await square.getAttribute("title")).startsWith(w.name), "the square's tooltip names it");
-        await square.click();
+        // the card has no square for it beside the row: that was the same
+        // setting twice (the owner, 10-25). Default is picked on the row.
+        assert.equal(await page.locator('.row.agent[data-id="codex"] .field[data-key="memories"]').count(), 0, "a memories square on Codex's card");
+        await pick.click();
         await page.locator("#pop:not([hidden]) #list li").first().waitFor();
         await page.locator("#pop #list li").first().click();
-        await page.waitForFunction(() => !document.querySelector('.row.agent[data-id="codex"] .field.extra.set[data-key="memories"]'));
+        for (let i = 0; i < 100 && sets.length < 2; i++) await page.waitForTimeout(50);
         assert.deepEqual(sets.at(-1), { agent: "codex", field: "memories", value: "" });
 
-        // and Settings shows Codex's own again
-        await page.evaluate(() => show("settings"));
+        // and the row shows the session's again
         if (w.own) await page.locator("#codexMemoriesPick button", { hasText: w.own }).waitFor();
-        assert.match(await row.locator(".sub").textContent(), w.subOwn);
+        assert.equal(await row.locator(".sub").count(), 0);
         assert.deepEqual(errors, []);
       });
     }
@@ -167,13 +166,21 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
     const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: "chromium" }));
     const page = await browser.newPage({ viewport: { width: 900, height: 520 } });
     page.setDefaultTimeout(5000);
+    page.setDefaultNavigationTimeout(60000);
     const errors = [];
     page.on("pageerror", (e) => errors.push(e.message));
     await page.route("**/*", server("en", [], false));
     t.after(() => browser.close());
-    await page.goto("http://magpie.test/?view=settings");
-    await page.locator("#codexAutoReviewPick button").waitFor();
-    await page.waitForTimeout(300);
+    await watchSettingsReads(page);
+    await page.goto("http://magpie.test/?view=agents");
+    await openAgentSettings(page, "claude");
+    // Long conversations, its one row (the owner merged the two, 11-12), and
+    // Claude Code's own rows under it
+    await page.locator('.row.agent[data-id="claude"] .ag-prefs .agent-compact').waitFor();
+    assert.equal(await page.locator('.row.agent[data-id="claude"] .ag-prefs #fullContextRow').isHidden(), true, "every agent's row gives its place");
+    const shown = await page.locator(".ag-prefs .row.pref").evaluateAll((rs) => rs.filter((r) => r.checkVisibility()).map((r) => r.className.replace("row pref", "").trim()));
+    assert.deepEqual(shown.filter((c) => !/^(agent-compact|claude-cache|claude-attribution|agent-window)$/.test(c)), [], "Claude Code's settings are Long conversations and its own: " + shown);
+    assert.equal(await page.locator(".ag-prefs .row.pref.claude-cache").count(), 2);
     assert.equal(await page.locator("#codexMemoriesRow").isHidden(), true);
     assert.deepEqual(errors, []);
   });

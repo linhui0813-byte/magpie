@@ -82,11 +82,24 @@ func TestNPMInfoDeadline(t *testing.T) {
 		}
 		npmAnswer(w, r)
 	})
-	npmAll = 300 * time.Millisecond
-	start := time.Now()
-	got := Info(context.Background(), []string{"fast-one", "slow-one", "fast-two"})
-	if took := time.Since(start); took > 2*time.Second {
-		t.Fatalf("took %v: the slow package held it", took)
+	// registered after fakeNPM, so it runs before the fake's Close, which
+	// waits for every handler: a check below that fails doesn't leave the
+	// slow one held and the package hung until -timeout (#1808)
+	let := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(let)
+	// The slow one is held until the test lets it go and each package is
+	// waited on for an hour, so Info coming back at all is npmAll at work,
+	// with no wall-clock bound a loaded machine can pass; the minute only
+	// turns a wait into a FAIL. npmAll is the quick ones' time to answer,
+	// room enough on a loaded machine.
+	npmEach, npmAll = time.Hour, 5*time.Second
+	answered := make(chan map[string]NPM, 1)
+	go func() { answered <- Info(context.Background(), []string{"fast-one", "slow-one", "fast-two"}) }()
+	var got map[string]NPM
+	select {
+	case got = <-answered:
+	case <-time.After(time.Minute):
+		t.Fatal("Info waited for the slow package")
 	}
 	if got["fast-one"].Version != "1.2.3" || got["fast-two"].Version != "1.2.3" {
 		t.Fatalf("the quick ones: %+v", got)
@@ -94,8 +107,8 @@ func TestNPMInfoDeadline(t *testing.T) {
 	if _, ok := got["slow-one"]; ok {
 		t.Fatalf("the slow one before it answered: %+v", got["slow-one"])
 	}
-	close(release)
-	deadline := time.Now().Add(3 * time.Second)
+	let()
+	deadline := time.Now().Add(30 * time.Second)
 	for InfoCached([]string{"slow-one"})["slow-one"].Version == "" {
 		if time.Now().After(deadline) {
 			t.Fatal("the slow one's answer wasn't kept")
@@ -135,5 +148,65 @@ func TestNPMInfoAtOnce(t *testing.T) {
 	}
 	if most > 3 || most == 0 {
 		t.Fatalf("%d asked at once, want at most 3", most)
+	}
+}
+
+// yetone: 这里的 agent plugin 为什么没有 logo. The picture a package gives
+// in package.json's magpie.icon comes with what npm says of it, so a
+// listing the market gives no icon shows it; anything but an https URL or
+// a data:image URI is left out.
+func TestNPMInfoGivesIcon(t *testing.T) {
+	icons := map[string]string{
+		"agent-aider": "data:image/png;base64,iVBORw0KGgo=",
+		"agent-web":   "https://aider.chat/icon.png",
+		"agent-plain": "http://aider.chat/icon.png",
+		"agent-js":    "javascript:alert(1)",
+		"agent-none":  "",
+	}
+	fakeNPM(t, func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/downloads/") {
+			w.Write([]byte(`{"downloads":1}`))
+			return
+		}
+		name := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/"), "/latest")
+		w.Write([]byte(`{"version":"0.1.1","magpie":{"agent":"./a.agent.js","icon":"` + icons[name] + `"}}`))
+	})
+	names := []string{}
+	for n := range icons {
+		names = append(names, n)
+	}
+	got := Info(context.Background(), names)
+	want := map[string]string{"agent-aider": icons["agent-aider"], "agent-web": icons["agent-web"]}
+	for _, n := range names {
+		if got[n].Version != "0.1.1" || got[n].Icon != want[n] {
+			t.Errorf("%s: %+v, want icon %q", n, got[n], want[n])
+		}
+	}
+}
+
+// The update check asks npm now, not what it said within the hour: a
+// community fix published a few minutes after the page last asked reaches
+// a magpie started since at its first look (ysm119 on Discord).
+func TestUpdateCheckAsksNPMNow(t *testing.T) {
+	var version atomic.Value
+	version.Store("1.2.3")
+	fakeNPM(t, func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/downloads/") {
+			w.Write([]byte(`{"downloads":1}`))
+			return
+		}
+		w.Write([]byte(`{"version":"` + version.Load().(string) + `"}`))
+	})
+	ctx := context.Background()
+	pkg := "@magpie-community/opencode-x-auth"
+	if got := Info(ctx, []string{pkg})[pkg].Version; got != "1.2.3" {
+		t.Fatalf("first ask: %q", got)
+	}
+	version.Store("1.2.4")
+	if got := Info(ctx, []string{pkg})[pkg].Version; got != "1.2.3" {
+		t.Fatalf("the page within the hour: %q, want what npm said last", got)
+	}
+	if got := latestOf(ctx, []string{pkg})[pkg]; got != "1.2.4" {
+		t.Fatalf("the update check: %q, want npm's version now", got)
 	}
 }

@@ -12,6 +12,13 @@ const { test } = require("node:test");
 const { chromium, webkit } = require("playwright");
 
 const assets = path.resolve(__dirname, "../assets");
+// the editor folds what few need under Advanced, this field among them:
+// opened as a reader would, unless something set in it opened it already
+const unfold = async (page) => {
+  const adv = page.locator(".editor details.advanced");
+  await adv.waitFor({ state: "attached" });
+  if (!(await adv.evaluate((d) => d.open))) await adv.locator(":scope > summary").click();
+};
 const relay = {
   id: "relay", name: "Relay", icon: "generic", chat: "https://relay.example.com/v1", responses: "", anthropic: "", catalog: "",
   models: [{ id: "model-a", name: "Model A", on: true }], agents: [], fallback: [], headers: {},
@@ -53,8 +60,8 @@ function serve(lang, posts) {
 }
 
 const words = {
-  en: { label: "Concurrency", save: "Save", none: "No limit", plugin: "4, as its plugin says", hint: "Over it, requests queue and go out in order; 0 or empty is no limit", bad: "Concurrency: a whole number from 0 to 1000" },
-  zh: { label: "并发上限", save: "保存", none: "不限制", plugin: "4（插件的默认值）", hint: "超出时排队，按顺序发出；0 或留空为不限制", bad: "并发上限：请填写 0 到 1000 之间的整数" },
+  en: { label: "Requests at once", save: "Save", none: "No limit", plugin: "4, as its plugin says", hint: "Over it, requests queue and go out in order; 0 or empty is no limit", bad: "Requests at once: a whole number from 0 to 1000" },
+  zh: { label: "同时请求数", save: "保存", none: "不限制", plugin: "4（插件的默认值）", hint: "超出时排队，按顺序发出；0 或留空为不限制", bad: "同时请求数：请填写 0 到 1000 之间的整数" },
 };
 
 for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium", "webkit"])) {
@@ -71,12 +78,14 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       });
       const page = await (await browser.newContext({ viewport: { width: 900, height: 760 }, reducedMotion: "reduce", colorScheme: scheme })).newPage();
       page.setDefaultTimeout(5000);
+      page.setDefaultNavigationTimeout(60000);
       const errors = [];
       page.on("pageerror", (e) => errors.push(e.message));
       const posts = [];
       await page.route("**/*", serve(lang, posts));
       await page.goto("http://magpie.test/?view=providers");
       await page.locator(".row.provider", { hasText: name }).click();
+      await unfold(page);
       await page.locator(".editor input.concurrency").waitFor();
       await page.waitForTimeout(300); // the editor drawn again as what it asked for comes in
       return { page, errors, posts };
@@ -123,16 +132,17 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
 
       // emptied again: none set
       await page.locator(".row.provider", { hasText: "Relay" }).click();
+      await unfold(page);
       await box(page).fill("");
       saved = await save(page, posts);
       assert(Object.hasOwn(saved.body, "maxConcurrency"), "an empty field is saved as none, not left out");
       assert.equal(saved.body.maxConcurrency, null);
 
       const missing = await page.evaluate(() => [
-        "Concurrency", "No limit", "{n}, as its plugin says",
+        "Requests at once", "No limit", "{n}, as its plugin says",
         "Over it, requests queue and go out in order; 0 or empty is no limit",
         "Over it, requests queue and go out in order; empty takes the plugin's {n}, 0 is no limit",
-        "Concurrency: a whole number from 0 to 1000",
+        "Requests at once: a whole number from 0 to 1000",
       ].filter((k) => !I18N.zh[k]));
       assert.deepEqual(missing, [], "every string has its Chinese");
       // a left border thicker or another colour than the right one is a stripe
@@ -180,6 +190,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       let saved = await save(page, posts);
       assert.equal(saved.body.maxConcurrency, null, "empty follows the plugin");
       await page.locator(".row.provider", { hasText: "Lemon" }).click();
+      await unfold(page);
       await box(page).fill("8");
       saved = await save(page, posts);
       assert.equal(saved.body.maxConcurrency, 8);

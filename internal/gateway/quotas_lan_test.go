@@ -60,11 +60,17 @@ func TestQuotasOverLAN(t *testing.T) {
 	if c, _ := call("192.168.1.9:5000", "Authorization", "Bearer "+key); c != http.StatusForbidden {
 		t.Fatal("not shared got", c)
 	}
-	// MAGPIE_ADDR's open gateway has no key to show, so its quotas stay here
+	// a gateway MAGPIE_ADDR puts on the network asks another machine for a
+	// gateway key, shared or not, and answers one that has it
 	t.Setenv("MAGPIE_ADDR", "0.0.0.0:3425")
-	c, b := call("192.168.1.9:5000", "Authorization", "Bearer "+key)
-	if c != http.StatusForbidden || !strings.Contains(b, "Share on local network") || !strings.Contains(b, "x-api-key") {
-		t.Fatal("MAGPIE_ADDR, not shared:", c, b)
+	if c, b := call("192.168.1.9:5000"); c != http.StatusUnauthorized || !strings.Contains(b, "no API key was sent") {
+		t.Fatal("MAGPIE_ADDR, not shared, no key:", c, b)
+	}
+	if _, err := access.Update("on-key", access.Change{Key: keys[0].ID}); err != nil {
+		t.Fatal(err)
+	}
+	if c, b := call("192.168.1.9:5000", "Authorization", "Bearer "+key); c != 200 || !strings.Contains(b, `"object":"list"`) {
+		t.Fatal("MAGPIE_ADDR, not shared, with the key:", c, b)
 	}
 	if c, _ := call("[::1]:5000"); c != 200 {
 		t.Fatal("loopback got", c)

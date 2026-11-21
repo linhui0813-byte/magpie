@@ -14,11 +14,17 @@ const day = [now.getFullYear(), now.getMonth() + 1, now.getDate()].map((n) => St
 const at = (i) => new Date(now.getTime() - (i + 1) * 60e3).toISOString();
 const glm = { id: "zhipu/a1", provider: "zhipu", name: "Zhipu", icon: "zhipu-color", who: "18610345303", kind: "account", agent: "claude", model: "glm-5.3-flash", routing: "order", shared: true, used: 20 };
 const gpt = { id: "openai/k1", provider: "openai", name: "OpenAI", icon: "openai", who: "work", kind: "key", model: "glm-5.3-flash", routing: "order", fallback: true, used: 0 };
+// two named alike (#3953, MYCF711): a key in the order and a member the
+// gateway skipped before trying it (r.left), each "API key"
+const ds = { id: "deepseek/k1", provider: "deepseek", name: "DeepSeek", icon: "deepseek-color", who: "API key", kind: "key", model: "glm-5.3-flash", routing: "order", fallback: true, used: 0 };
+const zen = { id: "opencode-zen-free", provider: "opencode-zen-free", name: "OpenCode Zen Free", icon: "opencode", who: "API key", kind: "account", agent: "claude", model: "deepseek-v4.1-flash-free", routing: "", used: 0, window: 200000 };
 const routes = [{
   id: 100, seq: 100, time: at(0), agent: "claude", model: "glm-5.3-flash", provider: "zhipu",
-  order: [glm, gpt],
+  order: [glm, ds, gpt],
+  left: [zen],
   tries: [
     { id: glm.id, model: glm.model, start: at(0), done: true, status: 429, ms: 400, error: "rate limited" },
+    { id: ds.id, model: ds.model, start: at(0), done: true, status: 500, ms: 300, error: "upstream error" },
     { id: gpt.id, model: gpt.model, start: at(0), done: true, status: 200, ms: 22000 },
   ],
   done: true, status: 200, ms: 22400, tokens: 1200,
@@ -56,6 +62,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       const context = await browser.newContext({ viewport: { width: 1100, height: 760 }, reducedMotion: "reduce" });
       const page = await context.newPage();
       page.setDefaultTimeout(5000);
+      page.setDefaultNavigationTimeout(60000);
       const errors = [];
       page.on("pageerror", (e) => errors.push(e.message));
       await page.route("**/*", serve(lang));
@@ -89,8 +96,86 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         assert.deepEqual(l.size, [14, 14], JSON.stringify(l));
         assert(l.before && l.inline, JSON.stringify(l));
       }
+      // a line about one of the two named "API key" leads with that one's
+      // logo: the skipped one's line with Zen's, the order key's try with
+      // DeepSeek's, whichever list is looked in first
+      const skipped = lines.find((l) => l.cls === "aside" && l.text.includes("200K"));
+      assert.equal(skipped?.logo, "opencode", JSON.stringify(lines));
+      assert.equal(skipped.name, "API key", JSON.stringify(skipped));
+      assert(skipped.before && skipped.inline, JSON.stringify(skipped));
+      const dsTry = of("bad")[1];
+      assert.equal(dsTry?.logo, "deepseek-color", JSON.stringify(lines));
+      assert.equal(dsTry.name, "API key", JSON.stringify(dsTry));
       // what the vendor said is word for word, with no logo in it
       assert(!lines.some((l) => /said/.test(l.cls) && l.logo), JSON.stringify(lines));
+      assert.deepEqual(errors, []);
+    });
+  }
+}
+
+// The story is drawn again at each step of a live request (routing, then
+// answering, then answered) and on every request that comes in. Its logos
+// blinked on and off with an agent at work (the owner: 这里的 icon 会不停地
+// 闪烁): each drawing made every logo afresh, and a logo made afresh loads
+// its picture again, which WebKit paints as nothing for a frame. A line
+// that says the same is the node it was, and a logo is the one it was.
+function serveLive(lang, steps) {
+  const base = serve(lang);
+  let n = 0;
+  return async (route) => {
+    const url = new URL(route.request().url());
+    if (url.pathname !== "/api/gateway/trace") return base(route);
+    const i = Math.min(n++, steps.length - 1);
+    if (i && i === steps.length - 1 && n > steps.length) await new Promise((r) => setTimeout(r, 20e3));
+    else if (url.searchParams.get("wait")) await new Promise((r) => setTimeout(r, 300));
+    return route.fulfill({ json: { mine: true, now: new Date().toISOString(), seq: 200 + i, totals: { requests: 1, rerouted: 1, errors: 0 }, routes: [steps[i]] } });
+  };
+}
+
+for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium", "webkit"])) {
+  for (const lang of ["en", "zh", "zh-TW", "ja", "de"]) {
+    test(`${engine} ${lang}: a live request's story keeps its logos as it goes on`, async (t) => {
+      const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: "chromium" }));
+      const context = await browser.newContext({ viewport: { width: 1100, height: 760 }, reducedMotion: "reduce" });
+      const page = await context.newPage();
+      page.setDefaultTimeout(8000);
+      page.setDefaultNavigationTimeout(60000);
+      const errors = [];
+      page.on("pageerror", (e) => errors.push(e.message));
+      const live = { id: 200, seq: 200, time: new Date().toISOString(), agent: "claude", model: "glm-5.3-flash", provider: "zhipu", order: [glm, gpt] };
+      const t429 = { id: glm.id, model: glm.model, start: live.time, done: true, status: 429, ms: 400, error: "rate limited" };
+      await page.route("**/*", serveLive(lang, [
+        { ...live, tries: [{ id: glm.id, model: glm.model, start: live.time }] },
+        { ...live, tries: [t429, { id: gpt.id, model: gpt.model, start: live.time }] },
+        { ...live, tries: [t429, { id: gpt.id, model: gpt.model, start: live.time, done: true, status: 200, ms: 900 }], done: true, status: 200, ms: 1300, tokens: 300 },
+      ]));
+      t.after(() => browser.close());
+      await page.goto("http://magpie.test/?view=routing");
+      await page.locator(".rt-steps li.wait").waitFor();
+      // mark each logo and line as first drawn
+      const first = await page.locator(".rt-steps").evaluate((s) => {
+        window.__logos = [...s.querySelectorAll(".rt-named > .ic")];
+        window.__why = s.querySelector("li.why");
+        return window.__logos.map((x) => x.dataset.icon);
+      });
+      assert(first.includes("zhipu-color"), JSON.stringify(first));
+      await page.locator(".rt-steps li.ok").waitFor();
+      const after = await page.locator(".rt-steps").evaluate((s) => {
+        const now = [...s.querySelectorAll(".rt-named > .ic")];
+        return {
+          kept: window.__logos.map((x) => s.contains(x)),
+          fresh: now.filter((x) => !window.__logos.includes(x)).map((x) => x.dataset.icon),
+          why: s.contains(window.__why),
+          logos: now.map((x) => x.dataset.icon),
+        };
+      });
+      // the line on who went first says the same: the very node
+      assert(after.why, JSON.stringify(after));
+      // zhipu's logo, drawn while it was tried, is the same one now; only
+      // a provider first named since gets a logo of its own, and only once
+      assert(after.kept.every(Boolean), JSON.stringify(after));
+      assert(after.logos.includes("openai"), JSON.stringify(after));
+      assert(after.fresh.every((x) => x !== "zhipu-color"), JSON.stringify(after));
       assert.deepEqual(errors, []);
     });
   }

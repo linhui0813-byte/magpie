@@ -18,6 +18,8 @@ type betaRelay struct {
 	mu      sync.Mutex
 	refuses []string
 	seen    [][]string
+	// copilot words the refusal as Copilot's Messages API does
+	copilot bool
 }
 
 func (b *betaRelay) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -32,6 +34,12 @@ func (b *betaRelay) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				bad = append(bad, "`"+x+"`")
 			}
 		}
+	}
+	if len(bad) > 0 && b.copilot {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		io.WriteString(w, `{"error":{"message":"unsupported beta header(s): `+strings.ReplaceAll(strings.Join(bad, ", "), "`", "")+`","code":"invalid_request_body"}}`)
+		return
 	}
 	if len(bad) > 0 {
 		w.Header().Set("Content-Type", "application/json")
@@ -97,6 +105,45 @@ func TestUserBetasMergeWithTheAgents(t *testing.T) {
 	}
 }
 
+// bigcat1800 on Discord: Claude Desktop's Code tab, its tool search on,
+// asks tool-search-tool-2025-10-19, and Copilot turns the name away: 400
+// "Copilot: unsupported beta header(s): tool-search-tool-2025-10-19"
+// reached Claude Code. The gateway reads Copilot's wording as it reads
+// Bedrock's: asked again at once without the betas named, and not asked
+// them again.
+func TestCopilotUnsupportedBetasLeftOut(t *testing.T) {
+	fresh(t)
+	up := &betaRelay{copilot: true, refuses: []string{"tool-search-tool-2025-10-19", "effort-2025-11-24"}}
+	srv := httptest.NewServer(up)
+	t.Cleanup(srv.Close)
+	if err := provider.Save(provider.Provider{ID: "relay", Name: "Relay", Key: "k", Anthropic: srv.URL,
+		Models: []string{"claude-opus-5-5"}}); err != nil {
+		t.Fatal(err)
+	}
+	s := New()
+	ask := func() {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("POST", "/v1/messages?beta=true", strings.NewReader(
+			`{"model":"relay/claude-opus-5-5","max_tokens":20,"messages":[{"role":"user","content":"ping"}],"tools":[{"name":"mcp__big__tool_7","input_schema":{"type":"object"},"defer_loading":true}]}`))
+		req.Header.Set("User-Agent", "claude-cli/2.1.309 (external, claude-desktop-3p, agent-sdk/0.3.309)")
+		req.Header.Set("anthropic-beta", "claude-code-20250219,interleaved-thinking-2025-05-14,tool-search-tool-2025-10-19,effort-2025-11-24")
+		s.Handler().ServeHTTP(rec, req)
+		if rec.Code != 200 {
+			t.Fatalf("status %d: %s", rec.Code, rec.Body)
+		}
+	}
+	ask()
+	want := []string{"claude-code-20250219,interleaved-thinking-2025-05-14"}
+	if got := up.last(); !slices.Equal(got, want) {
+		t.Fatalf("betas sent %q, want %q", got, want)
+	}
+	n := len(up.seen)
+	ask()
+	if got := up.last(); len(up.seen) != n+1 || !slices.Equal(got, want) {
+		t.Fatalf("again: %d calls, betas %q", len(up.seen)-n, got)
+	}
+}
+
 // A request with no betas of its own sends the user's alone.
 func TestUserBetasAlone(t *testing.T) {
 	fresh(t)
@@ -116,5 +163,51 @@ func TestUserBetasAlone(t *testing.T) {
 	}
 	if got := up.last(); !slices.Equal(got, []string{"context-1m-2025-08-07"}) {
 		t.Fatalf("betas sent %q", got)
+	}
+}
+
+// Claude Code signed in to claude.ai asks oauth-2025-04-20 with its
+// sign-in, which magpie never passes on: a provider gets the other betas,
+// as Claude Code with magpie's key asks them, and an oauth beta the user
+// set on the provider (header.anthropic-beta) still goes.
+func TestSignInBetaStaysWithMagpie(t *testing.T) {
+	fresh(t)
+	up := &betaRelay{}
+	srv := httptest.NewServer(up)
+	t.Cleanup(srv.Close)
+	for _, p := range []provider.Provider{
+		{ID: "relay", Name: "Relay", Key: "k", Anthropic: srv.URL, Models: []string{"claude-opus-5-5"}},
+		{ID: "own", Name: "Own", Key: "k", Anthropic: srv.URL, Models: []string{"claude-opus-5-5"}, Headers: map[string]string{"anthropic-beta": "oauth-2025-04-20"}},
+	} {
+		if err := provider.Save(p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s := New()
+	ask := func(model, betas string) []string {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("POST", "/v1/messages?beta=true", strings.NewReader(
+			`{"model":"`+model+`","max_tokens":20,"messages":[{"role":"user","content":"ping"}]}`))
+		req.Header.Set("User-Agent", "claude-cli/2.1.290 (external, cli)")
+		req.Header.Set("Authorization", "Bearer sk-ant-oat01-"+strings.Repeat("a", 24)) // made up, of a sign-in's shape
+		req.Header.Set("anthropic-beta", betas)
+		s.Handler().ServeHTTP(rec, req)
+		if rec.Code != 200 {
+			t.Fatalf("status %d: %s", rec.Code, rec.Body)
+		}
+		return up.last()
+	}
+	for _, c := range []struct {
+		model, asked string
+		want         []string
+	}{
+		{"relay/claude-opus-5-5", "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14", []string{"claude-code-20250219,interleaved-thinking-2025-05-14"}},
+		{"relay/claude-opus-5-5", "oauth-2025-04-20", nil},
+		{"own/claude-opus-5-5", "claude-code-20250219,oauth-2025-04-20", []string{"claude-code-20250219,oauth-2025-04-20"}},
+	} {
+		if got := ask(c.model, c.asked); !slices.Equal(got, c.want) {
+			t.Errorf("%s asked %q: sent %q, want %q", c.model, c.asked, got, c.want)
+		}
 	}
 }

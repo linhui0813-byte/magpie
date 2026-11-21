@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -59,7 +60,8 @@ func TestImportCCSwitch(t *testing.T) {
 		`INSERT INTO providers VALUES ('relay','codex','Some Relay','{"auth":{"OPENAI_API_KEY":"sk-relay"},"config":"model_provider = \"relay\"\nmodel = \"gpt-5.5\"\n\n[model_providers.relay]\nname = \"relay\"\nbase_url = \"https://relay.example.com/v1\"\nwire_api = \"responses\"\n"}','','custom',3,0)`,
 		`INSERT INTO providers VALUES ('ds','claude','DeepSeek','{"env":{"ANTHROPIC_BASE_URL":"https://api.deepseek.com/anthropic","ANTHROPIC_AUTH_TOKEN":"sk-ds"}}','','cn_official',4,2)`,
 		`INSERT INTO providers VALUES ('dial','pi','dial','{"api":"openai-completions","apiKey":"magpie","baseUrl":"http://127.0.0.1:3425/v1"}','','custom',5,0)`,
-		`INSERT INTO providers VALUES ('g','gemini','Gemini relay','{"env":{"GOOGLE_GEMINI_BASE_URL":"https://g.example.com","GEMINI_API_KEY":"k"}}','','custom',6,0)`,
+		`INSERT INTO providers VALUES ('g','gemini','Gemini relay','{"env":{"GOOGLE_GEMINI_BASE_URL":"https://g.example.com","GEMINI_API_KEY":"k","GEMINI_MODEL":"gemini-3.8-flash"}}','','custom',6,0)`,
+		`INSERT INTO providers VALUES ('g2','gemini','Gemini relay under a path','{"env":{"GOOGLE_GEMINI_BASE_URL":"https://g2.example.com/gemini/","GEMINI_API_KEY":"k2"}}','','custom',7,0)`,
 	)
 	// DeepSeek is already here under its preset id, with another key
 	if err := Save(FromPresetKey(t, "deepseek", "sk-other")); err != nil {
@@ -73,8 +75,16 @@ func TestImportCCSwitch(t *testing.T) {
 	if it := items["pi/dial"]; it.Skip == "" {
 		t.Fatalf("magpie itself offered: %+v", it)
 	}
-	if it := items["gemini/g"]; it.Skip == "" {
-		t.Fatalf("gemini relay offered: %+v", it)
+	g := items["gemini/g"]
+	// a Gemini-protocol relay (#1346): the base goes to the provider's own
+	// Gemini endpoint, as the editor, the TUI and import links take one
+	// Gemini CLI puts v1beta after GOOGLE_GEMINI_BASE_URL on every request,
+	// so the base magpie asks at is that one with v1beta, under a path too
+	if g.Skip != "" || g.Provider.Gemini != "https://g.example.com/v1beta" || g.Provider.Key != "k" || !slices.Equal(g.Provider.Models, []string{"gemini-3.8-flash"}) {
+		t.Fatalf("gemini relay: %+v", g)
+	}
+	if g2 := items["gemini/g2"]; g2.Skip != "" || g2.Provider.Gemini != "https://g2.example.com/gemini/v1beta" || g2.Provider.Key != "k2" {
+		t.Fatalf("gemini relay under a path: %+v", g2)
 	}
 	relay := items["claude/relay"]
 	if relay.Skip != "" || relay.Status != "new" || relay.Provider.Anthropic != "https://relay.example.com" || relay.Provider.Responses != "https://relay.example.com/v1" || relay.From != "Claude Code, Codex" {
@@ -121,6 +131,8 @@ func TestImportAlma(t *testing.T) {
 		`INSERT INTO providers VALUES ('a2','My Proxy','custom','sk-p','[]','https://proxy.example.com/v1',0,'2','openai-chat',0,'{"X-Team":"a"}')`,
 		`INSERT INTO providers VALUES ('a3','Copilot','copilot','','[]',NULL,1,'3',NULL,0,NULL)`,
 		`INSERT INTO providers VALUES ('a4','junk','custom','x','[]','bbb',0,'4',NULL,0,NULL)`,
+		`INSERT INTO providers VALUES ('a5','Gemini relay','custom','sk-g','["gemini-3.8-flash"]','https://ag.example.com/v1beta',1,'5','gemini',0,NULL)`,
+		`INSERT INTO providers VALUES ('a6','Google here','google','sk-gg','[]','https://gg.example.com/api/v1beta',1,'6',NULL,0,NULL)`,
 	)
 	items := itemsOf(t, "alma")
 	if it := items["a1"]; it.Provider.Preset != "openrouter" || it.Provider.Key != "sk-or" || len(it.Provider.Models) != 1 {
@@ -131,6 +143,14 @@ func TestImportAlma(t *testing.T) {
 	}
 	if items["a3"].Skip == "" || items["a4"].Skip == "" {
 		t.Fatalf("sign-in or junk offered: %+v %+v", items["a3"], items["a4"])
+	}
+	// a Gemini-protocol relay (#2413): Alma asks at its base_url with the
+	// version in it, as magpie's Gemini base is
+	if it := items["a5"]; it.Skip != "" || it.Provider.Gemini != "https://ag.example.com/v1beta" || it.Provider.Key != "sk-g" || it.Provider.Chat != "" {
+		t.Fatalf("alma gemini relay: %+v", it)
+	}
+	if it := items["a6"]; it.Skip != "" || it.Provider.Gemini != "https://gg.example.com/api/v1beta" || it.Provider.Key != "sk-gg" {
+		t.Fatalf("alma google type at a base: %+v", it)
 	}
 }
 
@@ -354,6 +374,14 @@ func TestClaudeConfigDirImport(t *testing.T) {
 	if items["settings"].Skip != "" || items["settings"].Provider.Key != "sk-claude" {
 		t.Fatalf("Claude custom config dir: %+v", items)
 	}
+	// a settings.json a Windows tool saved with a UTF-8 BOM (#1534)
+	if err := os.WriteFile(path, []byte("\xef\xbb\xbf{\r\n  \"env\": {\r\n    \"ANTHROPIC_BASE_URL\": \"https://relay.example.com/anthropic\",\r\n    \"ANTHROPIC_AUTH_TOKEN\": \"sk-bom\"\r\n  }\r\n}\r\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	items = itemsOf(t, "claude-code")
+	if items["settings"].Skip != "" || items["settings"].Provider.Key != "sk-bom" {
+		t.Fatalf("Claude settings.json with a BOM: %+v", items)
+	}
 }
 
 func FromPresetKey(t *testing.T, id, key string) Provider {
@@ -399,6 +427,151 @@ func TestSqlitePath(t *testing.T) {
 	} {
 		if got := sqlitePath(in); got != want {
 			t.Errorf("sqlitePath(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// The same relay is often both a CC Switch entry and what Claude Code's
+// settings.json points at. Picked together, it is added once; removed, it
+// can be imported again rather than being "Already added" as the copy left
+// behind (#1486, kk349958194).
+func TestImportSameAccountFromTwoAppsOnce(t *testing.T) {
+	isolate(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)                                  // Windows
+	t.Setenv("APPDATA", filepath.Join(home, "AppData", "Roaming")) // Windows: never the real Alma
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
+	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(home, ".claude"))
+	sqliteFixture(t, filepath.Join(home, ".cc-switch", "cc-switch.db"),
+		`CREATE TABLE providers (id TEXT, app_type TEXT, name TEXT, settings_config TEXT, website_url TEXT, category TEXT, created_at INTEGER, sort_index INTEGER, PRIMARY KEY (id, app_type))`,
+		`INSERT INTO providers VALUES ('relay','claude','Some Relay','{"env":{"ANTHROPIC_BASE_URL":"https://relay.example.com","ANTHROPIC_AUTH_TOKEN":"sk-relay","ANTHROPIC_MODEL":"claude-sonnet-5"}}','https://relay.example.com','custom',2,1)`,
+	)
+	if err := os.MkdirAll(filepath.Join(home, ".claude"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".claude", "settings.json"), []byte(`{"env":{"ANTHROPIC_BASE_URL":"https://relay.example.com","ANTHROPIC_AUTH_TOKEN":"sk-relay"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// what the picker turns on by default: every new entry of every app
+	var picks []AppPick
+	for _, s := range ImportSources() {
+		for _, it := range s.Items {
+			if it.Skip == "" && it.Status == "new" {
+				picks = append(picks, AppPick{Source: s.ID, Ref: it.Ref})
+			}
+		}
+	}
+	if len(picks) != 2 {
+		t.Fatalf("picks: %+v", picks)
+	}
+	if _, err := ImportFromApps(picks); err != nil {
+		t.Fatal(err)
+	}
+	var ids []string
+	for _, p := range load().Providers {
+		ids = append(ids, p.ID)
+	}
+	if len(ids) != 1 {
+		t.Fatalf("the relay added %d times: %v", len(ids), ids)
+	}
+	if err := Delete(ids[0]); err != nil {
+		t.Fatal(err)
+	}
+	if it := itemsOf(t, "cc-switch")["claude/relay"]; it.Status != "new" {
+		t.Fatalf("after removing it: %+v", it)
+	}
+}
+
+// CC Switch's config.json from before its database, saved with a UTF-8 BOM
+// on Windows (#1534), is read through the mark.
+func TestImportCCSwitchConfigWithBOM(t *testing.T) {
+	isolate(t)
+	path := filepath.Join(t.TempDir(), "config.json")
+	cfg := "\xef\xbb\xbf{\r\n  \"claude\": {\r\n    \"providers\": {\r\n      \"relay\": {\r\n        \"name\": \"Some Relay\",\r\n        \"settingsConfig\": {\"env\": {\"ANTHROPIC_BASE_URL\": \"https://relay.example.com\", \"ANTHROPIC_AUTH_TOKEN\": \"sk-relay\"}}\r\n      }\r\n    }\r\n  }\r\n}\r\n"
+	if err := os.WriteFile(path, []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	items, err := readCCSwitch(path)
+	if err != nil || len(items) != 1 || items[0].Provider.Key != "sk-relay" {
+		t.Fatalf("config.json with a BOM: %+v %v", items, err)
+	}
+}
+
+// A provider's Gemini URL (#1346) names its host like its other endpoints
+// do: the same key at that host is the provider already here, not another
+// one to add beside it.
+func TestGeminiURLIsItsHost(t *testing.T) {
+	isolate(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
+
+	// a Gemini-protocol relay added from the editor is known by its
+	// Gemini URL: the same key there again is the one already here
+	first := Provider{Name: "Gemini Relay", Key: "sk-g", Gemini: "https://g.example.com"}
+	if _, err := Add(first); err != nil {
+		t.Fatal(err)
+	}
+	if id, err := Add(Provider{Name: "Gemini Relay", Key: "sk-g", Gemini: "https://g.example.com"}); err == nil {
+		t.Fatalf("the same relay was added again as %q", id)
+	}
+
+	// an import entry at the relay over another protocol is the provider
+	// already here at its Gemini URL, the same key in hand
+	it := settle([]AppImport{{Ref: "r", Provider: Provider{
+		ID: "gr", Name: "Gemini Relay", Key: "sk-g", Chat: "https://g.example.com/v1",
+	}}}, All(), map[string]bool{})[0]
+	if it.Status != "same" || it.Existing != "Gemini Relay" {
+		t.Fatalf("the relay's import entry: %+v", it)
+	}
+}
+
+// While magpie routes Claude Code, its settings.json points at the
+// gateway and what the user had there stands by in the stash. The import
+// reads the stash back as magpie stepping out would put it back: the
+// tier and subagent models beside the endpoint, token and main model.
+func TestClaudeImportWhileRoutedTakesTheStashedEnv(t *testing.T) {
+	isolate(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("APPDATA", filepath.Join(home, "AppData", "Roaming"))
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
+	t.Setenv("MAGPIE_ADDR", "127.0.0.1:49999")
+	path := claudeSettingsPath()
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// routed: magpie wrote its own address and key over the user's relay
+	if err := os.WriteFile(path, []byte(`{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:49999","ANTHROPIC_AUTH_TOKEN":"sk-magpie"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(Path()), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	stash := map[string]string{
+		"claude.base_url":   "https://relay.example.com/anthropic",
+		"claude.auth_token": "sk-claude",
+		"claude.model":      "claude-sonnet-5",
+		"claude.env.ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-sonnet-5-x",
+		"claude.env.ANTHROPIC_SMALL_FAST_MODEL":     "claude-haiku-x",
+	}
+	b, _ := json.Marshal(stash)
+	if err := os.WriteFile(filepath.Join(filepath.Dir(Path()), "stash.json"), b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	it := itemsOf(t, "claude-code")["settings"]
+	if it.Skip != "" || it.Provider.Key != "sk-claude" {
+		t.Fatalf("the relay in the stash: %+v", it)
+	}
+	for _, m := range []string{"claude-sonnet-5", "claude-sonnet-5-x", "claude-haiku-x"} {
+		if !slices.Contains(it.Provider.Models, m) {
+			t.Fatalf("models %v miss %s", it.Provider.Models, m)
 		}
 	}
 }

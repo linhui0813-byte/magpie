@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -15,23 +14,19 @@ import (
 
 	"github.com/yetone/magpie/internal/plugin"
 	"github.com/yetone/magpie/internal/provider"
+	"github.com/yetone/magpie/internal/testenv"
 )
 
 // movedFake is the fake plugin signed in as the built-in id it was moved
 // onto, its requests going to up.
 func movedFake(t *testing.T, id string, up http.Handler) {
 	t.Helper()
-	bun, err := exec.LookPath("bun")
-	if err != nil {
-		t.Skip("no bun on PATH")
-	}
+	bun := testenv.Bun(t)
 	fresh(t)
 	t.Setenv("MAGPIE_BUN", bun)
 	t.Setenv("FAKE_ID", id)
 	t.Cleanup(plugin.Settle)
-	srv := httptest.NewServer(up)
-	t.Cleanup(srv.Close)
-	t.Setenv("FAKE_BASE", srv.URL+"/v1")
+	testenv.FakeVendor(t, up)
 	dir := filepath.Dir(provider.Path())
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)
@@ -121,12 +116,13 @@ func TestCursorPluginFast(t *testing.T) {
 
 // A Command Code Go conversation moved onto its plugin keeps its
 // reasoning, as the built-in replayed it to /alpha/generate: its plugin
-// reads reasoning_content. DeepSeek still gets it, others don't.
+// reads reasoning_content. DeepSeek and Qoder's plugin, which sends it on
+// as Qoder's client does, get it too; others don't.
 func TestCommandCodePluginReasoning(t *testing.T) {
 	reasoning := func(host string) any {
 		return chatBody(t, host)["messages"].([]any)[1].(map[string]any)["reasoning_content"]
 	}
-	for _, host := range []string{provider.CommandCodePlanID, "api.deepseek.com"} {
+	for _, host := range []string{provider.CommandCodePlanID, "api.deepseek.com", "qoder", "qoder-cn"} {
 		if got := reasoning(host); got != "pondered" {
 			t.Errorf("%s got reasoning %v", host, got)
 		}
@@ -145,5 +141,56 @@ func TestTraceNamesMovedAccount(t *testing.T) {
 	w := weighed(candidate{p: p, rest: "grok", model: "grok-4"}, p, weighing{}, false, "")
 	if w.Kind != "account" || w.Agent != "grok" || w.Plan != "SuperGrok Heavy" {
 		t.Fatalf("weighed = %+v, want grok's account", w)
+	}
+}
+
+// A failed tool result reaches the plugins of Devin and Qoder as their
+// built-ins sent it, "Error: " first, and Cursor's as is_error, which its
+// plugin reads; no other chat upstream is told either.
+func TestPluginToolFailureSaid(t *testing.T) {
+	failed := &Request{Messages: []Message{
+		{Role: "user", Parts: []Part{{Kind: Text, Text: "go"}}},
+		{Role: "assistant", Parts: []Part{{Kind: ToolCall, ID: "c1", Name: "Bash", Args: json.RawMessage(`{}`)}}},
+		{Role: "user", Parts: []Part{{Kind: ToolResult, CallID: "c1", Text: "exit status 1", IsError: true}}},
+	}}
+	tool := func(host string) map[string]any {
+		var m struct{ Messages []map[string]any }
+		if err := json.Unmarshal(buildChat(failed, "m", host, false), &m); err != nil {
+			t.Fatal(err)
+		}
+		for _, msg := range m.Messages {
+			if msg["role"] == "tool" {
+				return msg
+			}
+		}
+		t.Fatalf("%s: no tool message in %v", host, m.Messages)
+		return nil
+	}
+	for _, host := range []string{"devin", "qoder", "qoder-cn"} {
+		if got := tool(host); got["content"] != "Error: exit status 1" || got["is_error"] != nil {
+			t.Errorf("%s: %v", host, got)
+		}
+	}
+	if got := tool("cursor"); got["content"] != "exit status 1" || got["is_error"] != true {
+		t.Errorf("cursor: %v", got)
+	}
+	for _, host := range []string{"api.openai.com", "api.deepseek.com", "zed", provider.CommandCodePlanID} {
+		if got := tool(host); got["content"] != "exit status 1" || got["is_error"] != nil {
+			t.Errorf("%s: %v", host, got)
+		}
+	}
+}
+
+// A moved Command Code account's chat is built for its plugin, not for the
+// built-in's API host it shows, so a Go conversation keeps its reasoning
+// (chatReplaysReasoning) as one added on the plugin does.
+func TestMovedBuildHostIsPlugin(t *testing.T) {
+	movedFake(t, provider.CommandCodePlanID, http.NotFoundHandler())
+	p, err := provider.Find(provider.CommandCodePlanID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := buildHost(*p); got != provider.CommandCodePlanID {
+		t.Fatalf("buildHost = %q, Host = %q", got, p.Host())
 	}
 }

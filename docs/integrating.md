@@ -47,27 +47,65 @@ Send `magpie-<your-app-id>` (`Authorization: Bearer magpie-acme`, or
 log and the routing rules that match on agents. Without it, magpie counts
 the call by the first word of your `User-Agent` (`Acme/1.4 (darwin)` is
 `Acme`); an SDK's own User-Agent (`OpenAI/JS …`, `ai-sdk/…`) would count it
-as that SDK. From another computer (Settings → Share on local network) the
+as that SDK. From another computer (Settings → Network and sharing → Share on local network) the
 key must be one of the user's gateway keys, and the User-Agent names your
 app.
 
 **Models.** `GET /v1/models` lists what the user has turned on: `id`
 (`provider/model`, or a routing group's name, which you send as it is),
 `display_name`, `owned_by` (the provider), `reasoning` and
-`supported_reasoning_levels` (`[{"effort":"low"},…]`), `context_window`
+`supported_reasoning_levels` (`[{"effort":"low"},…]`, and the same as
+plain names in `reasoning_levels`), `context_window`
 and `max_output_tokens` when known, `modalities` when magpie knows whether
 it takes images. List them from there rather than shipping a list: the
 user adds and removes providers in magpie. Reasoning is asked in your
 API's own field (`reasoning_effort`, `reasoning.effort`, Anthropic's
 `thinking` or `output_config.effort`). `?format=text` gives the ids one a
-line.
+line. The list holds chat models only. Ask for image, video, embedding
+and rerank models with `?kind=image,video,embedding,rerank` (or
+`?kind=chat,image`, any of them, or `?kind=all`). Each of them is marked
+`"kind": "image"`, `"video"`, `"embedding"` or `"rerank"` and goes to
+`/v1/images/generations`, `/v1/videos`, `/v1/embeddings` or `/v1/rerank`,
+never to a chat route. Cherry Studio, which can't ask and tells an image
+or embedding model from a chat one by its id, is listed every kind.
+
+**A vendor's own fields.** `/v1/images/generations` and `/v1/videos`
+take OpenAI's fields and pass the others on to a vendor that takes them:
+Volcengine Ark's `content` (reference video and audio, `draft_task`),
+`ratio`, `resolution`, `duration: -1`, `tools`, `watermark`,
+`sequential_image_generation` and the rest. A video's answer carries
+Ark's own fields too (`content.last_frame_url`, `usage`, `resolution`).
+For the rest of a vendor's API use
+`/v1/magpie/native/<provider>/<path>`: GET, POST, PUT, PATCH or DELETE,
+with `<path>` joined to the provider's host (not its base URL), sent and
+answered in the vendor's own shape on the user's key for that provider,
+a stream as it comes. So Ark's task list is `GET
+/v1/magpie/native/ark/api/v3/contents/generations/tasks`. It serves a
+provider added with an API key, not a subscription or sign-in. Ark's
+short paths (`images/generations`, `contents/generations/tasks[/<id>]`)
+still work under the key's base. It takes the same gateway key as every
+route, and a key held to models, accounts or a budget is refused it.
 
 **Optional.** Send `X-Magpie-Session: <id>` with a conversation's requests
 and `GET /v1/magpie/route?session=<id>` says which model a routing group
 picked for the turn and the fallbacks it tried, before the first token
 (long-poll with `after=<seq>&wait=<s>`). `GET /v1/magpie/quotas` lists the
-user's subscription allowances. Both answer only this machine, or another
-with a gateway key. [Connecting anything else](reference.md#connecting-anything-else)
+user's subscription allowances, and `GET /v1/magpie/usage` and
+`/v1/magpie/usage/requests` the Usage page's numbers and its requests
+(with `session`, and `subagent`/`parent_agent` for a Claude Code
+subagent's call). They answer only this machine, or another with a gateway
+key; a key held to a budget, models or accounts sees its own calls and
+routes alone, and is refused the quotas unless its owner lets it see
+those of what it may use (`magpie gateway-key quotas <id> on`, #2216;
+its own limit, and what holds it, is `GET /v1/magpie/limit`).
+To keep a ledger of your own, read the requests as changes with `GET
+/v1/magpie/usage/requests?cursor=start` (stable `id`s, the vendors' ids
+under `original_ids`, `next_cursor`; `cursor=now` for what comes after).
+Calls your app makes to its vendor itself can be reported with `POST
+/v1/magpie/usage/requests` (one record or up to 5000 a post, in
+`usage.jsonl`'s shape, each with a `rid`; past times are kept, so a
+history can be backfilled). They show on the Usage page as reported, and
+never count against a key's limit. [Connecting anything else](reference.md#connecting-anything-else)
 has the details.
 
 **Keep the user's providers.** Add magpie as one more provider (named
@@ -103,11 +141,14 @@ app offers decides its shape:
   `Import` returns the link (`yourapp://provider/import?…` carrying the
   gateway's URL, the key `magpie-<id>` and the endpoints), the row's button
   opens it, and the user says yes once, in your app. `Added` reads,
-  read-only, whether your app has magpie already. magpie writes nothing of
-  yours. This suits an app that keeps its providers in a database or
-  encrypted.
-- **Your app has a local API while it runs** (Alma, at `localhost:23001`):
-  magpie adds itself as a provider and sets the default model through it.
+  read-only, whether your app has magpie already. Leave `Added` nil if your
+  app has no public status reader (as [Lody](../internal/agent/lody.go) does);
+  the row then asks the user to confirm in your app without claiming an
+  import status. magpie writes nothing of yours. This suits an app that keeps
+  its providers in a database or encrypted.
+- **Your app has a local API while it runs** (Alma, at `localhost:23001`;
+  Shelley, on its Unix socket): magpie adds itself as a provider and sets the
+  default model through it.
 
 A pull request needs: the adapter and its registration, `UA` (what your
 User-Agent begins with, lower-case) so Usage knows your calls, an icon in
@@ -127,7 +168,7 @@ kinds ([plugin guide](https://usemagpie.ai/docs/plugins)):
   source of models, such as a subscription magpie doesn't sign in to
   itself. They sign in, list models and make requests.
 - **Gateway middleware**: rewrites requests and replies as they pass
-  (`onRequest`, `onEvent`, `onResponse`).
+  (`onRequest`, `onAccount`, `onProvider`, `onEvent`, `onResponse`).
 
 A plugin can't add a row to the Agents page or write another app's
 config, so it is not how an app registers itself.

@@ -25,6 +25,7 @@ import (
 
 	"github.com/yetone/magpie/internal/appdir"
 	"github.com/yetone/magpie/internal/proc"
+	"github.com/yetone/magpie/internal/settings"
 )
 
 // copilotCLIHeaders are what the CLI sends with its token.
@@ -53,10 +54,101 @@ func copilotCLIHome() string {
 	return filepath.Join(home, ".copilot")
 }
 
+// CopilotWSLDirs, set by internal/agent, are the Copilot CLI's folders
+// (~/.copilot), as magpie opens them, in the WSL distros that run now:
+// magpie on Windows finds a Copilot CLI signed in inside one (#723,
+// jia2). Where ~/.copilot is a link the folder is where it leads (#4502).
+// nil, or none, off Windows. A stopped distro isn't in it: reading its
+// files would start it.
+var CopilotWSLDirs func() []string
+
+// copilotWSLAge is how long a WSL distro's Copilot CLI sign-in is kept as
+// read: its files are read over WSL's file share, slower than a disk's.
+var copilotWSLAge = 20 * time.Second
+
+// copilotWSLWait is how long a request waits for a distro's sign-in to
+// be read the first time, from when that read started (a read again
+// answers the last one meanwhile): one read at a time, outside
+// copilotWSL's lock, and a read WSL holds up answers the sign-in read
+// before. Held under the lock, a hung WSL queued every request behind
+// the first, and the gateway sent 504s after 30s (vsoullai on X, #6167).
+// A var for tests.
+var copilotWSLWait = 2 * time.Second
+
+var copilotWSL struct {
+	sync.Mutex
+	at    time.Time
+	app   copilotApp
+	ok    bool
+	done  chan struct{} // closed when the read in flight ends
+	start time.Time     // when it started
+}
+
 // copilotCLILogin is the account the Copilot CLI is signed in to, with its
-// token.
+// token: on this machine, or, for magpie on Windows, in a WSL distro that
+// runs now. A distro's token is read only from its config.json, where the
+// CLI keeps it when the distro has no keyring to put it in (WSL has none
+// unless one is set up): magpie can't reach a distro's keyring.
 func copilotCLILogin() (copilotApp, bool) {
-	raw, err := os.ReadFile(filepath.Join(copilotCLIHome(), "config.json"))
+	if settings.AccountDiscoveryOff() {
+		return copilotApp{}, false
+	}
+	if app, ok := copilotCLILoginIn(copilotCLIHome(), copilotCLISecret); ok {
+		return app, true
+	}
+	if CopilotWSLDirs == nil {
+		return copilotApp{}, false
+	}
+	c := &copilotWSL
+	c.Lock()
+	if !c.at.IsZero() && time.Since(c.at) < copilotWSLAge {
+		defer c.Unlock()
+		return c.app, c.ok
+	}
+	if c.done == nil {
+		done, dirs := make(chan struct{}), CopilotWSLDirs
+		c.done, c.start = done, time.Now()
+		go func() {
+			var found copilotApp
+			ok := false
+			for _, dir := range dirs() {
+				if app, in := copilotCLILoginIn(dir, nil); in {
+					found, ok = app, true
+					break
+				}
+			}
+			c.Lock()
+			c.app, c.ok, c.at, c.done = found, ok, time.Now(), nil
+			c.Unlock()
+			close(done)
+		}()
+	}
+	if !c.at.IsZero() {
+		// what was read before is answered while it is read again: each
+		// read waiting for it held a page's first ask (the Sessions page's,
+		// on a slow WSL) copilotWSLWait every copilotWSLAge (shangyuan0818
+		// on X)
+		defer c.Unlock()
+		return c.app, c.ok
+	}
+	done, start := c.done, c.start
+	c.Unlock()
+	t := time.NewTimer(time.Until(start.Add(copilotWSLWait)))
+	defer t.Stop()
+	select {
+	case <-done:
+	case <-t.C:
+	}
+	c.Lock()
+	defer c.Unlock()
+	return c.app, c.ok
+}
+
+// copilotCLILoginIn is the account the Copilot CLI whose settings are in
+// dir is signed in to, with its token: from its config.json, else from
+// secret (the keychain), when given.
+func copilotCLILoginIn(dir string, secret func(string) string) (copilotApp, bool) {
+	raw, err := readAccountFile(filepath.Join(dir, "config.json"))
 	if err != nil {
 		return copilotApp{}, false
 	}
@@ -86,8 +178,8 @@ func copilotCLILogin() (copilotApp, bool) {
 				key = strings.TrimSuffix(u.Host, "/") + ":" + u.Login
 			}
 			tok := cfg.Tokens[key]
-			if tok == "" {
-				tok = copilotCLISecret(key)
+			if tok == "" && secret != nil {
+				tok = secret(key)
 			}
 			if tok != "" {
 				return copilotApp{User: u.Login, Token: tok, Host: host, cli: true}, true
@@ -106,6 +198,9 @@ var copilotSecrets struct {
 // copilotCLISecret reads the CLI's token from the keychain, once in a
 // while: each read may ask the user to allow it.
 var copilotCLISecret = func(account string) string {
+	if settings.AccountDiscoveryOff() {
+		return ""
+	}
 	c := &copilotSecrets
 	c.Lock()
 	defer c.Unlock()
@@ -125,11 +220,34 @@ var copilotCLISecret = func(account string) string {
 		out, _ = proc.Command("security", "find-generic-password", "-s", "copilot-cli", "-a", account, "-w").Output()
 	case "linux":
 		if p, err := exec.LookPath("secret-tool"); err == nil {
-			out, _ = proc.Command(p, "lookup", "service", "copilot-cli", "account", account).Output()
+			out = []byte(copilotSecretTool(p, account))
 		}
 	}
 	c.at[account], c.tok[account] = time.Now(), string(bytes.TrimSpace(out))
 	return c.tok[account]
+}
+
+// copilotSecretWait bounds one secret-tool lookup: a keyring that waits on
+// a prompt nobody answers would hold the sign-in that asked (#723).
+var copilotSecretWait = 5 * time.Second
+
+// copilotSecretTool is the CLI's token in the Secret Service, as
+// secret-tool (at path) finds it. The CLI before 1.0 (keytar, libsecret)
+// keyed it by service and account; 1.0's own keyring store
+// (zbus-secret-service-keyring-store) by service and username, so both
+// are asked (#723).
+func copilotSecretTool(path, account string) string {
+	for _, attr := range []string{"account", "username"} {
+		ctx, cancel := context.WithTimeout(context.Background(), copilotSecretWait)
+		cmd := proc.CommandContext(ctx, path, "lookup", "service", "copilot-cli", attr, account)
+		cmd.WaitDelay = time.Second
+		out, _ := cmd.Output()
+		cancel()
+		if tok := strings.TrimSpace(string(out)); tok != "" {
+			return tok
+		}
+	}
+	return ""
 }
 
 // copilotDirect is the session a CLI token makes: the token itself, at the
@@ -147,7 +265,7 @@ func copilotDirect(ctx context.Context, app copilotApp) (copilotSession, error) 
 	}
 	req.Header.Set("Authorization", "token "+github)
 	req.Header.Set("Accept", "application/json")
-	res, err := http.DefaultClient.Do(req)
+	res, err := Keyed(http.DefaultClient).Do(req)
 	if err != nil {
 		return copilotSession{}, errors.New("Copilot sign-in: " + err.Error())
 	}
@@ -159,8 +277,17 @@ func copilotDirect(ctx context.Context, app copilotApp) (copilotSession, error) 
 		} `json:"endpoints"`
 	}
 	if res.StatusCode != 200 || json.Unmarshal(b, &u) != nil {
+		// 401 is GitHub refusing the token itself; a 403 here can be an
+		// account without Copilot, and a 5xx is GitHub's own trouble
+		if res.StatusCode == http.StatusUnauthorized {
+			copilotRefuse(github, res.StatusCode)
+		}
 		return copilotSession{}, errors.New("the Copilot CLI's sign-in was refused (" + APIError(b, res.Status) + "); run `copilot login` again")
 	}
+	copilotRefusals.Lock()
+	delete(copilotRefusals.at, github)
+	delete(copilotRefusals.status, github)
+	copilotRefusals.Unlock()
 	s := copilotSession{Token: github, ExpiresAt: time.Now().Add(30 * time.Minute).Unix(), direct: true}
 	s.Endpoints.API = u.Endpoints.API
 	copilotSessions[github] = s

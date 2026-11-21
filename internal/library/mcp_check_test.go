@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
@@ -34,6 +35,32 @@ func TestFakeMCPServer(t *testing.T) {
 		fmt.Fprintf(l, "%d\n", os.Getpid())
 		l.Close()
 	}
+	if f := os.Getenv("MAGPIE_FAKE_MCP_CWD"); f != "" {
+		wd, _ := os.Getwd()
+		os.WriteFile(f, []byte(wd+"\n"+os.Getenv("PWD")), 0o644)
+	}
+	if mode == "needcwd" {
+		// A server that writes into its working directory on start (the
+		// doris-mcp-server shape in #1727). Fail loudly if "." is not writable.
+		if err := os.MkdirAll(filepath.Join(".", "logs"), 0o755); err != nil {
+			fmt.Fprintln(os.Stderr, err.Error())
+			os.Exit(1)
+		}
+		mode = "ok"
+	}
+	if mode == "nohome" {
+		// a server that indexes the folder it starts in and refuses home,
+		// with fff-mcp 0.11.0's own words (math_milian on Discord)
+		wd, _ := os.Getwd()
+		h, _ := os.UserHomeDir()
+		a, errA := os.Stat(wd)
+		b, errB := os.Stat(h)
+		if errA == nil && errB == nil && os.SameFile(a, b) {
+			fmt.Fprintln(os.Stderr, `Error: "Failed to init file picker: Can not run certain FFF features in a file system root or home directories. Consider smaller per-project directories."`)
+			os.Exit(1)
+		}
+		mode = "ok"
+	}
 	switch mode {
 	case "sleep":
 		time.Sleep(time.Minute)
@@ -51,6 +78,12 @@ func TestFakeMCPServer(t *testing.T) {
 		time.Sleep(time.Minute)
 		os.Exit(0)
 	}
+	// a server that needs its token, as GitHub's does: it exits when the
+	// token isn't the one MAGPIE_FAKE_MCP_WANT names
+	if want, ok := os.LookupEnv("MAGPIE_FAKE_MCP_WANT"); ok && os.Getenv("MAGPIE_FAKE_MCP_TOKEN") != want {
+		fmt.Fprintf(os.Stderr, "Error: bad token %q\n", os.Getenv("MAGPIE_FAKE_MCP_TOKEN"))
+		os.Exit(4)
+	}
 	// ok: a log line on stdout first, as some servers write
 	fmt.Println("server starting on stdio")
 	sc := bufio.NewScanner(os.Stdin)
@@ -58,14 +91,46 @@ func TestFakeMCPServer(t *testing.T) {
 		var m struct {
 			ID     *int   `json:"id"`
 			Method string `json:"method"`
+			Params struct {
+				Name      string          `json:"name"`
+				Arguments json.RawMessage `json:"arguments"`
+				Meta      json.RawMessage `json:"_meta"`
+			} `json:"params"`
 		}
 		json.Unmarshal(sc.Bytes(), &m)
 		switch m.Method {
+		case "tools/call":
+			// the hub's: "die" ends the server mid-call, "slow" never
+			// answers, any other tool says its name, its arguments and the
+			// process it ran in, and the _meta it came with if any
+			switch m.Params.Name {
+			case "die":
+				fmt.Fprintln(os.Stderr, "Error: lost the database")
+				os.Exit(5)
+			case "slow":
+				continue
+			}
+			said := fmt.Sprintf("%s %s pid=%d", m.Params.Name, m.Params.Arguments, os.Getpid())
+			if len(m.Params.Meta) > 0 {
+				said += " meta=" + string(m.Params.Meta)
+			}
+			text, _ := json.Marshal(said)
+			fmt.Printf(`{"jsonrpc":"2.0","id":%d,"result":{"content":[{"type":"text","text":%s}]}}`+"\n", *m.ID, text)
 		case "initialize":
 			fmt.Printf(`{"jsonrpc":"2.0","id":%d,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"fake","version":"1"}}}`+"\n", *m.ID)
 		case "notifications/initialized":
 			os.WriteFile(os.Getenv("MAGPIE_FAKE_MCP_INIT"), []byte("yes"), 0o644)
 		case "tools/list":
+			// file: the reply a real server gave, under this request's id
+			if f := os.Getenv("MAGPIE_FAKE_MCP_TOOLS"); f != "" {
+				var r map[string]any
+				b, _ := os.ReadFile(f)
+				json.Unmarshal(b, &r)
+				r["id"] = *m.ID
+				b, _ = json.Marshal(r)
+				fmt.Println(string(b))
+				continue
+			}
 			fmt.Printf(`{"jsonrpc":"2.0","method":"notifications/message","params":{}}`+"\n"+`{"jsonrpc":"2.0","id":%d,"result":{"tools":[{"name":"a"},{"name":"b"},{"name":"c"}]}}`+"\n", *m.ID)
 		}
 	}
@@ -85,10 +150,11 @@ func fakeStdio(t *testing.T, mode string, env map[string]string) *Server {
 	return &Server{Name: "fake", Transport: "stdio", Command: self, Args: []string{"-test.run=^TestFakeMCPServer$"}, Env: e}
 }
 
+// short gives each step of a check d, a command's and a URL's alike.
 func short(t *testing.T, d time.Duration) {
-	was := checkTimeout
-	checkTimeout = d
-	t.Cleanup(func() { checkTimeout = was })
+	ws, wr := stdioStep, remoteStep
+	stdioStep, remoteStep = d, d
+	t.Cleanup(func() { stdioStep, remoteStep = ws, wr })
 }
 
 func TestCheckStdio(t *testing.T) {
@@ -112,6 +178,58 @@ func TestCheckStdio(t *testing.T) {
 		h := CheckServer(context.Background(), &Server{Name: "x", Transport: "stdio", Command: "magpie-no-such-mcp-server"})
 		if h.State != "error" || h.Why != "notfound" || h.Detail != "magpie-no-such-mcp-server" {
 			t.Fatalf("got %+v, want notfound", h)
+		}
+	})
+	// a home of the subtest's own, so what a server writes there goes with
+	// it, and a process cwd that isn't home (#1727)
+	ownHome := func(t *testing.T, cwd string) string {
+		h := t.TempDir()
+		t.Setenv("HOME", h)
+		t.Setenv("USERPROFILE", h)
+		t.Chdir(cwd)
+		return h
+	}
+	t.Run("starts in the home directory", func(t *testing.T) {
+		// Without cmd.Dir=home, the check inherits whatever cwd the process
+		// has (on Windows Start-menu launches, often an unwritable system
+		// dir); the child must report home instead.
+		work := t.TempDir()
+		h := ownHome(t, work)
+		cwdFile := filepath.Join(t.TempDir(), "cwd")
+		got := CheckServer(context.Background(), fakeStdio(t, "ok", map[string]string{"MAGPIE_FAKE_MCP_CWD": cwdFile}))
+		if got.State != "ok" {
+			t.Fatalf("got %+v, want ok", got)
+		}
+		b, _ := os.ReadFile(cwdFile)
+		wd, pwd, _ := strings.Cut(string(b), "\n")
+		// the same folder, however it is spelled (/var is /private/var on macOS)
+		a, errA := os.Stat(wd)
+		hi, errH := os.Stat(h)
+		if errA != nil || errH != nil || !os.SameFile(a, hi) {
+			t.Fatalf("check started the server in %q, want home %q (process cwd was %q)", wd, h, work)
+		}
+		// and PWD says so, as it would for a server an agent starts there
+		if runtime.GOOS != "windows" && pwd != h {
+			t.Fatalf("the server's PWD is %q, want home %q", pwd, h)
+		}
+	})
+	t.Run("writable home when process cwd is not", func(t *testing.T) {
+		// Read-only process cwd: a server that makes ./logs fails unless
+		// the check pins Dir to home (#1727). Windows doesn't enforce a
+		// folder's read-only bit, so there it is ./logs landing in home that
+		// shows where the server ran.
+		ro := filepath.Join(t.TempDir(), "ro")
+		if err := os.Mkdir(ro, 0o555); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { os.Chmod(ro, 0o755) })
+		h := ownHome(t, ro)
+		got := CheckServer(context.Background(), fakeStdio(t, "needcwd", nil))
+		if got.State != "ok" || got.Tools != 3 {
+			t.Fatalf("got %+v, want ok with 3 tools (server must not inherit the read-only cwd)", got)
+		}
+		if _, err := os.Stat(filepath.Join(h, "logs")); err != nil {
+			t.Fatalf("the server's ./logs isn't in home: %v", err)
 		}
 	})
 	t.Run("timeout ends the tree", func(t *testing.T) {
@@ -186,6 +304,9 @@ func mcpHandler(t *testing.T, sse bool, seen *http.Header) http.HandlerFunc {
 			}
 			*seen = r.Header.Clone()
 			reply = fmt.Sprintf(`{"jsonrpc":"2.0","id":%d,"result":{"tools":[{"name":"a"},{"name":"b"}]}}`, *m.ID)
+		case "tools/call":
+			// the hub's: the tool's name back, in the session it was sent in
+			reply = fmt.Sprintf(`{"jsonrpc":"2.0","id":%d,"result":{"content":[{"type":"text","text":"remote %s"}]}}`, *m.ID, r.Header.Get("Mcp-Session-Id"))
 		}
 		if sse {
 			w.Header().Set("Content-Type", "text/event-stream")
@@ -234,7 +355,7 @@ func TestCheckHTTP(t *testing.T) {
 			defer srv.Close()
 			h := CheckServer(context.Background(), &Server{Name: "r", Transport: "http", URL: srv.URL})
 			h.At = 0
-			if h != c.want {
+			if !reflect.DeepEqual(h, c.want) {
 				t.Fatalf("got %+v, want %+v", h, c.want)
 			}
 		})
@@ -375,4 +496,59 @@ func snapshot(t *testing.T, dir string) string {
 		return nil
 	})
 	return b.String()
+}
+
+// A server that indexes the folder it starts in refuses home, where the
+// check starts a command, while every agent starts it in its project
+// (fff-mcp, math_milian on Discord: "fff exited (1)" in the Library while
+// it worked in the agent). Given directly, it is ok, said to be so in a
+// project; through the MCP router, which runs it in home, it is "home".
+func TestCheckServerThatRefusesHome(t *testing.T) {
+	hubSandbox(t)
+	cwdFile := filepath.Join(t.TempDir(), "cwd")
+	fake := fakeStdio(t, "nohome", map[string]string{"MAGPIE_FAKE_MCP_CWD": cwdFile})
+	fake.Agents = []string{"claude"}
+	ok(t)(SaveServer("", *fake))
+	got := CheckServer(context.Background(), fake)
+	if got.State != "ok" || got.Tools != 3 || !got.Project || !strings.Contains(got.Detail, "home directories") {
+		t.Fatalf("given directly: got %+v, want ok with 3 tools, in a project, with what it said in home", got)
+	}
+	// an empty folder of its own, gone with the check
+	b, _ := os.ReadFile(cwdFile)
+	wd, _, _ := strings.Cut(string(b), "\n")
+	if !strings.Contains(filepath.Base(wd), "magpie-mcp-project-") {
+		t.Fatalf("it listed its tools in %q, want a project folder of the check's own", wd)
+	}
+	if _, err := os.Stat(wd); !os.IsNotExist(err) {
+		t.Fatalf("the project folder %s is left: %v", wd, err)
+	}
+	ok(t)(SetMCPHub(true))
+	got = CheckServer(context.Background(), fake)
+	if got.State != "error" || got.Why != "home" || got.Code != 1 || !strings.Contains(got.Detail, "home directories") {
+		t.Fatalf("through the router: got %+v, want error home, code 1, with what it said", got)
+	}
+	// kept direct, the router leaves it to the agents again
+	ok(t)(ServerHub(fake.Name, true))
+	fake.Hub = HubDirect
+	if got = CheckServer(context.Background(), fake); got.State != "ok" || !got.Project {
+		t.Fatalf("kept direct: got %+v, want ok in a project", got)
+	}
+	// Codex on magpie is given it as RunPath, which magpie runs in home too
+	ok(t)(SetMCPHub(false))
+	ok(t)(ServerHub(fake.Name, false))
+	fake.Hub = ""
+	fake.Agents = []string{"claude", "codex"}
+	runs.Lock()
+	was := runs.wired
+	runs.wired = map[string]bool{"codex": true}
+	runs.Unlock()
+	t.Cleanup(func() { runs.Lock(); runs.wired = was; runs.Unlock() })
+	if got = CheckServer(context.Background(), fake); got.Why != "home" {
+		t.Fatalf("given to Codex on magpie: got %+v, want error home", got)
+	}
+	// a server that exits wherever it starts is told as before
+	bad := fakeStdio(t, "exit", nil)
+	if got = CheckServer(context.Background(), bad); got.Why != "exited" || got.Code != 3 || got.Project {
+		t.Fatalf("one that exits anywhere: got %+v, want exited (3)", got)
+	}
 }

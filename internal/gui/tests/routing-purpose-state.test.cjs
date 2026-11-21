@@ -62,6 +62,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: "chromium" }));
       const page = await browser.newPage({ viewport: { width: 1100, height: 850 }, reducedMotion: "reduce" });
       page.setDefaultTimeout(5000);
+      page.setDefaultNavigationTimeout(60000);
       const feed = { seq: 100 }, errors = [];
       page.on("pageerror", (e) => errors.push(e.message));
       await page.route("**/*", serve(lang, feed));
@@ -74,13 +75,24 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       const choose = async (value) => {
         await click(page, page.locator("#rtPurpose"));
         const name = await page.evaluate((v) => v ? purposeOptions([v], v)[0].name : t("All purposes"), value);
-        await page.locator(".rt-purpose-menu .pm-item").filter({ has: page.locator(".pm-name", { hasText: name }) }).click();
+        const target = page.locator(".rt-purpose-menu .pm-item").filter({ has: page.locator(".pm-name", { hasText: name }) });
+        if (!value || await target.getAttribute("aria-checked") !== "true") await target.click();
+        if (value) {
+          const chosen = await page.locator('.rt-purpose-menu [role="menuitemcheckbox"][aria-checked="true"] .pm-name').allTextContents();
+          for (const other of chosen) {
+            if (other !== name) await page.locator(".rt-purpose-menu").getByRole("menuitemcheckbox", { name: other, exact: true }).click();
+          }
+        }
         await page.waitForFunction((v) => document.querySelector(".rt-purpose-tools").classList.contains("set") === !!v, value);
+        if (await page.locator("#rtPurpose").getAttribute("aria-expanded") === "true") await page.keyboard.press("Escape");
       };
-      const send = async (rs) => {
+      // away: sent while another page is shown, where the page asks for no
+      // more until it is back in sight
+      const send = async (rs, away) => {
         for (let i = 0; i < 100 && !feed.next; i++) await page.waitForTimeout(20);
         assert(feed.next, "trace poll is waiting");
         feed.next(rs);
+        if (away) return;
         // The following poll begins after all of this response was applied.
         for (let i = 0; i < 100 && !feed.next; i++) await page.waitForTimeout(20);
         assert(feed.next, "trace update was applied");
@@ -110,7 +122,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       assert.deepEqual(await counts(), ["4", "1", "2"]);
       // Resume after another page, then a matching new call, both keep the scope.
       await page.evaluate(() => window.show("providers"));
-      await send([req(104, "review")]);
+      await send([req(104, "review")], true);
       await page.evaluate(() => window.show("routing"));
       await story(102);
       await send([req(105, "thread_title")]);
@@ -152,8 +164,28 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await send([req(108, "thread_title")]);
       await page.waitForFunction((n) => document.querySelector("#rt .rt-stats b").textContent === String(n), Number(beforeDone[0]) + 1);
       assert.deepEqual((await counts()).slice(1), beforeDone.slice(1));
+      // Every selected purpose contributes to the live story and counters.
+      await click(page, page.locator("#rtPurpose"));
+      const reviewName = await page.evaluate(() => purposeOptions(["kind:review"])[0].name);
+      await page.locator(".rt-purpose-menu").getByRole("menuitemcheckbox", { name: reviewName, exact: true }).click();
+      await page.waitForFunction((name) => document.querySelector("#rtPurpose span").textContent.includes(name), reviewName);
+      await page.keyboard.press("Escape");
+      const unionCounts = await counts();
+      await send([req(109, "review", 500, "Selected review failed")]);
+      await story(109);
+      assert.deepEqual(await counts(), [String(Number(unionCounts[0]) + 1), unionCounts[1], String(Number(unionCounts[2]) + 1)]);
+      await send([req(110, "guardian")]);
+      await story(109);
+      assert.equal((await counts())[0], String(Number(unionCounts[0]) + 1), "an unselected purpose cannot change union counts");
+      await click(page, page.locator(".rt-days .rt-day").nth(1));
+      await story(50);
+      await click(page, page.locator("#rtPurpose"));
+      assert.equal(await page.locator('.rt-purpose-menu [role="menuitemcheckbox"][aria-checked="true"]').count(), 2, "a purpose absent from history stays selected");
+      await page.keyboard.press("Escape");
+      await click(page, page.locator(".rt-days .rt-day").first());
+      await story(109);
       await choose("");
-      await story(108);
+      await story(110);
       assert.deepEqual(await counts(), ["20", "5", "7"], "the menu's All purposes option also clears the routing scope");
       // Browser interpretation uses explicit canonical keys, including unknown
       // values that happen to be Object.prototype property names.

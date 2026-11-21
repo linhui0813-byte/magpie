@@ -72,6 +72,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         const ctx = await browser.newContext({ viewport: { width: 1000, height: 640 }, reducedMotion: "reduce" });
         const page = await ctx.newPage(), f = fixture(lang);
         page.setDefaultTimeout(5000);
+        page.setDefaultNavigationTimeout(60000);
         page.on("pageerror", (e) => errors.push(e.message));
         await page.route("**/*", f.route);
         await page.goto("http://magpie.test/?view=providers");
@@ -89,7 +90,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
           assert(x.inRow, `${x.id}'s grip is off its row or over its logo`);
         }
         assert.equal(await page.locator("#offProviders .pv-handle").count(), 0, "a provider switched off has a handle");
-        const tip = await page.evaluate(() => t("Drag to reorder — a model several providers serve goes to the higher one first · Alt+↑/↓ to move"));
+        const tip = await page.evaluate(() => t("Drag to reorder — a model several providers serve goes to the higher one first · Alt+↑/↓ to move") + " · " + t("right-click to move it to the top or the bottom"));
         if (lang === "zh") assert.match(tip, /拖动/);
         assert.equal(await page.locator("#providers .pv-handle").first().getAttribute("title"), tip);
         await page.locator("#providers > .row.provider").nth(1).locator(".name").hover();

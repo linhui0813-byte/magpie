@@ -2,11 +2,14 @@ package gateway
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/yetone/magpie/internal/catalog"
+	"github.com/yetone/magpie/internal/provider"
 )
 
 func codeAssistRequest(t *testing.T) *Request {
@@ -56,10 +59,18 @@ func TestBuildCodeAssistForGemini(t *testing.T) {
 	if strings.Contains(s, "sig-from-claude") || strings.Contains(s, `"hm"`) {
 		t.Error("thinking was sent back")
 	}
-	// the tool result and the next question are one user turn
+	// the tool result is a user turn, and the next question one of its own
+	// after it: Gemini turns away the two in one (#1533)
 	contents := req["contents"].([]any)
-	if len(contents) != 3 || len(contents[2].(map[string]any)["parts"].([]any)) != 2 {
-		t.Errorf("contents = %v", contents)
+	if len(contents) != 4 {
+		t.Fatalf("contents = %v", contents)
+	}
+	tools, asked := contents[2].(map[string]any), contents[3].(map[string]any)
+	if tp := tools["parts"].([]any); tools["role"] != "user" || len(tp) != 1 || tp[0].(map[string]any)["functionResponse"] == nil {
+		t.Errorf("the tool's turn = %v", tools)
+	}
+	if ap := asked["parts"].([]any); asked["role"] != "user" || len(ap) != 1 || ap[0].(map[string]any)["text"] != "and?" {
+		t.Errorf("the question's turn = %v", asked)
 	}
 }
 
@@ -155,7 +166,8 @@ func TestCodeAssistAntigravityLevels(t *testing.T) {
 	var raw []catalog.Model
 	for _, l := range []string{"gemini-3-flash - Gemini 3 Flash", "gemini-3.1-pro-high - Gemini 3.1 Pro (High)", "gemini-3.1-pro-low - Gemini 3.1 Pro (Low)",
 		"gemini-3.7-flash-high - Gemini 3.7 Flash (High)", "gemini-3.7-flash-low - Gemini 3.7 Flash (Low)",
-		"gemini-3.7-flash-medium - Gemini 3.7 Flash (Medium)", "gemini-pro-agent - Gemini 3.1 Pro (High)"} {
+		"gemini-3.7-flash-medium - Gemini 3.7 Flash (Medium)", "gemini-pro-agent - Gemini 3.1 Pro (High)",
+		"gemini-4-hydrogen-high - Gemini 4 Hydrogen (High)", "gemini-4-hydrogen-xhigh - Gemini 4 Hydrogen (XHigh)"} {
 		id, name, _ := strings.Cut(l, " - ")
 		raw = append(raw, catalog.Model{ID: id, Name: name})
 	}
@@ -175,6 +187,9 @@ func TestCodeAssistAntigravityLevels(t *testing.T) {
 		{"gemini-pro-agent", "medium", "antigravity", "gemini-pro-agent", "high"},
 		{"gemini-pro-agent", "low", "antigravity", "gemini-pro-agent", "low"},
 		{"gemini-3.7-flash", "low", "gemini", "gemini-3.7-flash", "low"},
+		{"gemini-4-hydrogen", "xhigh", "antigravity", "gemini-4-hydrogen-xhigh", "xhigh"},
+		{"gemini-4-hydrogen-xhigh", "xhigh", "antigravity", "gemini-4-hydrogen-xhigh", "xhigh"},
+		{"gemini-4-hydrogen", "high", "antigravity", "gemini-4-hydrogen-high", "high"},
 	} {
 		r := codeAssistRequest(t)
 		r.Thinking, r.Effort = false, c.effort
@@ -192,6 +207,63 @@ func TestCodeAssistAntigravityLevels(t *testing.T) {
 		if env.Model != c.want || level != c.level {
 			t.Errorf("%s at %q on %s: %s at %q, want %s at %q", c.model, c.effort, c.agent, env.Model, level, c.want, c.level)
 		}
+	}
+}
+
+// Claude Code's auto mode classifier turns thinking off and is asked at the
+// least level the model has (fitAutoModeClassifier, #250): minimal, on a
+// Gemini 3 Flash models.dev gives minimal. Code Assist sends minimal only
+// to a variant at minimal, as the id doesn't say which Flash serves it and
+// 3.8 Flash has none, and sent the rest at high, the most: they go at low.
+// An image model asked low, which fits to minimal (3.1 Flash Image has
+// minimal and high), still goes at high.
+func TestCodeAssistReasoningOffAtLow(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	os.MkdirAll(filepath.Dir(catalog.CachePath()), 0o755)
+	if err := os.WriteFile(catalog.CachePath(), []byte(`{"google":{"models":{
+	  "gemini-3.5-flash":{"id":"gemini-3.5-flash","reasoning":true,"reasoning_options":[{"type":"effort","values":["minimal","low","medium","high"]}]},
+	  "gemini-3.1-flash-lite":{"id":"gemini-3.1-flash-lite","reasoning":true,"reasoning_options":[{"type":"effort","values":["minimal","low","medium","high"]}]},
+	  "gemini-3.1-flash-image":{"id":"gemini-3.1-flash-image","reasoning":true,"reasoning_options":[{"type":"effort","values":["minimal","high"]}]}}}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	catalog.Reset()
+	t.Cleanup(catalog.Reset)
+	// the level the request goes at, its effort fitted as forwardTranslated
+	// fits it
+	level := func(p provider.Provider, model string, r *Request) string {
+		if r.Effort != "" {
+			r.Effort = fitFor(p, model, r.Effort)
+		}
+		var env struct {
+			Request struct {
+				GenerationConfig struct {
+					ThinkingConfig struct {
+						ThinkingLevel string `json:"thinkingLevel"`
+					} `json:"thinkingConfig"`
+				} `json:"generationConfig"`
+			} `json:"request"`
+		}
+		json.Unmarshal(codeAssistBody(p, r, model, nil), &env)
+		return env.Request.GenerationConfig.ThinkingConfig.ThinkingLevel
+	}
+	for _, c := range []struct{ agent, model string }{{"gemini", "gemini-3.5-flash"}, {"antigravity", "gemini-3.1-flash-lite"}} {
+		p := provider.Provider{ID: c.agent, Account: &provider.Account{Agent: c.agent, User: "u"}}
+		r, err := parseAnthropic([]byte(autoModeAsk(c.model)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		fitAutoModeClassifier(p, c.model, r)
+		if got := level(p, c.model, r); r.Effort != "minimal" || got != "low" {
+			t.Errorf("the classifier on %s's %s: %q at %q, want minimal at low", c.agent, c.model, r.Effort, got)
+		}
+	}
+	p := provider.Provider{ID: "antigravity", Account: &provider.Account{Agent: "antigravity", User: "u"}}
+	r, err := parseChat([]byte(`{"model":"gemini-3.1-flash-image","stream":true,"reasoning_effort":"low","messages":[{"role":"user","content":"draw a cat"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := level(p, "gemini-3.1-flash-image", r); got != "high" {
+		t.Errorf("gemini-3.1-flash-image asked low: at %q, want high", got)
 	}
 }
 
@@ -229,6 +301,8 @@ func TestCodeAssistTextCalls(t *testing.T) {
 			"", []call{{"bash", `{"command":"ls"}`}}, "tool"},
 		{"unfinished", []string{chunk(text("look call:default_api:bash{command:ls"), "MAX_TOKENS")},
 			"look call:default_api:bash{command:ls", nil, "length"},
+		{"malformed", []string{`{"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"x","thought":true}]},"finishReason":"MALFORMED_FUNCTION_CALL","finishMessage":"Malformed function call: call:default_api:bash{command:ls -la}"}]}}`},
+			"", []call{{"bash", `{"command":"ls -la"}`}}, "tool"},
 		{"not a call", []string{chunk(text("say call:default_api: or recall"), ""), chunk(text(" ca"), "STOP")},
 			"say call:default_api: or recall ca", nil, "stop"},
 	} {
@@ -296,9 +370,21 @@ func TestCodeAssistToolImagesAfterEveryResponse(t *testing.T) {
 		if err := json.Unmarshal(buildCodeAssist(r, model, agent), &env); err != nil {
 			t.Fatal(err)
 		}
+		// every part after the model's last turn, "|" between two turns
 		cs := env.Request.Contents
 		var out []string
-		for _, p := range cs[len(cs)-1].Parts {
+		var parts []map[string]json.RawMessage
+		for _, c := range cs[2:] {
+			if len(parts) > 0 {
+				parts = append(parts, map[string]json.RawMessage{"turn": nil})
+			}
+			parts = append(parts, c.Parts...)
+		}
+		for _, p := range parts {
+			if _, ok := p["turn"]; ok {
+				out = append(out, "|")
+				continue
+			}
 			switch {
 			case p["functionResponse"] != nil:
 				var fr struct{ ID string }
@@ -331,7 +417,7 @@ func TestCodeAssistToolImagesAfterEveryResponse(t *testing.T) {
 	gem := []string{
 		"response toolu_bdrk_01AvFfWkjBwUMB97S9vUMAR7", "image QUFB",
 		"response toolu_bdrk_01TJixAcopSp2JamBfnbfF4V", "image QkJC",
-		"which is bigger?",
+		"|", "which is bigger?", // in a turn of its own (#1533)
 	}
 	if got := shape("gemini-3-flash", "antigravity"); !reflect.DeepEqual(got, gem) {
 		t.Errorf("Antigravity Gemini:\n got %q\nwant %q", got, gem)

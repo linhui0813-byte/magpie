@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 
@@ -23,18 +24,13 @@ func TestProxyDownDoesNotRest(t *testing.T) {
 			for _, k := range []string{"HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy"} {
 				t.Setenv(k, "")
 			}
-			l, err := net.Listen("tcp", "127.0.0.1:0")
-			if err != nil {
-				t.Fatal(err)
-			}
-			down := l.Addr().String()
-			l.Close() // nothing listens there now
 			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				io.ReadAll(r.Body)
 				w.Header().Set("Content-Type", "application/json")
 				io.WriteString(w, `{"id":"c","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"from b"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
 			}))
 			t.Cleanup(up.Close)
+			down := deadAddr(t, up.Listener.Addr().String())
 			for _, p := range []provider.Provider{
 				{ID: "a", Name: "A", Key: "ka", Models: []string{"m"}, Chat: "http://a.test/v1", Proxy: scheme + "://" + down},
 				{ID: "b", Name: "B", Key: "kb", Models: []string{"m"}, Chat: up.URL + "/v1"},
@@ -68,4 +64,25 @@ func TestProxyDownDoesNotRest(t *testing.T) {
 			}
 		})
 	}
+}
+
+// deadAddr is a loopback address nothing listens on, for a proxy that is
+// down. It is taken after the test's own servers are up and is never one of
+// theirs: a port just let go can be handed out again at once (Linux CI gave
+// the closed port to the next httptest server, so the "down" proxy answered).
+func deadAddr(t *testing.T, taken ...string) string {
+	t.Helper()
+	for range 20 {
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		a := l.Addr().String()
+		l.Close()
+		if !slices.Contains(taken, a) {
+			return a
+		}
+	}
+	t.Fatal("no free loopback port apart from the test's servers")
+	return ""
 }

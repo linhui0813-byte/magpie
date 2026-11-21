@@ -1,10 +1,20 @@
 package plugin
 
 import (
+	"archive/tar"
+	"bytes"
+	"compress/gzip"
 	"context"
+	"crypto/sha512"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"io/fs"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -54,9 +64,10 @@ func TestIsGit(t *testing.T) {
 }
 
 // The test binary stands in for bun when MAGPIE_FAKE_BUN is set: add,
-// update and remove as bun does them for a git spec, fetching from local
-// repositories ($MAGPIE_FAKE_GITHUB/owner/repo.git for GitHub's), and,
-// like bun, keeping the commit its lock has when a spec is added again.
+// update and remove as bun does them — a git spec fetched from local
+// repositories ($MAGPIE_FAKE_GITHUB/owner/repo.git for GitHub's), and, like
+// bun, keeping the commit its lock has when a spec is added again; an npm
+// one put at node_modules/<its name>, at the version its spec names.
 func init() {
 	if os.Getenv("MAGPIE_FAKE_BUN") == "1" {
 		if err := fakeBun(os.Args[1:]); err != nil {
@@ -76,6 +87,7 @@ func fakeBun(args []string) error {
 		return fmt.Errorf("unexpected %q", args)
 	}
 	var pj map[string]any
+	failSays := "" // what Bun says failing after it wrote package.json
 	b, err := os.ReadFile("package.json")
 	if err != nil {
 		return err
@@ -101,12 +113,60 @@ func fakeBun(args []string) error {
 				return nil // as bun: the lock's commit stays
 			}
 		}
+		// a package npm doesn't have, as Bun 1.4.4 says it: nothing written
+		if n := os.Getenv("MAGPIE_FAKE_BUN_NPM404"); n != "" && !IsPath(spec) && Name(spec) == n {
+			fmt.Println("bun add v1.4.4 (38afee6c8)")
+			fmt.Println("Resolving dependencies")
+			fmt.Println("Resolved, downloaded and extracted [1]")
+			fmt.Println("error: GET https://registry.npmjs.org/" + strings.Replace(n, "/", "%2f", 1) + " - 404")
+			return errors.New("exit 1")
+		}
+		// a tarball of plugins/dist (installDist): the package it holds,
+		// copied as Bun 1.4.4 copies it, from its install cache's entry
+		// for the tarball, which it trusts whole once it is there
+		if IsPath(spec) && strings.HasSuffix(spec, ".tgz") {
+			name, held, err := fakeDistAdd(spec)
+			if err != nil {
+				return err
+			}
+			deps[name] = spec
+			if held {
+				// as the reporter's Bun 1.4.4 said it: installed, the
+				// dependency written, and exit 1
+				failSays = "bun add v1.4.4 (38afee6c8)\nResolving dependencies\nResolved, downloaded and extracted [1]\n" +
+					"Unexpected: failed copying files from cache to destination for package " + name + "\n" +
+					"Saved lockfile\n\ninstalled " + name + "@" + spec + "\n\n1 package removed [43.00ms]\nFailed to install 1 package\n"
+			}
+			break
+		}
+		if !IsGit(spec) {
+			name := Name(spec)
+			at := filepath.Join("node_modules", filepath.FromSlash(name))
+			if err := os.MkdirAll(at, 0o755); err != nil {
+				return err
+			}
+			v := strings.TrimPrefix(strings.TrimPrefix(spec, name), "@")
+			// a file to load, as a plugin's package has: add says why it
+			// won't take a package that names none (notPlugin)
+			b, _ := json.Marshal(map[string]string{"name": name, "version": v, "main": "index.js"})
+			if err := os.WriteFile(filepath.Join(at, "index.js"), []byte("export default async () => ({})\n"), 0o644); err != nil {
+				return err
+			}
+			if err := os.WriteFile(filepath.Join(at, "package.json"), b, 0o644); err != nil {
+				return err
+			}
+			deps[name] = spec
+			break
+		}
 		name, commit, err := fakeFetch(spec)
 		if err != nil {
 			return err
 		}
 		deps[name], lock[name] = spec, commit
 	case "update":
+		if os.Getenv("MAGPIE_FAKE_BUN_STUCK") == "1" {
+			return nil // as bun whose cache's clone of the repository is stale: the lock's commit stays (#2954)
+		}
 		for _, n := range args[2:] {
 			if deps[n] == "" {
 				return fmt.Errorf("no dependency %s", n)
@@ -118,6 +178,9 @@ func fakeBun(args []string) error {
 			lock[name] = commit
 		}
 	case "remove":
+		if os.Getenv("MAGPIE_FAKE_BUN_NOREMOVE") == "1" {
+			return errors.New("error: lockfile had changes, but lockfile is frozen")
+		}
 		for _, n := range args[2:] {
 			delete(deps, n)
 			delete(lock, n)
@@ -132,20 +195,152 @@ func fakeBun(args []string) error {
 		return err
 	}
 	b, _ = json.Marshal(lock)
-	return os.WriteFile("fake.lock", b, 0o644)
+	if err := os.WriteFile("fake.lock", b, 0o644); err != nil {
+		return err
+	}
+	if failSays != "" {
+		fmt.Print(failSays)
+		return errors.New("exit 1")
+	}
+	// as bun does on Windows with a file of a package's copy held open:
+	// package.json written, then every command fails over that package
+	// while it is a dependency (CHENGJIAHEGOXIS's agency-agents)
+	// ($MAGPIE_FAKE_BUN_BUSY_SAYS: Bun's whole output instead)
+	if n := os.Getenv("MAGPIE_FAKE_BUN_BUSY"); n != "" && deps[n] != "" {
+		if says := os.Getenv("MAGPIE_FAKE_BUN_BUSY_SAYS"); says != "" {
+			fmt.Print(says)
+			return errors.New("exit 1")
+		}
+		fmt.Println("bun add v1.4.2 (fake)")
+		fmt.Println("EBUSY: failed copying files from cache to destination for package " + n)
+		return errors.New("exit 1")
+	}
+	return nil
+}
+
+// fakeDistAdd puts the package in the tarball at path into node_modules
+// as Bun 1.4.4 does: extracted into the install cache's entry for the
+// tarball (@T@sha512-<32 hex>@@@1) when there is none, and copied from
+// that entry, whatever it holds. A copy over a folder holding .held (a
+// file of the old copy held open, as on Windows) isn't made, and held
+// says so; $MAGPIE_FAKE_BUN_HELD=1 is a copy it can never make (the
+// reporter's, v0.1.4241), and $MAGPIE_FAKE_BUN_LOSE a file that never
+// reaches the copy. A copy whose .bun-tag is the tarball's integrity is
+// taken as installed and never copied over.
+func fakeDistAdd(path string) (name string, held bool, err error) {
+	tgz, err := os.ReadFile(path)
+	if err != nil {
+		return "", false, err
+	}
+	name, _, err = fakeTarball(path)
+	if err != nil {
+		return "", false, err
+	}
+	if os.Getenv("BUN_INSTALL_CACHE_DIR") == "" {
+		return "", false, errors.New("no BUN_INSTALL_CACHE_DIR")
+	}
+	sum := sha512.Sum512(tgz)
+	entry := filepath.Join(os.Getenv("BUN_INSTALL_CACHE_DIR"), "@T@sha512-"+hex.EncodeToString(sum[:])[:32]+"@@@1")
+	if _, err := os.Stat(entry); err != nil {
+		gz, err := gzip.NewReader(bytes.NewReader(tgz))
+		if err != nil {
+			return "", false, err
+		}
+		tr := tar.NewReader(gz)
+		for {
+			h, err := tr.Next()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				return "", false, err
+			}
+			_, rel, _ := strings.Cut(h.Name, "/")
+			to := filepath.Join(entry, filepath.FromSlash(rel))
+			if err := os.MkdirAll(filepath.Dir(to), 0o755); err != nil {
+				return "", false, err
+			}
+			b, _ := io.ReadAll(tr)
+			if err := os.WriteFile(to, b, 0o644); err != nil {
+				return "", false, err
+			}
+		}
+		link := filepath.Join(os.Getenv("BUN_INSTALL_CACHE_DIR"), filepath.FromSlash(name))
+		os.MkdirAll(link, 0o755)
+		os.Symlink(entry, filepath.Join(link, filepath.Base(entry)))
+	}
+	at := filepath.Join("node_modules", filepath.FromSlash(name))
+	// a copy whose .bun-tag is the tarball's integrity is installed, as
+	// Bun 1.4.4 checks a tarball's copy, and left as it is
+	if tag, err := os.ReadFile(filepath.Join(at, ".bun-tag")); err == nil && string(tag) == "sha512-"+base64.StdEncoding.EncodeToString(sum[:]) {
+		return name, false, nil
+	}
+	if _, err := os.Stat(filepath.Join(at, ".held")); err == nil || os.Getenv("MAGPIE_FAKE_BUN_HELD") == "1" {
+		return name, true, nil
+	}
+	err = filepath.WalkDir(entry, func(p string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		rel, _ := filepath.Rel(entry, p)
+		if rel == os.Getenv("MAGPIE_FAKE_BUN_LOSE") {
+			return nil // a file taken out of every copy as it is made
+		}
+		b, err := os.ReadFile(p)
+		if err != nil {
+			return err
+		}
+		if err := os.MkdirAll(filepath.Dir(filepath.Join(at, rel)), 0o755); err != nil {
+			return err
+		}
+		return os.WriteFile(filepath.Join(at, rel), b, 0o644)
+	})
+	if err != nil {
+		return "", false, err
+	}
+	return name, false, nil
+}
+
+// fakeTarball is the name and version of the package in the tarball at
+// path.
+func fakeTarball(path string) (name, version string, err error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", "", err
+	}
+	defer f.Close()
+	gz, err := gzip.NewReader(f)
+	if err != nil {
+		return "", "", err
+	}
+	tr := tar.NewReader(gz)
+	for {
+		h, err := tr.Next()
+		if err != nil {
+			return "", "", fmt.Errorf("%s has no package/package.json: %v", path, err)
+		}
+		if h.Name != "package/package.json" {
+			continue
+		}
+		var p struct{ Name, Version string }
+		if err := json.NewDecoder(tr).Decode(&p); err != nil {
+			return "", "", err
+		}
+		return p.Name, p.Version, nil
+	}
 }
 
 // fakeFetch clones spec's repository and puts the package in it at
 // node_modules/<its name>.
 func fakeFetch(spec string) (name, commit string, err error) {
 	s, ref, _ := strings.Cut(spec, "#")
-	var url string
+	var url, ghRepo string
 	switch {
 	case strings.HasPrefix(s, "git+file://"):
 		url = strings.TrimPrefix(s, "git+")
 	case strings.HasPrefix(s, "github:"), strings.HasPrefix(s, "https://github.com/"), IsGit(s) && !strings.Contains(s, ":"):
-		repo := strings.TrimSuffix(strings.TrimPrefix(strings.TrimPrefix(s, "github:"), "https://github.com/"), ".git")
-		url = filepath.Join(os.Getenv("MAGPIE_FAKE_GITHUB"), filepath.FromSlash(repo)+".git")
+		ghRepo = strings.TrimSuffix(strings.TrimPrefix(strings.TrimPrefix(s, "github:"), "https://github.com/"), ".git")
+		url = filepath.Join(os.Getenv("MAGPIE_FAKE_GITHUB"), filepath.FromSlash(ghRepo)+".git")
 	default:
 		return "", "", fmt.Errorf("fetches only git, not %s", spec)
 	}
@@ -192,7 +387,17 @@ func fakeFetch(spec string) (name, commit string, err error) {
 		}
 		return os.WriteFile(filepath.Join(dest, rel), b, 0o644)
 	})
-	return p.Name, strings.TrimSpace(string(out)), err
+	commit = strings.TrimSpace(string(out))
+	// as bun tags what it installed: owner-repo-<7 digits> for GitHub's
+	// tarball, the whole commit for a clone
+	tag := commit
+	if ghRepo != "" {
+		tag = strings.ReplaceAll(ghRepo, "/", "-") + "-" + commit[:7]
+	}
+	if err == nil {
+		err = os.WriteFile(filepath.Join(dest, ".bun-tag"), []byte(tag), 0o644)
+	}
+	return p.Name, commit, err
 }
 
 // gitRepo is a plugin's repository: a checkout to commit to and the bare
@@ -251,34 +456,8 @@ func newGitRepo(t *testing.T, bare string) gitRepo {
 // and on, updates (fetching the repository again), shows its README and
 // is removed like any other; npm is never asked about it.
 func TestGitPlugin(t *testing.T) {
-	if _, err := exec.LookPath("git"); err != nil {
-		t.Skip("no git on PATH")
-	}
-	dir := t.TempDir()
-	t.Setenv("HOME", dir)
-	t.Setenv("USERPROFILE", dir)
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(dir, "config"))
-	t.Setenv("XDG_CACHE_HOME", filepath.Join(dir, "cache"))
+	github, log := gitSandbox(t)
 	realBun, _ := exec.LookPath("bun")
-	self, err := os.Executable()
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("MAGPIE_BUN", self) // never downloaded
-	github := filepath.Join(dir, "github")
-	log := filepath.Join(dir, "bun.log")
-	orig := bunCommand
-	bunCommand = func(ctx context.Context, bun, dir string, args ...string) *exec.Cmd {
-		if len(args) > 0 && args[0] == "run" && realBun != "" {
-			return orig(ctx, realBun, dir, args...)
-		}
-		cmd := exec.CommandContext(ctx, self, args...)
-		cmd.Dir = dir
-		cmd.Env = append(os.Environ(), "MAGPIE_FAKE_BUN=1", "MAGPIE_FAKE_GITHUB="+github, "MAGPIE_FAKE_BUN_LOG="+log)
-		return cmd
-	}
-	t.Cleanup(func() { bunCommand = orig })
-	t.Cleanup(Settle)
 	asked := false
 	origLatest := latestOf
 	latestOf = func(ctx context.Context, names []string) map[string]string {
@@ -295,6 +474,77 @@ func TestGitPlugin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	gitPluginRest(t, ctx, repo, spec, e, realBun, log, &asked)
+}
+
+// gitSandbox is a HOME of the test's own where bun is the fake above,
+// fetching GitHub's repositories from the folder it returns, and GitHub's
+// API (asked for a repository's newest commit) answers from the same; and
+// the fake bun's log.
+func gitSandbox(t *testing.T) (github, log string) {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("no git on PATH")
+	}
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+	t.Setenv("USERPROFILE", dir)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(dir, "config"))
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(dir, "cache"))
+	realBun, _ := exec.LookPath("bun")
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("MAGPIE_BUN", self) // never downloaded
+	github = filepath.Join(dir, "github")
+	log = filepath.Join(dir, "bun.log")
+	orig := bunCommand
+	bunCommand = func(ctx context.Context, bun, dir string, args ...string) *exec.Cmd {
+		if len(args) > 0 && args[0] == "run" && realBun != "" {
+			return orig(ctx, realBun, dir, args...)
+		}
+		cmd := exec.CommandContext(ctx, self, args...)
+		cmd.Dir = dir
+		cmd.Env = append(os.Environ(), "MAGPIE_FAKE_BUN=1", "MAGPIE_FAKE_GITHUB="+github, "MAGPIE_FAKE_BUN_LOG="+log, "BUN_INSTALL_CACHE_DIR="+installCacheDir())
+		return cmd
+	}
+	t.Cleanup(func() { bunCommand = orig })
+	t.Cleanup(Settle)
+	// GitHub's API: GET /repos/{owner}/{repo}/commits?per_page=1[&sha=ref]
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+		if len(p) != 4 || p[0] != "repos" || p[3] != "commits" || r.URL.Query().Get("per_page") != "1" {
+			http.NotFound(w, r)
+			return
+		}
+		ref := r.URL.Query().Get("sha")
+		if ref == "" {
+			ref = "HEAD"
+		}
+		out, err := exec.Command("git", "-C", filepath.Join(github, p[1], p[2]+".git"), "rev-parse", ref+"^{commit}").Output()
+		if err != nil {
+			http.Error(w, `{"message":"No commit found for SHA: `+ref+`"}`, http.StatusUnprocessableEntity)
+			return
+		}
+		fmt.Fprintf(w, `[{"sha": %q, "commit": {"message": "x"}}]`, strings.TrimSpace(string(out)))
+	}))
+	t.Cleanup(srv.Close)
+	api := githubAPI
+	githubAPI = srv.URL
+	t.Cleanup(func() { githubAPI = api; forgetHeads() })
+	forgetHeads()
+	return github, log
+}
+
+func forgetHeads() {
+	headsMu.Lock()
+	heads = map[string]headAnswer{}
+	headsMu.Unlock()
+}
+
+func gitPluginRest(t *testing.T, ctx context.Context, repo gitRepo, spec string, e Entry, realBun, log string, asked *bool) {
+	t.Helper()
 	if e.Spec != spec {
 		t.Fatalf("added as %q, want the spec as given", e.Spec)
 	}
@@ -340,8 +590,8 @@ func TestGitPlugin(t *testing.T) {
 		t.Fatalf("after upgrade: %s %+v", v, Load().Plugins)
 	}
 	// npm's my-oc-plugin, whatever it is, is never offered over it
-	if u, err := CheckUpdates(ctx); err != nil || asked || len(u.Waiting) != 0 || Installed(spec) != "3.0.0" {
-		t.Fatalf("CheckUpdates = %+v, %v; npm asked: %v", u, err, asked)
+	if u, err := CheckUpdates(ctx); err != nil || *asked || len(u.Waiting) != 0 || Installed(spec) != "3.0.0" {
+		t.Fatalf("CheckUpdates = %+v, %v; npm asked: %v", u, err, *asked)
 	}
 
 	// off and on, by its package or by the spec
@@ -353,10 +603,7 @@ func TestGitPlugin(t *testing.T) {
 	}
 
 	// the same package from another URL takes the entry's place
-	file := "git+file://" + filepath.ToSlash(repo.bare)
-	if !strings.HasPrefix(file, "git+file:///") {
-		file = "git+file:///" + strings.TrimPrefix(file, "git+file://")
-	}
+	file := gitFileURL(repo.bare)
 	if _, err := Add(ctx, file); err != nil {
 		t.Fatal(err)
 	}

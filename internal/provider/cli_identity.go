@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/yetone/magpie/internal/settings"
 )
 
 // cliIdentity is who an agent's CLI says is signed in (`cursor-agent about`,
@@ -17,17 +19,28 @@ import (
 // the CLIs (#123), and asks them again behind it. An ask that couldn't tell
 // (the CLI failed, ran out of time or printed something else) leaves what
 // was served as it was: taken for nobody signed in, it dropped the account
-// from the Providers page and from routing until the next ask (#154).
+// from the Providers page and from routing until the next ask (#154). One
+// that keeps failing, or taking slowAsk or longer, is asked less often, the
+// wait doubling up to slowestAsk: a cursor-agent that calls itself ran out
+// of time every minute, after hundreds of processes, and answered nobody
+// signed in all the same, as no token is kept (#1278).
 type cliIdentity struct {
 	sync.Mutex
-	name       string
-	exe        func() string
-	ask        func() (user, plan string, ok bool, err error) // err: couldn't tell
+	name string
+	exe  func() string
+	ask  func() (user, plan string, ok bool, err error) // err: couldn't tell
+	// mark, when set, is a cheap fingerprint of where the CLI keeps its
+	// sign-in (a token, a file's size and time): while it reads as it did
+	// at the last answer, nobody can have signed in or out, and the CLI is
+	// asked again only after unchangedAsk
+	mark       func() string
+	markAt     string // mark when the answer served was asked; "" unknown
 	at         time.Time
 	refreshing bool
 	done       chan struct{} // closed when the ask under way has answered
 	gen        int           // bumped by forget: an ask from before is dropped
 	waited     bool          // a look waited for the first answer already
+	retry      time.Duration // after asks that failed or were slow, the wait before the next
 	read       bool          // the one kept on disk was looked for
 	user, plan string
 	ok         bool
@@ -41,6 +54,23 @@ type keptIdentity struct {
 
 var identityFile sync.Mutex
 
+// testSandbox is testenv.Marker, which provider can't import: set in a test
+// binary testenv isolated.
+const testSandbox = "MAGPIE_TEST_SANDBOX"
+
+// keepInSandbox has the answers kept on disk in a test binary too, for the
+// tests of that file itself.
+var keepInSandbox = false
+
+// keepsIdentities says whether the answers are kept on disk: always, except
+// in a test binary testenv isolated. There an ask runs behind the look that
+// started it, and one still going when its test ended (a stand-in CLI slow
+// under load) wrote cli-identity.json into the config folder of whichever
+// test was running then, as that was being removed, failing its TempDir
+// cleanup: internal/gateway's (#1524), then internal/agent's (#1538), and
+// any package whose tests read the accounts could.
+func keepsIdentities() bool { return keepInSandbox || os.Getenv(testSandbox) == "" }
+
 func identityPath() string { return filepath.Join(filepath.Dir(Path()), "cli-identity.json") }
 
 func readIdentities() map[string]keptIdentity {
@@ -52,6 +82,9 @@ func readIdentities() map[string]keptIdentity {
 }
 
 func (c *cliIdentity) keep() {
+	if !keepsIdentities() {
+		return
+	}
 	identityFile.Lock()
 	defer identityFile.Unlock()
 	m := readIdentities()
@@ -68,6 +101,9 @@ func (c *cliIdentity) keep() {
 }
 
 func (c *cliIdentity) get() (user, plan string, ok bool) {
+	if settings.AccountDiscoveryOff() {
+		return "", "", false
+	}
 	c.Lock()
 	defer c.Unlock()
 	if c.at.IsZero() && !c.read {
@@ -80,6 +116,11 @@ func (c *cliIdentity) get() (user, plan string, ok bool) {
 			c.user, c.plan, c.ok = k.User, k.Plan, k.OK
 			c.at = time.Unix(1, 0)
 		}
+	}
+	if leftAlone(c.name) {
+		// switched off or removed: the CLI isn't asked, what it said last
+		// is served
+		return c.user, c.plan, c.ok
 	}
 	if c.at.IsZero() {
 		// never answered: waited for, but only so long and only once — a
@@ -95,14 +136,33 @@ func (c *cliIdentity) get() (user, plan string, ok bool) {
 			}
 			c.Lock()
 		}
-	} else if time.Since(c.at) > time.Minute {
+	} else if since := time.Since(c.at); since > max(time.Minute, c.retry) && !c.unchanged(since) {
 		c.refresh()
 	}
 	return c.user, c.plan, c.ok
 }
 
+// unchanged says the CLI's sign-in reads as it did when the answer served
+// was asked, and that was less than unchangedAsk ago. Called with c locked.
+func (c *cliIdentity) unchanged(since time.Duration) bool {
+	return c.mark != nil && c.markAt != "" && since < unchangedAsk && c.mark() == c.markAt
+}
+
+// unchangedAsk is how often a CLI whose sign-in reads the same is asked
+// anyway, for a plan changed on the vendor's side. Asked every minute,
+// cursor-agent alone, a Node program asking Cursor's servers, took ~0.5s of
+// CPU and 200 MB each time, for as long as magpie ran (#3185).
+const unchangedAsk = 30 * time.Minute
+
 // firstAsk is how long a look waits for a CLI never answered before.
 var firstAsk = 3 * time.Second
+
+// slowAsk is how long an ask takes for the CLI to be asked less often.
+var slowAsk = 5 * time.Second
+
+// slowestAsk is the longest wait before asking again a CLI that keeps
+// failing or taking long to answer.
+const slowestAsk = 30 * time.Minute
 
 // refresh asks the CLI behind what is served, once at a time; the channel is
 // closed when it has answered. Called with c locked.
@@ -112,8 +172,16 @@ func (c *cliIdentity) refresh() chan struct{} {
 	}
 	c.refreshing, c.done = true, make(chan struct{})
 	gen, done := c.gen, c.done
+	mark := c.mark
 	go func() {
+		// read before the ask, so a sign-in during it is asked again
+		var m string
+		if mark != nil {
+			m = mark()
+		}
+		start := time.Now()
 		u, p, ok, err := c.ask()
+		slow := time.Since(start) >= slowAsk
 		c.Lock()
 		defer c.Unlock()
 		defer close(done)
@@ -121,9 +189,18 @@ func (c *cliIdentity) refresh() chan struct{} {
 			return
 		}
 		c.at, c.refreshing = time.Now(), false
-		if err != nil {
-			return // asked again in a minute; what was served stays
+		// asked again in a minute, then two, four… up to slowestAsk while
+		// it fails or is slow
+		if err != nil || slow {
+			c.retry = min(max(2*c.retry, time.Minute), slowestAsk)
+		} else {
+			c.retry = 0
 		}
+		if err != nil {
+			c.markAt = "" // couldn't tell: asked on the next minute's look
+			return        // what was served stays
+		}
+		c.markAt = m
 		c.user, c.plan, c.ok = u, p, ok
 		c.keep()
 	}()
@@ -137,5 +214,7 @@ func (c *cliIdentity) forget() {
 	c.at, c.read = time.Time{}, true
 	c.gen++
 	c.refreshing, c.waited = false, false
+	c.retry = 0
+	c.markAt = ""
 	c.Unlock()
 }

@@ -61,8 +61,8 @@ function server(lang) {
 }
 
 const L = {
-  en: { speed: "Speed", kpi: "Output speed", first: "first token in 782 ms on average", fast: "TTFT 762 ms", slow: "TTFT 1.2 s" },
-  zh: { speed: "速度", kpi: "输出速度", first: "首字平均 782 毫秒", fast: "首字 762 毫秒", slow: "首字 1.2 秒" },
+  en: { speed: "Speed", kpi: "Output speed", first: "first token in 782 ms on average · 62 timed replies", fast: "TTFT 762 ms", slow: "TTFT 1.2 s" },
+  zh: { speed: "速度", kpi: "输出速度", first: "首字平均 782 毫秒 · 62 次计时", fast: "首字 762 毫秒", slow: "首字 1.2 秒" },
 };
 // a long fraction anywhere: 761.949…, 1166.66…
 const ragged = /\d[.,]\d{2,} ?(ms|s|毫秒|秒)/;
@@ -78,11 +78,12 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         const ctx = await browser.newContext({ viewport: { width: 1100, height: 800 }, reducedMotion: "reduce" });
         const p = await ctx.newPage();
         p.setDefaultTimeout(5000);
+        p.setDefaultNavigationTimeout(60000);
         p.on("pageerror", (e) => errors.push(e.message));
         await p.route("**/*", server(lang));
         await p.goto("http://magpie.test/");
         await p.locator('[data-view="usage"]').first().click();
-        await p.locator("#usageTab .opt").nth(1).click();
+        await p.locator(":is(#usageTab .opt, .nav-s):visible").nth(1).click();
         await p.locator("#ledWrap .led tbody tr").first().waitFor();
         await p.waitForTimeout(300);
 

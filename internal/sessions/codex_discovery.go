@@ -2,13 +2,14 @@ package sessions
 
 import (
 	"bytes"
-	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
+	"time"
 )
 
 const (
@@ -33,13 +34,24 @@ var codexCopyCache = struct {
 // Windows replaces this with a same-handle stat carrying ChangeTime.
 var codexDiscoveryStat = os.Stat
 var compareCodexCopies = readCodexCopies
+var codexDiscoveryNow = time.Now
+
+// A file system stamps change times from the clock tick, not the precise
+// clock: NTFS from Windows' system time (0.5 ms to 15.6 ms), Linux from the
+// coarse kernel clock. Two writes within one tick get the same change time,
+// so a comparison is cached only for files whose change time is older than
+// this when it starts. A later rewrite is then in a later tick and changes
+// the stamp; a file changed more recently is compared again.
+const codexStampSettle = time.Second
 
 type codexDiscoveryInfo struct {
 	os.FileInfo
-	ChangeTime string
+	ChangeTime time.Time
 }
 
-func codexChangeStamp(info os.FileInfo) string {
+// codexChangeTime is the file's change time, zero when the file system
+// doesn't expose one.
+func codexChangeTime(info os.FileInfo) time.Time {
 	if wrapped, ok := info.(codexDiscoveryInfo); ok {
 		return wrapped.ChangeTime
 	}
@@ -51,22 +63,29 @@ func codexChangeStamp(info os.FileInfo) string {
 		v = v.Elem()
 	}
 	if v.Kind() != reflect.Struct {
-		return ""
+		return time.Time{}
 	}
 	for _, name := range []string{"Ctimespec", "Ctim"} {
 		c := v.FieldByName(name)
 		if c.IsValid() && c.Kind() == reflect.Struct {
 			sec, nsec := c.FieldByName("Sec"), c.FieldByName("Nsec")
 			if sec.IsValid() && nsec.IsValid() && sec.CanInt() && nsec.CanInt() {
-				return fmt.Sprintf("%d:%d", sec.Int(), nsec.Int())
+				return time.Unix(sec.Int(), nsec.Int())
 			}
 		}
 	}
-	return ""
+	return time.Time{}
+}
+
+// settledCodexStamp reports whether a comparison of this file, started at
+// start, can be cached: it has a change time from before the current tick.
+func settledCodexStamp(info os.FileInfo, start time.Time) bool {
+	c := codexChangeTime(info)
+	return !c.IsZero() && c.Before(start.Add(-codexStampSettle))
 }
 
 func sameCodexSnapshot(a, b os.FileInfo) bool {
-	if a == nil || b == nil || a.Size() != b.Size() || !a.ModTime().Equal(b.ModTime()) || codexChangeStamp(a) != codexChangeStamp(b) {
+	if a == nil || b == nil || a.Size() != b.Size() || !a.ModTime().Equal(b.ModTime()) || !codexChangeTime(a).Equal(codexChangeTime(b)) {
 		return false
 	}
 	if wrapped, ok := a.(codexDiscoveryInfo); ok {
@@ -81,12 +100,22 @@ func sameCodexSnapshot(a, b os.FileInfo) bool {
 // Only a proven decoded prefix is a redundant copy. A shared thread/name
 // alone cannot establish ownership of divergent logs or distinct segments.
 func distinctCodexFiles(files []file) []file {
-	groups := map[string][]int{}
+	// a name's first file, and the rest of its files, which few names
+	// have: a slice made for every name was ~45 MB of a minute of the
+	// page's polls (#2278)
+	first := nameFirsts()
+	defer putNameFirsts(first)
+	var more map[string][]int
 	keep := make([]bool, len(files))
 	for i, f := range files {
 		keep[i] = true
 		name := strings.TrimSuffix(filepath.Base(f.path), zstSuffix)
-		for _, j := range groups[name] {
+		j0, seen := first[name]
+		if !seen {
+			first[name] = i
+			continue
+		}
+		for _, j := range slices.Concat([]int{j0}, more[name]) {
 			if !keep[j] {
 				continue
 			}
@@ -100,9 +129,17 @@ func distinctCodexFiles(files []file) []file {
 				break
 			}
 		}
-		groups[name] = append(groups[name], i)
+		if more == nil {
+			more = map[string][]int{}
+		}
+		more[name] = append(more[name], i)
 	}
-	out := files[:0]
+	// files may be a list kept and read elsewhere: one left out is left
+	// out of a copy, and files is given back when none is
+	if !slices.Contains(keep, false) {
+		return files
+	}
+	out := make([]file, 0, len(files)-1)
 	for i, f := range files {
 		if keep[i] {
 			out = append(out, f)
@@ -111,14 +148,32 @@ func distinctCodexFiles(files []file) []file {
 	return out
 }
 
+// nameFirstSets are distinctCodexFiles' sets of names, kept on a shelf from
+// poll to poll as pathSets are: made new for ~13k rollouts, each was ~0.4
+// MB of every Sessions poll (#2278).
+var nameFirstSets shelf[map[string]int]
+
+func nameFirsts() map[string]int {
+	if m, ok := nameFirstSets.take(nil); ok {
+		return m
+	}
+	return map[string]int{}
+}
+
+func putNameFirsts(m map[string]int) {
+	clear(m)
+	nameFirstSets.give(m, nil)
+}
+
 func codexCopyRelation(first, second string) int {
+	start := codexDiscoveryNow()
 	a, errA := codexDiscoveryStat(first)
 	b, errB := codexDiscoveryStat(second)
 	if errA != nil || errB != nil {
 		return codexCopiesDiffer
 	}
 	key := codexCopyPair{first, second}
-	cacheable := codexChangeStamp(a) != "" && codexChangeStamp(b) != ""
+	cacheable := settledCodexStamp(a, start) && settledCodexStamp(b, start)
 	codexCopyCache.Lock()
 	saved, found := codexCopyCache.Pairs[key]
 	codexCopyCache.Unlock()

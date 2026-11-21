@@ -4,6 +4,7 @@ import (
 	"errors"
 	"slices"
 	"strings"
+	"sync/atomic"
 
 	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/settings"
@@ -17,14 +18,19 @@ import (
 // the two never differ.
 
 // Names are what an entry answers to in a visibility: its family, and its
-// provider's id or its group's id (as group/<id> too).
+// provider's id or its group's id (as group/<id> too, and a found group's
+// auto/<model>).
 func (e Entry) Names() []string {
 	var out []string
 	if e.Family != "" {
 		out = append(out, e.Family)
 	}
 	if e.Group != "" {
-		return append(out, e.Group, GroupPrefix+e.Group)
+		out = append(out, e.Group, GroupPrefix+e.Group)
+		if e.ID != GroupPrefix+e.Group { // a found group's auto/<model>
+			out = append(out, e.ID)
+		}
+		return out
 	}
 	return append(out, e.Provider.ID)
 }
@@ -57,24 +63,51 @@ func described() bool { return Described != nil && Described() }
 
 // CatalogFor is the catalog as agent is shown it, and what is kept from it
 // (none when its lists aren't narrowed): its visibility's, less the models
-// taken out of its lists one by one (HiddenModels).
+// taken out of its lists one by one (HiddenModels), or, when it is shown
+// only the models picked for it, those alone (PickedModels).
+//
+// It is kept across requests with the catalog (keptOf): a window poll
+// asks it for every agent, and building each again from the whole
+// catalog was ~140 MB of what twenty polls allocated. Each caller gets
+// its own copy of the lists.
 func CatalogFor(agent string) (shown, hidden []Entry) {
+	c := catalogKept(agent)
+	return slices.Clone(c.shown), slices.Clone(c.hidden)
+}
+
+// catalogKept is CatalogFor's lists as kept, only for reading.
+func catalogKept(agent string) catalogLists {
+	return keptOf("catalog-for\x00"+agent, func() catalogLists {
+		catalogsBuilt.Add(1)
+		s, h := catalogFor(agent)
+		return catalogLists{slices.Clip(s), slices.Clip(h)}
+	})
+}
+
+type catalogLists struct{ shown, hidden []Entry }
+
+// catalogsBuilt counts the lists CatalogFor built, for a test.
+var catalogsBuilt atomic.Int64
+
+func catalogFor(agent string) (shown, hidden []Entry) {
 	listed, hidden := ListedFor(agent)
-	off := HiddenModels(agent)
+	off := ModelOff(agent)
 	for _, e := range listed {
-		if off[e.ID] {
+		if off(e.ID) {
 			hidden = append(hidden, e)
 		} else {
 			shown = append(shown, e)
 		}
 	}
+	// the windows the user set for this agent alone (settings.AgentContexts)
+	shown = withAgentWindows(heldSettings(), agent, shown)
 	return shown, hidden
 }
 
 // ListedFor is the catalog agent's visibility gives it, the models it may
 // pick to show or not among, and what the visibility keeps from it.
 func ListedFor(agent string) (listed, kept []Entry) {
-	all := Catalog()
+	all := catalogOf(agent)
 	names, ok := VisibleTo(agent)
 	if !ok {
 		return InOrder(agent, all), nil
@@ -89,14 +122,195 @@ func ListedFor(agent string) (listed, kept []Entry) {
 	return InOrder(agent, listed), kept
 }
 
-// HiddenModels are the ids of the entries taken out of agent's lists.
+// HiddenModels are the ids of the entries taken out of agent's lists, a
+// found group saved by its old id, group/auto-<slug>, by the one it is
+// listed by now (PublicRef).
 func HiddenModels(agent string) map[string]bool {
 	ids := heldSettings().HiddenModels[strings.ToLower(agent)]
 	out := make(map[string]bool, len(ids))
 	for _, id := range ids {
-		out[id] = true
+		out[PublicRef(id)] = true
 	}
 	return out
+}
+
+// PickedModels are the only entries agent's lists show, by id (a found
+// group by the id it is listed by now, PublicRef), and whether
+// it is shown only those (#1337): a model not among them, one that came
+// after the user switched to it among them, is not shown.
+func PickedModels(agent string) (map[string]bool, bool) {
+	ids, only := heldSettings().PickedModels[strings.ToLower(agent)]
+	if !only {
+		return nil, false
+	}
+	out := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		out[PublicRef(id)] = true
+	}
+	return out, true
+}
+
+// ModelOff reports whether agent's lists leave an entry out by the picks
+// made one model at a time: every one not picked, when it is shown only
+// the models picked for it, else the ones taken out (HiddenModels).
+func ModelOff(agent string) func(id string) bool {
+	if on, only := PickedModels(agent); only {
+		return func(id string) bool { return !on[id] }
+	}
+	off := HiddenModels(agent)
+	return func(id string) bool { return off[id] }
+}
+
+// SetOnlyPicked switches agent between being shown every model not taken
+// out of its lists, a new one among them, and being shown only the ones
+// picked for it (#1337). Either way the models it is shown now stay as
+// they are: switched on, they are its picks; switched off, the ones listed
+// for it and not picked are taken out, and a model that comes later is
+// shown again.
+func SetOnlyPicked(agent string, on bool) error {
+	agent = strings.ToLower(strings.TrimSpace(agent))
+	if agent == "" {
+		return errors.New("no agent")
+	}
+	if _, only := PickedModels(agent); only == on {
+		return nil
+	}
+	listed, _ := ListedFor(agent)
+	off := ModelOff(agent)
+	var shown, hidden []string
+	for _, e := range listed {
+		if off(e.ID) {
+			hidden = append(hidden, e.ID)
+		} else {
+			shown = append(shown, e.ID)
+		}
+	}
+	s := settings.Load()
+	if on {
+		if s.PickedModels == nil {
+			s.PickedModels = map[string][]string{}
+		}
+		s.PickedModels[agent] = sortedIDs(shown)
+		delete(s.HiddenModels, agent)
+	} else {
+		delete(s.PickedModels, agent)
+		if hidden = sortedIDs(hidden); len(hidden) > 0 {
+			if s.HiddenModels == nil {
+				s.HiddenModels = map[string][]string{}
+			}
+			s.HiddenModels[agent] = hidden
+		} else {
+			delete(s.HiddenModels, agent)
+		}
+	}
+	if err := settings.Save(s); err != nil {
+		return err
+	}
+	catalog.Touched()
+	return nil
+}
+
+// SetPickedModels makes these entries the only ones agent's lists show, for
+// an agent shown only the models picked for it. A pick of an entry not
+// listed for it now (its provider switched off for a while, a model its
+// vendor dropped from the list) is kept, so it is shown again when it is
+// back, as it was picked.
+func SetPickedModels(agent string, ids []string) error {
+	agent = strings.ToLower(strings.TrimSpace(agent))
+	if agent == "" {
+		return errors.New("no agent")
+	}
+	was, only := PickedModels(agent)
+	if !only {
+		return errors.New(agent + " is shown every model not taken out of its lists, not only the ones picked")
+	}
+	listed, _ := ListedFor(agent)
+	now := map[string]bool{}
+	for _, e := range listed {
+		now[e.ID] = true
+	}
+	keep := slices.Clone(ids)
+	for id := range was {
+		if !now[id] {
+			keep = append(keep, id)
+		}
+	}
+	keep = sortedIDs(keep)
+	s := settings.Load()
+	if slices.Equal(s.PickedModels[agent], keep) {
+		return nil
+	}
+	if s.PickedModels == nil {
+		s.PickedModels = map[string][]string{}
+	}
+	s.PickedModels[agent] = keep
+	if err := settings.Save(s); err != nil {
+		return err
+	}
+	catalog.Touched()
+	return nil
+}
+
+// sortedIDs is ids trimmed, without blanks or twins, sorted; never nil, so
+// an agent shown only its picks with none picked is still saved as one.
+func sortedIDs(ids []string) []string {
+	keep := []string{}
+	for _, id := range ids {
+		if id = strings.TrimSpace(id); id != "" && !slices.Contains(keep, id) {
+			keep = append(keep, id)
+		}
+	}
+	slices.Sort(keep)
+	return keep
+}
+
+// Widen lets agent's visibility give it these entries, of those it keeps
+// now (whysugarsweet on X: Claude Desktop narrowed to five providers, set
+// from the terminal, never listed OpenCode Go added later, and the Agents
+// page's list had no way to it): each one's provider, or its group, is
+// added to the names the agent is narrowed to, so the provider's other
+// models are listed too, for its list to show or not. When nothing is
+// kept after, the agent is narrowed no more. An id not kept is passed by.
+func Widen(agent string, ids []string) error {
+	agent = strings.ToLower(strings.TrimSpace(agent))
+	if agent == "" {
+		return errors.New("no agent")
+	}
+	names, narrowed := VisibleTo(agent)
+	if !narrowed || len(ids) == 0 {
+		return nil
+	}
+	_, kept := ListedFor(agent)
+	added := false
+	for _, e := range kept {
+		if !slices.Contains(ids, e.ID) {
+			continue
+		}
+		n := e.Provider.ID
+		if e.Group != "" {
+			n = e.Group
+		}
+		if !slices.ContainsFunc(names, func(v string) bool { return strings.EqualFold(v, n) }) {
+			names, added = append(names, n), true
+		}
+	}
+	if !added {
+		return nil
+	}
+	s := settings.Load()
+	if slices.ContainsFunc(kept, func(e Entry) bool { return !Shows(names, e) }) {
+		if s.Visible == nil {
+			s.Visible = map[string][]string{}
+		}
+		s.Visible[agent] = names
+	} else {
+		delete(s.Visible, agent)
+	}
+	if err := settings.Save(s); err != nil {
+		return err
+	}
+	catalog.Touched()
+	return nil
 }
 
 // SetHiddenModels takes these entries out of agent's lists, and puts back
@@ -111,6 +325,22 @@ func SetHiddenModels(agent string, ids []string) error {
 	for _, id := range ids {
 		if id = strings.TrimSpace(id); id != "" && !slices.Contains(keep, id) {
 			keep = append(keep, id)
+		}
+	}
+	// a model taken out that its provider's list lacks now (ZCode's
+	// -Trial entries are listed from 23:00 only) isn't in the list the
+	// editor sent, so it stays taken out for when it is listed again, as
+	// SetPickedModels keeps a pick of it
+	if was := HiddenModels(agent); len(was) > 0 {
+		listed, _ := ListedFor(agent)
+		now := map[string]bool{}
+		for _, e := range listed {
+			now[e.ID] = true
+		}
+		for id := range was {
+			if !now[id] && !slices.Contains(keep, id) {
+				keep = append(keep, id)
+			}
 		}
 	}
 	slices.Sort(keep)
@@ -133,6 +363,39 @@ func SetHiddenModels(agent string, ids []string) error {
 	return nil
 }
 
+// OwnModelsHidden reports whether agent's pickers leave out the models it
+// reaches on its own, offering magpie's alone (#1642).
+func OwnModelsHidden(agent string) bool {
+	return slices.Contains(heldSettings().OwnModelsHidden, strings.ToLower(strings.TrimSpace(agent)))
+}
+
+// SetOwnModelsHidden switches agent's pickers between offering its own
+// models beside magpie's and offering magpie's alone.
+func SetOwnModelsHidden(agent string, on bool) error {
+	agent = strings.ToLower(strings.TrimSpace(agent))
+	if agent == "" {
+		return errors.New("no agent")
+	}
+	s := settings.Load()
+	if slices.Contains(s.OwnModelsHidden, agent) == on {
+		return nil
+	}
+	if on {
+		s.OwnModelsHidden = append(s.OwnModelsHidden, agent)
+		slices.Sort(s.OwnModelsHidden)
+	} else {
+		s.OwnModelsHidden = slices.DeleteFunc(s.OwnModelsHidden, func(a string) bool { return a == agent })
+	}
+	if err := settings.Save(s); err != nil {
+		return err
+	}
+	// an agent's own config says the switch too (Claude Code's modelPicker
+	// replaceBuiltInOptions, #4548), so it is written again now, as a
+	// hidden model's change is
+	catalog.Touched()
+	return nil
+}
+
 // Families are the families providers and groups are tagged with, sorted.
 func Families() []string {
 	var out []string
@@ -144,7 +407,7 @@ func Families() []string {
 	for _, p := range All() {
 		add(p.Family)
 	}
-	for _, g := range Groups() {
+	for _, g := range sharedGroups() {
 		add(g.Family)
 	}
 	slices.Sort(out)
@@ -152,9 +415,14 @@ func Families() []string {
 }
 
 // ModelOrder is the order the user put agent's models in (OrderedModels),
-// by entry id; none when they never did.
+// by entry id, a found group by the id it is listed by now (PublicRef);
+// none when they never did.
 func ModelOrder(agent string) []string {
-	return slices.Clone(heldSettings().OrderedModels[strings.ToLower(agent)])
+	ids := slices.Clone(heldSettings().OrderedModels[strings.ToLower(agent)])
+	for i, id := range ids {
+		ids[i] = PublicRef(id)
+	}
+	return ids
 }
 
 // SetModelOrder lists agent's models in this order, by entry id: the ones
@@ -221,4 +489,43 @@ func InOrder(agent string, es []Entry) []Entry {
 // which the ChatGPT backend lists to Codex by its bare slug (e.Model).
 func CodexOwn(e Entry) bool {
 	return e.Group == "" && e.Provider.Account != nil && e.Provider.Account.Agent == "codex"
+}
+
+// ShowFor puts entry id back in agent's lists, as the user picks it in
+// one of the agent's pickers where its lists leave it out (a routing
+// group made after the agent was narrowed, or shown only its picks): its
+// provider or group is added to the names the agent is narrowed to, and
+// it is picked for an agent shown only its picks, else no longer taken
+// out. Nothing else in the lists changes.
+func ShowFor(agent, id string) error {
+	agent = strings.ToLower(strings.TrimSpace(agent))
+	if id = strings.TrimSpace(id); agent == "" || id == "" {
+		return errors.New("no agent or model")
+	}
+	if err := Widen(agent, []string{id}); err != nil {
+		return err
+	}
+	s := settings.Load()
+	changed := false
+	if picks, only := s.PickedModels[agent]; only {
+		if !slices.ContainsFunc(picks, func(p string) bool { return PublicRef(p) == id }) {
+			s.PickedModels[agent], changed = sortedIDs(append(slices.Clone(picks), id)), true
+		}
+	} else if was := s.HiddenModels[agent]; slices.ContainsFunc(was, func(h string) bool { return PublicRef(h) == id }) {
+		keep := slices.DeleteFunc(slices.Clone(was), func(h string) bool { return PublicRef(h) == id })
+		if len(keep) == 0 {
+			delete(s.HiddenModels, agent)
+		} else {
+			s.HiddenModels[agent] = keep
+		}
+		changed = true
+	}
+	if !changed {
+		return nil
+	}
+	if err := settings.Save(s); err != nil {
+		return err
+	}
+	catalog.Touched()
+	return nil
 }

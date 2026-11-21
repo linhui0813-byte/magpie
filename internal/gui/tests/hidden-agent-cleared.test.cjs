@@ -57,14 +57,15 @@ function server(lang, arranged) {
 }
 
 const words = {
-  en: { hidden: "Hidden", unset: "Not set up", def: "Default", said: "Hanako has nothing set on it now · it is under Not set up, no longer hidden" },
-  zh: { hidden: "已隐藏", unset: "未设置", def: "默认", said: "Hanako 已没有任何设置 · 已取消隐藏，移到「未设置」" },
+  en: { hidden: "Hidden", hidLine: "Hidden (1)", unset: "Not set up", def: "Default", said: "Hanako has nothing set on it now · it is under Not set up, no longer hidden" },
+  zh: { hidden: "已隐藏", hidLine: "已隐藏（1）", unset: "未设置", def: "默认", said: "Hanako 已没有任何设置 · 已取消隐藏，移到「未设置」" },
 };
 
-// the fold's groups: each caption with the agents under it
+// the fold's groups: each caption with the agents under it, the hidden
+// ones' own disclosure (under the others) with the rows it holds
 const groups = (page) => page.evaluate(() => {
   const out = [];
-  for (const n of document.querySelectorAll(".agent-fold-inner > *")) {
+  for (const n of document.querySelectorAll(".agent-fold-inner > *, .agent-hid-inner > *")) {
     if (n.classList.contains("agent-fold-cap")) out.push([n.textContent.trim()]);
     else if (n.dataset.id) out.at(-1).push(n.dataset.id + (n.querySelector(".ag-show") ? "+show" : ""));
   }
@@ -78,6 +79,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       t.after(() => browser.close());
       const page = await (await browser.newContext({ viewport: { width: 1100, height: 700 }, colorScheme: "dark" })).newPage();
       page.setDefaultTimeout(5000);
+      page.setDefaultNavigationTimeout(60000);
       const errors = [], arranged = [], w = words[lang];
       page.on("pageerror", (e) => errors.push(e.message));
       await page.route("**/*", server(lang, arranged));
@@ -94,13 +96,13 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await page.locator("#pop:not([hidden]) #list li").first().waitFor();
       await page.locator("#list li", { hasText: w.def }).first().click();
       await page.waitForFunction((s) => (document.querySelector("#status")?.textContent || "").includes(s), w.said);
-      assert.deepEqual(await groups(page), [[w.hidden, "idle+show"], [w.unset, "hanako"]], "Hanako went under Not set up without its Show");
+      assert.deepEqual(await groups(page), [[w.unset, "hanako"], [w.hidLine, "idle+show"]], "Hanako went under Not set up without its Show");
       assert.deepEqual(arranged.at(-1).hidden, ["idle"], "the hiding dropped is saved");
 
       // the pick's answer, read before that, still names it hidden: it stays put
       await page.waitForResponse((r) => r.url().endsWith("/api/set"));
       await page.waitForTimeout(150);
-      assert.deepEqual(await groups(page), [[w.hidden, "idle+show"], [w.unset, "hanako"]], "the pick's answer didn't hide it again");
+      assert.deepEqual(await groups(page), [[w.unset, "hanako"], [w.hidLine, "idle+show"]], "the pick's answer didn't hide it again");
       assert.equal(arranged.length, 1, "saved once");
       assert.equal(await view.evaluate((v) => v.scrollTop), top, "no click moved the page");
       if (process.env.SHOT) await page.screenshot({ path: `${process.env.SHOT}/${engine}-${lang}.png` });

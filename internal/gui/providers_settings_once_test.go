@@ -6,7 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
-	"time"
 
 	"github.com/yetone/magpie/internal/filememo"
 	"github.com/yetone/magpie/internal/provider"
@@ -19,6 +18,9 @@ import (
 // again each time even while the request held it: with the owner's 23
 // providers that was most of /api/providers (~0.5s on Windows). A
 // provider's list now reads them once, and still says what they hold.
+//
+// The parses are counted, not timed: a 2s bar on the call failed on a
+// loaded machine with the settings read once (#2185).
 func TestProviderListReadsSettingsOnce(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -32,10 +34,10 @@ func TestProviderListReadsSettingsOnce(t *testing.T) {
 	if err := provider.Save(provider.Provider{ID: "relay", Name: "Relay", Key: "k", Chat: "http://127.0.0.1:1/v1", Models: models}); err != nil {
 		t.Fatal(err)
 	}
-	// a big settings file, as a long-used magpie's is, makes each read
-	// show: some 20000 image answers of other providers' models
+	// image answers of other providers' models too, as a long-used
+	// magpie's settings hold
 	images := map[string]bool{"relay/model-7": true}
-	for i := range 20000 {
+	for i := range 200 {
 		images[fmt.Sprintf("other-%d/some-model-%d", i%50, i)] = i%2 == 0
 	}
 	raw, err := json.Marshal(map[string]any{
@@ -57,11 +59,15 @@ func TestProviderListReadsSettingsOnce(t *testing.T) {
 	defer provider.Hold()()
 	defer filememo.Hold()()
 	providerInfo(*p, nil) // the first read of each file
-	start := time.Now()
+	before := settings.Parses()
 	info := providerInfo(*p, nil)
-	took := time.Since(start)
-	if took > 2*time.Second {
-		t.Errorf("one provider's 300 models took %v: the settings were read for each", took)
+	// a few for the list (6 here); read for each model it is once to
+	// three times per model (300 to 900). The bound sits far from both,
+	// leaving room for a read some other look makes meanwhile.
+	n := settings.Parses() - before
+	t.Logf("settings.json parsed %d times", n)
+	if n >= 50 {
+		t.Errorf("one provider's %d models parsed settings.json %d times: the settings were read for each", len(models), n)
 	}
 	byID := map[string]modelJSON{}
 	for _, m := range info.Models {

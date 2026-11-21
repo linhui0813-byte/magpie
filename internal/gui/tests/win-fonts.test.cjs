@@ -10,7 +10,7 @@ const { test } = require("node:test");
 const { chromium, webkit } = require("playwright");
 
 const assets = path.resolve(__dirname, "../assets");
-const sheets = ["app.css", "library.css", "routing.css", "sessions.css", "plugins.css"];
+const sheets = ["app.css", "plugins/library/library.css", "plugins/routing/routing.css", "plugins/sessions/sessions.css", "plugins.css"];
 
 test("no stylesheet names a monospace stack of its own", async () => {
   for (const f of sheets) {

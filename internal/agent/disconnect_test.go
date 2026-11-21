@@ -89,12 +89,22 @@ func TestCodexDisconnect(t *testing.T) {
 // come back, and every env key, tier and capability magpie wrote goes.
 // The tier and subagent models the user set for their relay come back with
 // it (#1050), whether magpie steps out by Disconnect or by Claude Code's
-// own model.
+// own model. So does the main model set for the relay in the env
+// (ANTHROPIC_MODEL), which magpie takes out while wired in, and the auto
+// mode classifier's model (CLAUDE_CODE_AUTO_MODE_MODEL).
 func TestClaudeDisconnect(t *testing.T) {
 	for name, before := range map[string]string{
 		"own relay":   `{"theme":"dark","model":"opus","env":{"ANTHROPIC_BASE_URL":"https://relay.example","ANTHROPIC_AUTH_TOKEN":"sk-relay","DISABLE_TELEMETRY":"1"}}`,
 		"own tiers":   `{"model":"sonnet","env":{"ANTHROPIC_BASE_URL":"https://relay.example","ANTHROPIC_AUTH_TOKEN":"sk-relay","ANTHROPIC_DEFAULT_OPUS_MODEL":"relay-opus","ANTHROPIC_DEFAULT_SONNET_MODEL":"relay-sonnet","ANTHROPIC_DEFAULT_HAIKU_MODEL":"relay-haiku","ANTHROPIC_SMALL_FAST_MODEL":"relay-haiku","CLAUDE_CODE_SUBAGENT_MODEL":"relay-sonnet"}}`,
 		"nothing set": `{"theme":"dark"}`,
+		// the auto mode classifier's model the user set themselves, which
+		// magpie takes out while wired in and puts back
+		"own auto mode": `{"env":{"ANTHROPIC_BASE_URL":"https://relay.example","ANTHROPIC_AUTH_TOKEN":"sk-relay","CLAUDE_CODE_AUTO_MODE_MODEL":"relay-haiku"}}`,
+		// the main model set for the relay in the env (with no settings
+		// model, and beside one), which magpie takes out while wired in:
+		// it outranks a pick in /model
+		"own env model":       `{"env":{"ANTHROPIC_BASE_URL":"https://relay.example","ANTHROPIC_AUTH_TOKEN":"sk-relay","ANTHROPIC_MODEL":"relay-main"}}`,
+		"own env model, both": `{"model":"opus","env":{"ANTHROPIC_BASE_URL":"https://relay.example","ANTHROPIC_AUTH_TOKEN":"sk-relay","ANTHROPIC_MODEL":"relay-main[1m]"}}`,
 	} {
 		for _, out := range []string{"disconnect", "default"} {
 			t.Run(name+", "+out, func(t *testing.T) {
@@ -142,6 +152,9 @@ func TestClaudeDisconnect(t *testing.T) {
 					t.Fatal(err)
 				}
 				if err := a.Apply("subagent", "deepseek/flash"); err != nil {
+					t.Fatal(err)
+				}
+				if err := a.Apply("auto_mode", "deepseek/flash"); err != nil {
 					t.Fatal(err)
 				}
 				if !a.Wired() {
@@ -217,5 +230,36 @@ func TestDisconnectUnwiredLeavesConfig(t *testing.T) {
 	}
 	if got := read(); got != was {
 		t.Fatalf("changed:\n%s\nwant\n%s", got, was)
+	}
+}
+
+// An auth Gemini CLI doesn't know, set on its provider field, is refused
+// before magpie is taken out. `magpie gemini <a model it has no option
+// for>` sets that field (it is the first), and took Gemini CLI off magpie,
+// its sign-in and key put back, before saying the auth was unknown: the
+// sibling of `magpie snow --help` (#1457).
+func TestGeminiUnknownAuthChangesNothing(t *testing.T) {
+	home, _ := codexHome(t, "", "")
+	dir := filepath.Join(home, ".gemini")
+	os.MkdirAll(dir, 0o755)
+	os.WriteFile(filepath.Join(dir, "settings.json"), []byte(`{"security":{"auth":{"selectedType":"gemini-api-key"}},"model":{"name":"gemini-2.5-pro"}}`), 0o644)
+	os.WriteFile(filepath.Join(dir, ".env"), []byte("GEMINI_API_KEY=mine\n"), 0o600)
+	g := gemini(home)
+	if err := g.Apply("model", "fake/m1"); err != nil {
+		t.Fatal(err)
+	}
+	read := func() string {
+		s, _ := os.ReadFile(filepath.Join(dir, "settings.json"))
+		e, _ := os.ReadFile(filepath.Join(dir, ".env"))
+		return string(s) + "\n" + string(e)
+	}
+	was, vals := read(), g.Values()
+	for _, v := range []string{"nonsense-model", "--help"} {
+		if err := g.Field("provider").Set(v); err == nil {
+			t.Errorf("%q taken", v)
+		}
+		if got := read(); got != was || !g.Wired() || !reflect.DeepEqual(g.Values(), vals) {
+			t.Fatalf("%q changed Gemini CLI:\n%s\nwas\n%s", v, got, was)
+		}
 	}
 }

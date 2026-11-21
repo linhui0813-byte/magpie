@@ -1,7 +1,7 @@
 // Run with Node's test runner and Playwright on the module path; see README.md.
 // xiao_wang24004 on X: 能不能在里面加一个保持电脑任务常亮的选项呢？电脑在做任务
-// 的过程中经常自动关闭了. Settings → General has a "Keep awake while agents
-// work" row, off by default: On and Off are saved as keepAwake true and
+// 的过程中经常自动关闭了. Settings → General has a "Prevent sleep" row
+// (named so by 1ooogle on X), off by default: On and Off are saved as keepAwake true and
 // false, the click moving nothing; another setting saved keeps it; a
 // browser's page (magpie web, the gateway's own computer) shows it too.
 // #975 (Hu9956: an agent recording the screen found it locked): a third
@@ -13,13 +13,14 @@ const fs = require("node:fs/promises");
 const path = require("node:path");
 const { test } = require("node:test");
 const { chromium, webkit } = require("playwright");
+const { watchSettingsReads, settingsDrawn } = require("./reader.cjs");
 
 const assets = path.resolve(__dirname, "../assets");
 const words = {
-  en: { name: "Keep awake while agents work", sub: "Keeps this computer from going to sleep by itself while agents work through magpie and for ten minutes after; the display may still turn off", on: "On", off: "Off", display: "Screen on too", displaySub: "Keeps this computer from going to sleep and its display on while agents work through magpie and for ten minutes after" },
-  zh: { name: "防止睡眠（Agent 工作时）", sub: "Agent 通过 magpie 工作时及之后十分钟内，阻止这台电脑自动睡眠；屏幕仍可能关闭", on: "开启", off: "关闭", display: "屏幕也常亮", displaySub: "Agent 通过 magpie 工作时及之后十分钟内，阻止这台电脑睡眠，屏幕也保持常亮、不锁屏" },
-  ja: { name: "エージェントの作業中はスリープしない", sub: "エージェントが magpie 経由で作業している間とその後 10 分間、このコンピューターが自動でスリープしないようにします。ディスプレイはオフになることがあります", on: "オン", off: "オフ", display: "画面もオン", displaySub: "エージェントが magpie 経由で作業している間とその後 10 分間、このコンピューターをスリープさせず、ディスプレイもオンのままにします" },
-  de: { name: "Wach halten, während Agenten arbeiten", sub: "Verhindert, dass dieser Computer von selbst in den Ruhezustand geht, während Agenten über magpie arbeiten, und zehn Minuten danach; der Bildschirm kann sich trotzdem ausschalten", on: "An", off: "Aus", display: "Bildschirm auch an", displaySub: "Verhindert, dass dieser Computer in den Ruhezustand geht, und hält den Bildschirm an, während Agenten über magpie arbeiten, und zehn Minuten danach" },
+  en: { name: "Prevent sleep", sub: "Keeps this computer awake while magpie runs tasks", on: "On", off: "Off", display: "Screen on too", displaySub: "Keeps this computer and its screen awake while magpie runs tasks" },
+  zh: { name: "防止休眠", sub: "在 magpie 运行任务时，让电脑保持唤醒状态", on: "开启", off: "关闭", display: "屏幕也常亮", displaySub: "在 magpie 运行任务时，让电脑和屏幕保持唤醒状态" },
+  ja: { name: "スリープを防ぐ", sub: "magpie がタスクを実行している間、このコンピューターをスリープさせません", on: "オン", off: "オフ", display: "画面もオン", displaySub: "magpie がタスクを実行している間、このコンピューターと画面をスリープさせません" },
+  de: { name: "Ruhezustand verhindern", sub: "Hält diesen Computer wach, während magpie Aufgaben ausführt", on: "An", off: "Aus", display: "Bildschirm auch an", displaySub: "Hält diesen Computer und den Bildschirm wach, während magpie Aufgaben ausführt" },
 };
 
 function serve(lang, web, posted, st) {
@@ -54,10 +55,13 @@ async function open(engine, lang, web, posted, st, t, width = 900) {
   t.after(() => browser.close());
   const page = await (await browser.newContext({ viewport: { width, height: 700 } })).newPage();
   page.setDefaultTimeout(5000);
+  page.setDefaultNavigationTimeout(60000);
   const errors = [];
   page.on("pageerror", (e) => errors.push(e.message));
   await page.route("**/*", serve(lang, web, posted, st));
+  await watchSettingsReads(page);
   await page.goto("http://magpie.test/?view=settings&tab=general");
+  await settingsDrawn(page); // rows found are the ones that stay (#1659)
   await page.locator("#setPage-general .row.pref").first().waitFor();
   return { page, errors };
 }
@@ -84,9 +88,10 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       const where = () => page.evaluate(() => [scrollX, scrollY, document.scrollingElement.scrollTop, ...[...document.querySelectorAll("*")].filter((e) => e.scrollTop).map((e) => e.scrollTop)]);
       const before = await where();
       const click = async (loc) => {
-        let b = await loc.boundingBox();
-        // the row is drawn again as the save comes back
-        for (let i = 0; i < 20 && !b; i++) { await page.waitForTimeout(50); b = await loc.boundingBox(); }
+        // the last save's answer draws Settings again, every option replaced:
+        // one measured before that is gone (null) by the time it is clicked
+        await page.waitForFunction(() => prefsBusy === 0);
+        const b = await loc.boundingBox();
         await page.mouse.click(b.x + b.width / 2, b.y + b.height / 2);
       };
       await click(opt(w.on));

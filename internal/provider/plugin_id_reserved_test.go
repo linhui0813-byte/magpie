@@ -2,22 +2,19 @@ package provider
 
 import (
 	"context"
-	"os/exec"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/yetone/magpie/internal/plugin"
+	"github.com/yetone/magpie/internal/testenv"
 )
 
 // An installed plugin's provider id is kept for it signed in or not, as a
 // built-in subscription's is: a provider of the user's own saved on it, or
 // renamed onto it, would hide the plugin's subscription once signed in.
 func TestPluginIDReservedSignedOut(t *testing.T) {
-	bun, err := exec.LookPath("bun")
-	if err != nil {
-		t.Skip("no bun on PATH")
-	}
+	bun := testenv.Bun(t)
 	claudeHome(t)
 	t.Setenv("MAGPIE_BUN", bun)
 	t.Cleanup(plugin.Settle)

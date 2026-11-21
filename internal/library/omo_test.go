@@ -14,6 +14,7 @@ func TestOmoTarget(t *testing.T) {
 	h := sandbox(t)
 	d := filepath.Join(h, ".omo", "agent")
 	write(t, filepath.Join(d, "settings.json"), "{}")
+	holdCLI(t, h, "omo") // the folder alone is gone (#2177)
 	tg := targetByID("omo")
 	if tg == nil || tg.MCP == nil || tg.MCP.Path != filepath.Join(d, "mcp.json") || tg.MCP.Format != fmtPiNative ||
 		tg.Instructions != filepath.Join(d, "AGENTS.md") || tg.Skills != filepath.Join(d, "skills") {

@@ -24,8 +24,11 @@ func symlink(t *testing.T, to, at string) {
 // shared folder as it is.
 func TestSharedAgentsSkills(t *testing.T) {
 	h := sandbox(t)
-	// no agent here whose own folder the shared one is (Goose's)
+	// no agent here whose own folder the shared one is (Goose's): its CLI
+	// of the sandbox too, since that alone would have it here (#2177)
 	os.RemoveAll(filepath.Join(h, ".config/goose"))
+	os.Remove(filepath.Join(h, "bin/goose"))
+	os.Remove(filepath.Join(h, "bin/goose.exe"))
 	shared := filepath.Join(h, ".agents/skills")
 	// a skill kept elsewhere (D:\aimer-skills\…) linked into the shared folder
 	ext := filepath.Join(h, "aimer-skills/grilling")

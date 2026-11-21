@@ -22,7 +22,7 @@ func TestPageFilesRevalidate(t *testing.T) {
 	t.Setenv("USERPROFILE", h)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(h, ".config"))
 	t.Setenv("XDG_CACHE_HOME", filepath.Join(h, ".cache"))
-	srv := Handler(webHost{}, nil)
+	srv := webPageHandler(t, webHost{}, nil)
 	get := func(path, etag string) *httptest.ResponseRecorder {
 		r := httptest.NewRequest("GET", path, nil)
 		if etag != "" {
@@ -80,7 +80,7 @@ func TestPageNamesItsFilesByContent(t *testing.T) {
 	t.Setenv("USERPROFILE", h)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(h, ".config"))
 	t.Setenv("XDG_CACHE_HOME", filepath.Join(h, ".cache"))
-	srv := Handler(webHost{}, nil)
+	srv := webPageHandler(t, webHost{}, nil)
 	get := func(path, etag string) *httptest.ResponseRecorder {
 		r := httptest.NewRequest("GET", path, nil)
 		if etag != "" {
@@ -98,7 +98,7 @@ func TestPageNamesItsFilesByContent(t *testing.T) {
 		t.Errorf("/: Content-Type %q", ct)
 	}
 	body := page.Body.String()
-	for _, f := range []string{"app.js", "routing.js", "library.js", "plugins.js", "sessions.js", "i18n.js", "compat.js", "app.css", "routing.css"} {
+	for _, f := range []string{"app.js", "plugins.js", "plugins/routing/client.js", "plugins/routing/routing.css", "plugins/sessions/client.js", "plugins/sessions/sessions.css", "plugins/library/client.js", "plugins/library/library.css", "context.js", "i18n.js", "compat.js", "app.css", "context.css"} {
 		b, err := fs.ReadFile(staticFS(), f)
 		if err != nil {
 			t.Fatal(err)

@@ -12,11 +12,12 @@ package gateway
 import (
 	"encoding/json"
 	"fmt"
-	"regexp"
 	"slices"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/yetone/magpie/internal/lazyre"
 )
 
 // effortRemember is how long an account's refusal of a level is kept: a
@@ -74,7 +75,9 @@ func takesEffort(c candidate, e string) bool {
 			return true
 		}
 	}
-	if levels, ok := c.p.Account.Levels(c.model); ok && !slices.Contains(levels, e) {
+	// the account's list names its models by the vendor's id, not one the
+	// user lists one by (SetModelID)
+	if levels, ok := c.p.Account.Levels(c.p.OwnModelID(c.model)); ok && !slices.Contains(levels, e) {
 		return false
 	}
 	return true
@@ -92,12 +95,12 @@ func effortMate(left []candidate, c candidate, e string) int {
 var (
 	// unsupportedEffort is OpenAI's "Unsupported value: 'high' is not
 	// supported with the 'gpt-6-luna' model. Supported values are: …"
-	unsupportedEffort = regexp.MustCompile(`(?i)unsupported value:?\s*['"\x60]?([a-z]+)['"\x60]?\s+is not supported`)
+	unsupportedEffort = lazyre.New(`(?i)unsupported value:?\s*['"\x60]?([a-z]+)['"\x60]?\s+is not supported`)
 	// effortNamed is a refusal naming the reasoning effort itself
-	effortNamed  = regexp.MustCompile(`(?i)reasoning[._ ]?effort`)
-	effortDenied = regexp.MustCompile(`(?i)not supported|unsupported|not available|isn'?t available|not allowed|invalid value|upgrade|your plan`)
-	supportedAre = regexp.MustCompile(`(?i)supported values are:?\s*([^.]*)`)
-	quotedLevel  = regexp.MustCompile(`['"\x60]([a-z]+)['"\x60]`)
+	effortNamed  = lazyre.New(`(?i)reasoning[._ ]?effort`)
+	effortDenied = lazyre.New(`(?i)not supported|unsupported|not available|isn'?t available|not allowed|invalid value|upgrade|your plan`)
+	supportedAre = lazyre.New(`(?i)supported values are:?\s*([^.]*)`)
+	quotedLevel  = lazyre.New(`['"\x60]([a-z]+)['"\x60]`)
 )
 
 // effortRefused reads a vendor's 400 as the reasoning level sent turned
@@ -160,4 +163,36 @@ func effortError(c candidate, e string, takes []string, vendor string) string {
 		msg += ": " + vendor
 	}
 	return msg
+}
+
+// askedTier is the service tier a Responses request asks for.
+func askedTier(body []byte) string {
+	var q struct {
+		Tier string `json:"service_tier"`
+	}
+	decodeJSON(body, &q)
+	return q.Tier
+}
+
+// takesTier says whether c's account may be asked for service tier t on
+// its model: not when its own model list says which tiers the model has
+// and t isn't one.
+func takesTier(c candidate, t string) bool {
+	if c.p.Account == nil {
+		return true
+	}
+	tiers, ok := c.p.Account.Tiers(c.p.OwnModelID(c.model)) // by the vendor's id, as Levels
+	return !ok || slices.Contains(tiers, t)
+}
+
+// tierMate is the first of left that is another account of c's member
+// whose list offers tier t on the model, or -1.
+func tierMate(left []candidate, c candidate, t string) int {
+	return slices.IndexFunc(left, func(x candidate) bool {
+		if x.p.Account == nil || x.p.ID != c.p.ID || x.model != c.model || x.effort != c.effort || x.who() == c.who() {
+			return false
+		}
+		tiers, ok := x.p.Account.Tiers(x.model)
+		return ok && slices.Contains(tiers, t)
+	})
 }

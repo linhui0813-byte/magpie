@@ -61,10 +61,12 @@ func TestRoundTrip(t *testing.T) {
 	if Save(Settings{}) != nil || Load().TextSize != DefaultTextSize() {
 		t.Fatalf("default text size: %+v", Load())
 	}
-	if Save(Settings{TextSize: 125}) != nil || Load().TextSize != 125 {
-		t.Fatal("text size not kept")
+	for _, n := range []int{115, 120, 125} {
+		if Save(Settings{TextSize: n}) != nil || Load().TextSize != n {
+			t.Fatalf("text size %d not kept", n)
+		}
 	}
-	for _, bad := range []int{90, 120, 300, -1} {
+	for _, bad := range []int{90, 105, 130, 300, -1} {
 		if Save(Settings{TextSize: bad}) == nil {
 			t.Fatalf("text size %d accepted", bad)
 		}
@@ -486,19 +488,20 @@ func TestModelPriceKeysStayTheFilesOwnWhileMessagesSayTheParts(t *testing.T) {
 	}
 }
 
-// the usage alerts' share and amount (#368): 0 is off, the rest in range
+// the usage alerts' share and amount (#368), and a turn's length before
+// its end is said: 0 is off, the rest in range
 func TestAlertsChecked(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
-	for _, s := range []Settings{{UsageAlert: 101}, {UsageAlert: -1}, {BalanceAlert: -0.5}} {
+	for _, s := range []Settings{{UsageAlert: 101}, {UsageAlert: -1}, {BalanceAlert: -0.5}, {TurnDoneAlert: -1}, {TurnDoneAlert: 86401}} {
 		if err := Save(s); err == nil {
 			t.Errorf("saved %+v", s)
 		}
 	}
-	if err := Save(Settings{UsageAlert: 80, BalanceAlert: 2.5}); err != nil {
+	if err := Save(Settings{UsageAlert: 80, BalanceAlert: 2.5, TurnDoneAlert: 180}); err != nil {
 		t.Fatal(err)
 	}
-	if s := Load(); s.UsageAlert != 80 || s.BalanceAlert != 2.5 {
-		t.Fatalf("read back %d %v", s.UsageAlert, s.BalanceAlert)
+	if s := Load(); s.UsageAlert != 80 || s.BalanceAlert != 2.5 || s.TurnDoneAlert != 180 {
+		t.Fatalf("read back %d %v %d", s.UsageAlert, s.BalanceAlert, s.TurnDoneAlert)
 	}
 }
 
@@ -533,5 +536,27 @@ func TestDefaultTextSize(t *testing.T) {
 	}
 	if orig() != want {
 		t.Fatalf("on %s the default is %d, want %d", runtime.GOOS, orig(), want)
+	}
+}
+
+// The models folder is this computer's: settings that come from another
+// computer's sync keep the one set here, and it is saved and cleared on its
+// own.
+func TestRedactModelDirKept(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	if err := SetRedactModelDir("/models"); err != nil {
+		t.Fatal(err)
+	}
+	cur := Load()
+	if cur.RedactModelDir != "/models" {
+		t.Fatalf("not saved: %q", cur.RedactModelDir)
+	}
+	from := Settings{RedactModelDir: "D:\\their-disk"}
+	from.KeepOwn(cur)
+	if from.RedactModelDir != "/models" {
+		t.Fatalf("a sync took the folder: %q", from.RedactModelDir)
+	}
+	if err := SetRedactModelDir(""); err != nil || Load().RedactModelDir != "" {
+		t.Fatalf("cleared: %v %q", err, Load().RedactModelDir)
 	}
 }

@@ -29,7 +29,9 @@ const routes = [
   { id: 101, seq: 101, time: at(6), agent: "codex", model: "relay/gpt-6-sol", provider: "relay", order: [relay],
     tries: [{ id: relay.id, model: "gpt-6-sol", start: at(6), done: true, status: 429, ms: 300, fail: "rate" }], done: true, status: 429, ms: 300 },
   { id: 103, seq: 103, time: at(1), agent: "codex", model: "relay/gpt-6-sol", provider: "relay", order: [relay],
-    tries: [ok(relay, 1, { served: "gpt-6-luna", swapped: true })], done: true, status: 200, ms: 1500, tokens: 12400, served: "gpt-6-luna", swapped: true },
+    tries: [ok(relay, 1, { served: "gpt-6-luna", swapped: true })], done: true, status: 200, ms: 1500, tokens: 12400, served: "gpt-6-luna", swapped: true,
+    // it wrote 2,000 tokens in the 1.2 s after its first, at 1,667 tok/s
+    out: 2000, ttft: 300 },
   { id: 100, seq: 100, time: at(9), agent: "claude", model: "claude/claude-opus-5", provider: "claude", order: [claude],
     tries: [ok(claude, 9, { served: "claude-opus-5-20260901" })], done: true, status: 200, ms: 1500, tokens: 800 },
   { id: 102, seq: 102, time: at(3), agent: "claude", model: "claude/claude-opus-5", provider: "claude", order: [claude],
@@ -69,8 +71,8 @@ function serve(lang, opened, live) {
 }
 
 const want = {
-  en: { tab: "Routing", quota: "Allowances", swap: "served gpt-6-luna", today: /today\s*42\s*calls\s*·\s*1\.2M\s*tokens/, fail: /429 · rate limited/, open: "Open Routing", story: /How the request at/ },
-  zh: { tab: "路由", quota: "额度", swap: "实际 gpt-6-luna", today: /今天\s*42\s*次调用\s*·\s*1\.2M\s*token/, fail: /429 · 限流/, open: "打开路由", story: /的请求是怎么路由的/ },
+  en: { speed: "1667 tok/s", tab: "Routing", quota: "Allowances", swap: "served gpt-6-luna", today: /today\s*42\s*calls\s*·\s*1\.2M\s*tokens/, fail: /429 · rate limited/, open: "Open Routing", story: /How the request at/ },
+  zh: { speed: "1667 token/秒", tab: "路由", quota: "额度", swap: "实际 gpt-6-luna", today: /今天\s*42\s*次调用\s*·\s*1\.2M\s*token/, fail: /429 · 限流/, open: "打开路由", story: /的请求是怎么路由的/ },
 };
 
 for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium", "webkit"])) {
@@ -89,6 +91,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         const page = await (await browser.newContext({ viewport, reducedMotion: live ? "no-preference" : "reduce" })).newPage();
         pages.push(page);
         page.setDefaultTimeout(5000);
+        page.setDefaultNavigationTimeout(60000);
         page.on("pageerror", (e) => errors.push(e.message));
         await page.route("**/*", serve(lang, opened, live));
         await page.goto(url);
@@ -111,7 +114,11 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         who: r.querySelector(".pr-who").textContent, model: r.querySelector(".pr-a .m").textContent,
         where: r.querySelector(".pr-where").textContent, served: r.querySelector(".pr-m")?.textContent || "",
         swap: r.querySelector(".swap")?.textContent || "", cls: r.className, at: r.querySelector(".at").textContent,
+        meta: r.querySelector(".meta").textContent,
       })));
+      // a finished row tells how fast it wrote, as the Routing page's does
+      // (#2050); one that failed or tells no speed doesn't
+      assert.deepEqual(rows.map((r) => r.meta.includes(want[lang].speed)), [true, false, false, false], JSON.stringify(rows.map((r) => r.meta)));
       assert.deepEqual(rows.map((r) => r.model), ["relay/gpt-6-sol", "claude/claude-opus-5", "relay/gpt-6-sol", "claude/claude-opus-5"]);
       assert.deepEqual(rows.map((r) => r.who), ["Codex", "Claude Code", "Codex", "Claude Code"]);
       assert.equal(rows[0].where, "Relay · team");
@@ -131,6 +138,10 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       // no row runs out of the panel
       const over = await page.locator(".pr-req").evaluateAll((rs) => rs.filter((r) => r.scrollWidth > r.clientWidth + 1).length);
       assert.equal(over, 0);
+      // nor are its totals cut: with the speed they go under where it went
+      // when both don't fit (#2050)
+      const cut = await page.locator(".pr-req .meta").evaluateAll((ms) => ms.filter((m) => m.scrollWidth > m.clientWidth + 1).map((m) => m.textContent));
+      assert.deepEqual(cut, []);
       // the times and the totals line up on the right; one mark a row
       const rights = await page.locator(".pr-req").evaluateAll((rs) => rs.map((r) => [r.querySelector(".at").getBoundingClientRect().right, r.querySelector(".meta").getBoundingClientRect().right, r.querySelectorAll("i").length]));
       for (const [at, meta, marks] of rights) {

@@ -88,6 +88,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       t.after(() => browser.close());
       const page = await (await browser.newContext({ viewport: { width: 1000, height: 740 }, reducedMotion: "reduce" })).newPage();
       page.setDefaultTimeout(5000);
+      page.setDefaultNavigationTimeout(60000);
       const errors = [], posts = [], requests = [];
       page.on("pageerror", (e) => errors.push(e.message));
       await page.route("**/*", fixture(lang, "light", posts, requests));
@@ -96,7 +97,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         : { addButton: "Add", first: "Make first", remove: "Remove", failed: "Failed", all: "All gateway keys" };
       await page.goto("http://magpie.test/?view=providers");
       await page.locator(".row.provider", { hasText: "Relay" }).click();
-      assert.equal(await page.locator(".accts .acc:not(.add)").count(), 2);
+      assert.equal(await page.locator(".accts .acc:not(.add):not(.keys-copy-all)").count(), 2);
       await page.locator(".accts .acc.add").click();
       await page.locator(".acc.adding .kf input").nth(0).fill("Backup");
       await page.locator(".acc.adding .kf input").nth(1).fill("test-new");
@@ -132,9 +133,9 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await page.locator("#usageKeys .row").first().waitFor();
       assert.deepEqual(await page.locator("#usageKeys .name").allTextContents(), ["Server", "Laptop"]);
       assert.deepEqual(await page.locator("#usageKeys .num b").allTextContents(), ["2.2K", "1.1K"]);
-      assert.deepEqual(await page.locator("#usageKeys .cost").allTextContents(), ["≈$0.400", "≈$0.200"]);
+      assert.deepEqual(await page.locator("#usageKeys .cost").allTextContents(), ["$0.400", "$0.200"]);
       assert(!/Workspace|Personal/.test(await page.locator("#usageKeys").textContent()));
-      await page.locator("#usageTab .opt").nth(1).click();
+      await page.locator(":is(#usageTab .opt, .nav-s):visible").nth(1).click();
       await page.locator(".led tbody tr").first().waitFor();
       assert.equal(await page.locator(".led tbody tr").first().locator("td").nth(3).textContent(), "Relay · relay.example");
       assert((await page.locator(".led tbody tr").first().locator("td").nth(3).getAttribute("title")).includes("relay.example"));
@@ -162,6 +163,10 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       assert(!requests.at(-1).has("key") && !requests.at(-1).has("callerKey"));
       assert.equal(await page.locator(".led tbody tr").last().locator("td").nth(3).textContent(), "Relay · relay.example");
       await page.setViewportSize({ width: 560, height: 700 });
+      // WebKit applies the sidebar's media rule to the new width at the next
+      // frame (matchMedia already answers for it), so measure after that frame
+      await page.waitForFunction(() => !document.body.classList.contains("side-nav"));
+      await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
       assert(await page.locator("#view-usage").evaluate((v) => v.scrollWidth <= v.clientWidth));
       if (process.env.ARTIFACT_DIR) {
         await fs.mkdir(process.env.ARTIFACT_DIR, { recursive: true });

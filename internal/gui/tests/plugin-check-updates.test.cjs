@@ -89,6 +89,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         const calls = [];
         const page = await (await browser.newContext({ viewport: { width: 980, height: 560 } })).newPage();
         page.setDefaultTimeout(5000);
+        page.setDefaultNavigationTimeout(60000);
         const errors = [];
         page.on("pageerror", (e) => errors.push(e.message));
         const srv = server(lang, calls);
@@ -96,7 +97,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
 
         await page.goto("http://magpie.test/?view=plugins");
         const view = page.locator("#view-plugins");
-        await view.locator(".lib-tabs .opt", { hasText: w.installed }).click();
+        await view.page().locator(":is(.lib-tabs .opt, .nav-s):visible", { hasText: w.installed }).click();
         const row = (spec) => view.locator(".pm-row").filter({ has: page.locator(".name span", { hasText: new RegExp("^" + spec.replace(/[/@-]/g, "\\$&") + "$") }) });
         await row(COPILOT).waitFor();
         // nothing newer known yet: no Update offered

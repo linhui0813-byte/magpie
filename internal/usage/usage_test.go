@@ -143,7 +143,7 @@ func TestSummarizeTimesFirstTokens(t *testing.T) {
 	}
 	s := summarize(Today, now, recs)
 	m := s.Models[0]
-	if m.Timed != 2 || m.MeanTTFT() != 750 || m.DecodeMs != 3000 || m.DecodeOut != 150 || m.Speed() != 50 {
+	if m.Timed != 2 || m.MeanTTFT() != 750 || m.DecodeMs != 3000 || m.DecodeOut != 150 || !within(m.Speed(), 50) {
 		t.Fatalf("model: %+v", m.Totals)
 	}
 	if s.Timed != 2 || s.Series[14].Timed != 2 {
@@ -172,14 +172,14 @@ func TestBurstTellsNoSpeed(t *testing.T) {
 		{Time: at, Provider: "antigravity", Model: "gemini-3.8-flash", Output: 400, Millis: 6000, TTFT: 2000, Status: 200},   // 100 tok/s
 	}
 	m := summarize(Today, now, recs).Models[0]
-	if m.Timed != 3 || m.MeanTTFT() != (24359+3000+2000)/3 || m.DecodeMs != 16000 || m.DecodeOut != 1600 || m.Speed() != 100 {
+	if m.Timed != 3 || m.MeanTTFT() != (24359+3000+2000)/3 || m.DecodeMs != 16000 || m.DecodeOut != 1600 || !within(m.Speed(), 100) {
 		t.Fatalf("model: %+v, %v tok/s", m.Totals, m.Speed())
 	}
 	var rows Totals
 	for _, r := range recs {
 		rows.addRow(Row{Record: r})
 	}
-	if rows.Timed != 3 || rows.DecodeMs != 16000 || rows.DecodeOut != 1600 || rows.Speed() != 100 {
+	if rows.Timed != 3 || rows.DecodeMs != 16000 || rows.DecodeOut != 1600 || !within(rows.Speed(), 100) {
 		t.Fatalf("rows: %+v", rows)
 	}
 	for _, c := range []struct {
@@ -228,7 +228,7 @@ func TestReasoningReplyTimedByItsAnswer(t *testing.T) {
 	}
 	const ms, out = 1500 + 1500 + 3000 + 5000, 200 + 200 + 300 + 500
 	m := summarize(Today, now, recs).Models[0]
-	if m.Timed != 6 || m.DecodeMs != ms || m.DecodeOut != out || m.Speed() != 109.0909090909091 {
+	if m.Timed != 6 || m.DecodeMs != ms || m.DecodeOut != out || !within(m.Speed(), (133.33+100)/2) { // the median of 133, 133, 100 and 100
 		t.Fatalf("model: %+v, %v tok/s", m.Totals, m.Speed())
 	}
 	var rows Totals
@@ -251,7 +251,7 @@ func TestReasoningReplyTimedByItsAnswer(t *testing.T) {
 			p = q
 		}
 	}
-	if p.DecodeMs != ms || p.DecodeOut != out {
+	if p.DecodeMs != ms || p.DecodeOut != out || p.TPS != m.Speed() {
 		t.Fatalf("part: %+v", p)
 	}
 	for _, c := range []struct {
@@ -309,5 +309,23 @@ func TestSawIsLastSeen(t *testing.T) {
 	Saw(agent)
 	if at := LastSeen(agent); at.Before(before) || time.Since(at) > time.Minute {
 		t.Fatalf("after a request: %v", at)
+	}
+}
+
+// A client named by an HTTP library, a runtime or an SDK is no agent
+// (theforeveriris on X), as AgentOf names it from its User-Agent; an
+// agent's or an app's own name is not one.
+func TestIsLibrary(t *testing.T) {
+	for _, ua := range []string{"curl/8.7.1", "Bun/1.4.2", "python-httpx/0.28.1", "Go-http-client/1.1", "node-fetch/1.0",
+		"undici", "axios/1.7.2", "okhttp/4.12.0", "python-requests/2.32.3", "Python/3.12 aiohttp/3.10.5",
+		"OpenAI/Python 1.54.0", "AsyncOpenAI/Python 1.54.0", "Anthropic/JS 0.32.1"} {
+		if a := AgentOf(ua); !IsLibrary(a) {
+			t.Errorf("%q (%q) is not a library", ua, a)
+		}
+	}
+	for _, ua := range []string{"SillyTavern/1.12", "MyApp/2.0 (Linux)", "Mozilla/5.0 (Macintosh)", ""} {
+		if a := AgentOf(ua); IsLibrary(a) {
+			t.Errorf("%q (%q) is a library", ua, a)
+		}
 	}
 }

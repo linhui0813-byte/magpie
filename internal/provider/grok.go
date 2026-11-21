@@ -1,13 +1,14 @@
 package provider
 
-// PLUGIN-SERVED (see AGENTS.md): Grok ("grok") is a deprecated built-in
-// subscription served by its plugin, @magpie-community/opencode-grok-auth,
-// once moved onto it (provider.Moved; the default for a new sign-in). A
-// moved one's sign-ins, models, requests and usage are all the plugin's,
-// never this code's (only the move, in migrate*.go, still reads its
-// accounts). A fix here alone doesn't reach those users; fix the plugin
-// (github.com/magpie-community/plugins, packages/grok) and raise the mover's
-// min in internal/provider/migrate_side.go.
+// PLUGIN-SERVED (see AGENTS.md): Grok ("grok") is a retired built-in
+// subscription, served by its plugin alone,
+// @magpie-community/opencode-grok-auth (provider.BuiltinRetired). Its
+// sign-in, models, requests and usage are the plugin's; what is left here
+// reads the accounts signed in to the built-in for the move onto the plugin
+// (migrate_side.go), installs and finds the Grok CLI the plugin signs in
+// with, and shapes the plugin's request bodies (grokBody). A fix belongs in
+// the plugin (github.com/magpie-community/plugins, packages/grok), with the
+// mover's min raised in internal/provider/migrate_side.go.
 
 // A Grok subscription (SuperGrok, X Premium+) is served straight from the
 // backend xAI's Grok Build CLI talks to, OpenAI's Responses API at
@@ -23,20 +24,19 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/yetone/magpie/internal/appdir"
-	"github.com/yetone/magpie/internal/catalog"
+	"github.com/yetone/magpie/internal/lazyre"
 	"github.com/yetone/magpie/internal/netproxy"
 	"github.com/yetone/magpie/internal/proc"
 )
@@ -156,53 +156,6 @@ func readGrokCredential(home string) (grokCredential, bool) {
 	return grokCredential{}, false
 }
 
-func grokAccount() (Provider, bool) {
-	if GrokExecutable() == "" {
-		return Provider{}, false
-	}
-	ls := grokLogins()
-	if len(ls) == 0 {
-		return Provider{}, false
-	}
-	home := ls[0].Home
-	acct := &Account{Agent: "grok", User: ls[0].User, Plan: ls[0].Plan, Home: home}
-	if home == GrokHome() {
-		acct.Home = "" // the CLI's own, wherever it is
-	}
-	grokSigned(acct, home)
-	acct.body = grokBody
-	acct.models = func() []catalog.Model { return []catalog.Model{{ID: "grok-4.7", Name: "Grok 4.7"}} }
-	acct.fetch = func(ctx context.Context) ([]catalog.Model, error) {
-		ms, err := grokModels(ctx, acct.sign)
-		if err != nil {
-			return nil, err
-		}
-		return ms, catalog.SaveLive("grok", GrokBase, ms)
-	}
-	return Provider{ID: "grok", Name: "Grok (SuperGrok)", Icon: "xai", Website: "https://x.ai/cli", Responses: GrokBase, Account: acct}, true
-}
-
-// grokSigned has the account's requests signed with the sign-in in home.
-func grokSigned(acct *Account, home string) {
-	acct.sign = func(ctx context.Context, req *http.Request, body []byte) error {
-		c, err := grokAccessToken(home, GrokExecutable(), false)
-		if err != nil {
-			return err
-		}
-		grokHeaders(req, c.Key)
-		if m := bodyModel(body); m != "" {
-			req.Header.Set("x-grok-model-override", m)
-		}
-		var v struct {
-			Key string `json:"prompt_cache_key"`
-		}
-		if json.Unmarshal(body, &v) == nil && v.Key != "" {
-			req.Header.Set("x-grok-conv-id", v.Key)
-		}
-		return nil
-	}
-}
-
 // grokTools are the tool types Grok's backend takes; it turns the whole
 // request away over another, as over Codex's freeform apply_patch (custom)
 // or a namespace, which groups its sub-agent tools. A namespace's functions
@@ -223,9 +176,24 @@ var grokTools = map[string]bool{"function": true, "web_search": true, "x_search"
 // A tool_choice with no tools
 // left goes too: the backend turns the request away over it ("A
 // tool_choice was set on the request but no tools were specified"), as it
-// would Codex's compaction summary, sent without tools (#378).
-func grokBody(body []byte) []byte {
-	if !bytes.Contains(body, []byte(`"tools"`)) && !bytes.Contains(body, []byte(`"reasoning"`)) && !bytes.Contains(body, []byte(`"tool_choice"`)) && !bytes.Contains(body, []byte(`"namespace"`)) {
+// would Codex's compaction summary, sent without tools (#378). A Codex
+// agent_message (a subagent's task, or its reply in the lead's history),
+// which the backend turns away with 422 "unknown item type", goes as the
+// user's message, its sender and recipient said first (grokAgentMessage).
+func grokBody(body []byte) []byte { return grokShaped(body, false) }
+
+// grokPluginBody is grokBody for the Grok plugin, but the tool_choice the
+// plugin reads stays: a lone "none" (a request that turned tools off says
+// so to the plugin, which reads it before adding a tool of its own
+// (x_search) and leaves a lone tool_choice out before the request goes to
+// Grok; @magpie-community/opencode-grok-auth 0.1.18, #3110), and an object
+// of a type Grok's backend doesn't take, an allowed_tools naming the
+// client's own tools among them, which the plugin reads the same way and
+// leaves out before Grok (#3153).
+func grokPluginBody(body []byte) []byte { return grokShaped(body, true) }
+
+func grokShaped(body []byte, forPlugin bool) []byte {
+	if !bytes.Contains(body, []byte(`"tools"`)) && !bytes.Contains(body, []byte(`"reasoning"`)) && !bytes.Contains(body, []byte(`"tool_choice"`)) && !bytes.Contains(body, []byte(`"namespace"`)) && !bytes.Contains(body, []byte(`"agent_message"`)) {
 		return body
 	}
 	dec := json.NewDecoder(bytes.NewReader(body))
@@ -266,20 +234,28 @@ func grokBody(body []byte) []byte {
 			if flatCall(tc) {
 				dirty = true
 			}
-			if ty, _ := tc["type"].(string); !grokTools[ty] {
+			// a type the backend turns the request away over goes for the
+			// plugin to read, as the lone "none" does: it leaves an
+			// unsupported one out before Grok instead of adding x_search
+			// over it (#3153). The built-in is Grok's last stop.
+			if ty, _ := tc["type"].(string); !grokTools[ty] && !forPlugin {
 				delete(m, "tool_choice")
 				dirty = true
 			}
 		}
 	}
-	if tools, _ := m["tools"].([]any); len(tools) == 0 {
+	if tools, _ := m["tools"].([]any); len(tools) == 0 && !(forPlugin && m["tool_choice"] == "none") {
 		if _, ok := m["tool_choice"]; ok {
 			delete(m, "tool_choice")
 			dirty = true
 		}
 	}
 	input, _ := m["input"].([]any)
-	for _, it := range input {
+	for i, it := range input {
+		if msg, ok := grokAgentMessage(it); ok {
+			input[i], it = msg, msg
+			dirty = true
+		}
 		if im, ok := it.(map[string]any); ok && flatCall(im) {
 			dirty = true
 		}
@@ -298,6 +274,57 @@ func grokBody(body []byte) []byte {
 		return body
 	}
 	return b
+}
+
+// grokAgentMessage is a plain Codex agent_message as the user's message
+// Grok's backend takes: "From <author> to <recipient>" first, then its text
+// and images as they came, in its place among the input. One sealed
+// (encrypted_content on it or on a part), empty, or with a part of another
+// kind is left as it is: magpie reads no sealed task, and the gateway's
+// guard for one (hasSealedAgentMessage) still sees it. The plugin does the
+// same (@magpie-community/opencode-grok-auth 0.1.11, plugins#61).
+func grokAgentMessage(it any) (map[string]any, bool) {
+	im, ok := it.(map[string]any)
+	if !ok || im["type"] != "agent_message" {
+		return nil, false
+	}
+	if _, sealed := im["encrypted_content"]; sealed {
+		return nil, false
+	}
+	parts, _ := im["content"].([]any)
+	if len(parts) == 0 {
+		return nil, false
+	}
+	for _, p := range parts {
+		pm, ok := p.(map[string]any)
+		if !ok {
+			return nil, false
+		}
+		if _, sealed := pm["encrypted_content"]; sealed {
+			return nil, false
+		}
+		_, isText := pm["text"].(string)
+		_, isURL := pm["image_url"].(string)
+		if !(pm["type"] == "input_text" && isText || pm["type"] == "input_image" && isURL) {
+			return nil, false
+		}
+	}
+	from, _ := im["author"].(string)
+	to, _ := im["recipient"].(string)
+	header := ""
+	switch {
+	case from != "" && to != "":
+		header = "From " + from + " to " + to
+	case from != "":
+		header = "From " + from
+	case to != "":
+		header = "To " + to
+	}
+	content := parts
+	if header != "" {
+		content = append([]any{map[string]any{"type": "input_text", "text": header + "\n\n"}}, parts...)
+	}
+	return map[string]any{"type": "message", "role": "user", "content": content}, true
 }
 
 // liteNamespace is the namespace Codex's Responses Lite groups its own
@@ -352,9 +379,18 @@ func objectRoot(fn map[string]any) bool {
 // oneOf, allOf, or anyOf at the top level", #646). allOf's branches are
 // all merged, properties and required alike. Of anyOf's and oneOf's object
 // branches the properties are merged, a field each of them requires stays
-// required, and the other branches go. It reports whether it changed
-// anything.
+// required, and the other branches go. A branch that is a union itself, as
+// zod writes a discriminated union inside another (Codex desktop's
+// automation_update, #1271), is folded the same way first, so its fields
+// are kept; a field the branches give different schemas takes any of them.
+// It reports whether it changed anything.
 func ObjectRoot(ps map[string]any) bool {
+	return objectRootIn(ps, ps, 0)
+}
+
+// objectRootIn is ObjectRoot on ps, a schema whose local $refs name root's
+// $defs; depth bounds how far unions inside unions are followed.
+func objectRootIn(root, ps map[string]any, depth int) bool {
 	_, any1 := ps["anyOf"]
 	_, one := ps["oneOf"]
 	_, all := ps["allOf"]
@@ -372,7 +408,7 @@ func ObjectRoot(ps map[string]any) bool {
 	list, _ := ps["allOf"].([]any)
 	for _, b := range list {
 		bm, _ := b.(map[string]any)
-		if bm = grokRef(ps, bm); bm == nil {
+		if bm = grokRef(root, bm); bm == nil {
 			continue
 		}
 		bp, _ := bm["properties"].(map[string]any)
@@ -390,8 +426,13 @@ func ObjectRoot(ps map[string]any) bool {
 		list, _ := ps[k].([]any)
 		for _, b := range list {
 			bm, _ := b.(map[string]any)
-			if bm = grokRef(ps, bm); bm == nil {
+			if bm = grokRef(root, bm); bm == nil {
 				continue
+			}
+			if nestedUnion(bm) && depth < 8 {
+				// folded on a copy: the branch may be a $def others name
+				bm = maps.Clone(bm)
+				objectRootIn(root, bm, depth+1)
 			}
 			if _, has := bm["properties"]; bm["type"] != "object" && !has {
 				continue
@@ -400,30 +441,59 @@ func ObjectRoot(ps map[string]any) bool {
 		}
 		delete(ps, k)
 	}
+	// a field every branch requires stays required, beside the root's and
+	// allOf's own, which no branch can drop
+	var common []any
+	// the schemas the branches give a field the root doesn't define
+	from := map[string][]any{}
+	var order []string
 	for i, b := range branches {
 		bp, _ := b["properties"].(map[string]any)
-		for k, v := range bp {
-			if _, ok := props[k]; !ok {
-				props[k] = v
+		for _, k := range slices.Sorted(maps.Keys(bp)) {
+			if _, own := props[k]; own {
+				continue
 			}
+			if _, seen := from[k]; !seen {
+				order = append(order, k)
+			}
+			from[k] = appendDistinct(from[k], bp[k])
 		}
 		br, _ := b["required"].([]any)
 		if i == 0 {
-			required = append(required, br...)
+			common = append(common, br...)
 			continue
 		}
 		in := map[any]bool{}
 		for _, r := range br {
 			in[r] = true
 		}
-		kept := required[:0]
-		for _, r := range required {
+		kept := common[:0]
+		for _, r := range common {
 			if in[r] {
 				kept = append(kept, r)
 			}
 		}
-		required = kept
+		common = kept
 	}
+	for _, k := range order {
+		if vs := from[k]; len(vs) == 1 {
+			props[k] = vs[0]
+		} else {
+			props[k] = map[string]any{"anyOf": vs}
+		}
+	}
+	seen := map[string]bool{}
+	var merged []any
+	for _, r := range append(required, common...) {
+		if name, ok := r.(string); ok {
+			if seen[name] {
+				continue
+			}
+			seen[name] = true
+		}
+		merged = append(merged, r)
+	}
+	required = merged
 	ps["type"] = "object"
 	ps["properties"] = props
 	if len(required) > 0 {
@@ -432,6 +502,27 @@ func ObjectRoot(ps map[string]any) bool {
 		delete(ps, "required")
 	}
 	return true
+}
+
+// nestedUnion reports whether a branch of a union is a union itself.
+func nestedUnion(b map[string]any) bool {
+	for _, k := range []string{"anyOf", "oneOf", "allOf"} {
+		if _, ok := b[k]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// appendDistinct adds v to vs unless one there is the same schema.
+func appendDistinct(vs []any, v any) []any {
+	vb, _ := json.Marshal(v)
+	for _, w := range vs {
+		if wb, _ := json.Marshal(w); bytes.Equal(vb, wb) {
+			return vs
+		}
+	}
+	return append(vs, v)
 }
 
 // grokRef is a branch of a schema, or what its local $ref names in the
@@ -465,206 +556,6 @@ func flatCall(it map[string]any) bool {
 	return true
 }
 
-// grokHeaders say a request comes from the Grok CLI, which the backend
-// wants to know the version of: without it the CLI is "outdated".
-func grokHeaders(req *http.Request, token string) {
-	v := grokVersion()
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("x-grok-client-version", v)
-	req.Header.Set("x-xai-token-auth", "xai-grok-cli")
-	req.Header.Set("x-grok-client-identifier", "grok-shell")
-	req.Header.Set("x-grok-client-mode", "headless")
-	goos, arch := runtime.GOOS, runtime.GOARCH
-	if goos == "darwin" {
-		goos = "macos"
-	}
-	switch arch {
-	case "arm64":
-		arch = "aarch64"
-	case "amd64":
-		arch = "x86_64"
-	}
-	req.Header.Set("User-Agent", "grok-shell/"+v+" ("+goos+"; "+arch+")")
-}
-
-// grokClientVersion is the Grok CLI version magpie says it is, unless the
-// installed one is newer.
-const grokClientVersion = "1.0.41"
-
-var grokVersionCache struct {
-	sync.Mutex
-	v  string
-	at time.Time
-}
-
-var grokSemver = regexp.MustCompile(`\d+\.\d+\.\d+`)
-
-func grokVersion() string {
-	grokVersionCache.Lock()
-	defer grokVersionCache.Unlock()
-	if time.Since(grokVersionCache.at) < 10*time.Minute {
-		return grokVersionCache.v
-	}
-	v := grokClientVersion
-	if exe := GrokExecutable(); exe != "" {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		if out, err := proc.ProbeContext(ctx, exe, "--version").Output(); err == nil { // "grok 1.0.41 (4220f3b224a6)"
-			if c := grokSemver.FindString(string(out)); c != "" && compareClaudeVersion(c, v) > 0 {
-				v = c
-			}
-		}
-		cancel()
-	}
-	grokVersionCache.v, grokVersionCache.at = v, time.Now()
-	return v
-}
-
-// grokModels lists what the account can use, with each model's context
-// window and efforts, as the CLI's backend lists them.
-func grokModels(ctx context.Context, sign func(context.Context, *http.Request, []byte) error) ([]catalog.Model, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, GrokBase+"/models", nil)
-	if err != nil {
-		return nil, err
-	}
-	if err := sign(ctx, req, nil); err != nil {
-		return nil, err
-	}
-	res, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer res.Body.Close()
-	b, _ := io.ReadAll(io.LimitReader(res.Body, 4<<20))
-	if res.StatusCode != http.StatusOK {
-		return nil, errorf("Grok models: %s", APIError(b, res.Status))
-	}
-	ms := parseGrokModels(b)
-	if len(ms) == 0 {
-		return nil, errorf("Grok listed no models")
-	}
-	return ms, nil
-}
-
-func parseGrokModels(b []byte) []catalog.Model {
-	var v struct {
-		Data []struct {
-			ID      string `json:"id"`
-			Name    string `json:"name"`
-			Context int    `json:"context_window"`
-			Backend string `json:"api_backend"`
-			Efforts []struct {
-				Value string `json:"value"`
-			} `json:"reasoning_efforts"`
-		} `json:"data"`
-	}
-	if json.Unmarshal(b, &v) != nil {
-		return nil
-	}
-	var ms []catalog.Model
-	for _, d := range v.Data {
-		if d.ID == "" || (d.Backend != "" && d.Backend != "responses") {
-			continue
-		}
-		m := catalog.Model{ID: d.ID, Name: d.Name, Context: d.Context, Images: true, APIs: []string{"responses"}}
-		if m.Name == "" {
-			m.Name = d.ID
-		}
-		// listed hardest first; kept easiest first, as the others are
-		for i := len(d.Efforts) - 1; i >= 0; i-- {
-			if e := d.Efforts[i].Value; e != "" {
-				m.Efforts = append(m.Efforts, e)
-			}
-		}
-		ms = append(ms, m)
-	}
-	return ms
-}
-
-// grokRefreshMargin is how close to its expiry a borrowed token has the CLI
-// refresh it first.
-const grokRefreshMargin = 5 * time.Minute
-
-var grokRefresh sync.Mutex
-
-// grokAccessToken is the CLI's sign-in, with a token still good. One about
-// to expire is first refreshed by the CLI in its own home: a `grok models`
-// there renews it the way any use of the CLI does; so is one a run has
-// found expired.
-func grokAccessToken(home, binary string, expired bool) (grokCredential, error) {
-	c, ok := readGrokCredential(home)
-	if ok && (expired || time.Until(c.ExpiresAt) < grokRefreshMargin) && binary != "" {
-		grokRefresh.Lock()
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		cmd := proc.CommandContext(ctx, binary, "models")
-		cmd.Dir = filepath.Dir(home)
-		cmd.Env = netproxy.Env(grokOwnEnv(os.Environ(), home))
-		_ = cmd.Run()
-		cancel()
-		grokRefresh.Unlock()
-		c, ok = readGrokCredential(home)
-	}
-	if !ok {
-		return c, errorf("Grok is not signed in; run `grok login`")
-	}
-	if !c.ExpiresAt.IsZero() && time.Until(c.ExpiresAt) <= 0 {
-		return c, errorf("Grok's sign-in has expired; run `grok login`")
-	}
-	return c, nil
-}
-
-// grokOwnEnv runs the CLI as the user runs it, in its own home.
-func grokOwnEnv(env []string, home string) []string {
-	out := make([]string, 0, len(env)+1)
-	for _, e := range env {
-		k, _, _ := strings.Cut(e, "=")
-		switch strings.ToUpper(k) {
-		case "GROK_HOME", "GROK_AUTH_PROVIDER_COMMAND", "GROK_AUTH_EXPIRED":
-			continue
-		}
-		out = append(out, e)
-	}
-	return append(out, "GROK_HOME="+home)
-}
-
-// startGrokSignIn runs `grok login` with its device code, hands its link to
-// the window, and finishes when the CLI says the account is in. With the
-// CLI signed in already, a further account signs in in a home of magpie's,
-// so the CLI's own sign-in stays as it is.
-func startGrokSignIn(s *signInFlow) error {
-	path := GrokExecutable()
-	if path == "" {
-		c, _ := cliFor("grok")
-		manual := c.sh
-		if runtime.GOOS == "windows" {
-			manual = c.ps
-		}
-		return errorf("install Grok Build first: %s", manual)
-	}
-	if _, ok := readGrokCredential(GrokHome()); !ok {
-		return runCLISignIn(s, "grok login", nil, true, nil, func() (string, string, bool) {
-			c, ok := readGrokCredential(GrokHome())
-			return c.Email, "", ok
-		}, nil, path, "login", "--device-auth")
-	}
-	home, err := newGrokHome()
-	if err != nil {
-		return err
-	}
-	err = runCLISignIn(s, "grok login", grokOwnEnv(os.Environ(), home), false, func() { removeGrokHome(home) }, func() (string, string, bool) {
-		user, err := addGrokLogin(home)
-		return user, "", err == nil
-	}, nil, path, "login", "--device-auth")
-	if err != nil {
-		removeGrokHome(home)
-	}
-	return err
-}
-
-// agentCommand runs an agent's CLI with magpie's proxy.
-func agentCommand(ctx context.Context, path string, args ...string) *exec.Cmd {
-	return withProxy(proc.CommandContext(ctx, path, args...))
-}
-
 // agentProbe is agentCommand for asking the CLI something (proc.ProbeContext).
 func agentProbe(ctx context.Context, path string, args ...string) *exec.Cmd {
 	return withProxy(proc.ProbeContext(ctx, path, args...))
@@ -686,7 +577,7 @@ func runCLISignIn(s *signInFlow, what string, env []string, using bool, failed f
 	ctx, cancel := context.WithCancel(context.Background())
 	cmd := proc.CommandContext(ctx, path, args...)
 	cmd.Dir, _ = os.UserHomeDir()
-	cmd.Env = netproxy.Env(env)
+	cmd.Env = netproxy.EnvWith(s.proxy, env)
 	out, err := cmd.StdoutPipe()
 	if err != nil {
 		cancel()
@@ -768,7 +659,16 @@ func runCLISignIn(s *signInFlow, what string, env []string, using bool, failed f
 		cancel()
 		forgetAccountCaches()
 		if err == nil {
-			if user, plan, ok := identity(); ok {
+			// a second account's identity is its keeping (addGrokLogin):
+			// not once the sign-in is canceled
+			var user, plan string
+			if s.keep(func() error {
+				var ok bool
+				if user, plan, ok = identity(); !ok {
+					return fmt.Errorf("%s finished without an account", what)
+				}
+				return nil
+			}) == nil {
 				s.finish(SignInState{State: "done", User: user, Plan: plan, Using: using})
 				return
 			}
@@ -809,18 +709,18 @@ func runCLISignIn(s *signInFlow, what string, env []string, using bool, failed f
 // it couldn't reach, not a page to open: grok 1.0.46 behind a proxy it
 // can't get through prints "Error: error sending request for url
 // (https://auth.x.ai/oauth2/device/code): …" (𝕏 on Discord).
-var failedLine = regexp.MustCompile(`(?i)\berror\b`)
+var failedLine = lazyre.New(`(?i)\berror\b`)
 
 // linkWait is how long a login command has to print its link.
 var linkWait = 30 * time.Second
 
 // linkRest is a line that is nothing but more of a link: no spaces, only
 // what a URL holds.
-var linkRest = regexp.MustCompile(`^[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+$`)
+var linkRest = lazyre.New(`^[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+$`)
 
 // queryRest is what may still follow a link that already has its challenge
 // and uuid: the rest of a value, or more params.
-var queryRest = regexp.MustCompile(`^[A-Za-z0-9\-_%&=]+$`)
+var queryRest = lazyre.New(`^[A-Za-z0-9\-_%&=]+$`)
 
 // AgentUser is who an agent is signed in to itself, as its own files say,
 // for an agent whose vendor a plugin serves too; "" when not known.
@@ -836,4 +736,64 @@ func AgentUser(agent string) string {
 func GrokUser(home string) (string, bool) {
 	c, ok := readGrokCredential(home)
 	return c.Email, ok
+}
+
+// GrokFlatBody is a Responses body with Codex's namespaced functions flat
+// (namespace__name) and every function's parameters an object at the root,
+// the two things Grok's backend turns a request away over wherever it is
+// served (Copilot's grok-4.7, #4374), and nothing else: tool types, reasoning
+// and the rest go as they came. The model's call to a flat name is given its
+// namespace back by the gateway (namespacedIn).
+func GrokFlatBody(body []byte) []byte {
+	if !bytes.Contains(body, []byte(`"namespace"`)) && !bytes.Contains(body, []byte(`"anyOf"`)) && !bytes.Contains(body, []byte(`"oneOf"`)) && !bytes.Contains(body, []byte(`"allOf"`)) {
+		return body
+	}
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.UseNumber()
+	var m map[string]any
+	if dec.Decode(&m) != nil || m == nil {
+		return body
+	}
+	dirty := false
+	if tools, ok := m["tools"].([]any); ok {
+		var out []any
+		for _, t := range tools {
+			tm, _ := t.(map[string]any)
+			switch {
+			case tm != nil && tm["type"] == "namespace":
+				dirty = true
+				for _, f := range grokFlat(tm) {
+					if fm, ok := f.(map[string]any); ok {
+						objectRoot(fm)
+					}
+					out = append(out, f)
+				}
+			case tm != nil && tm["type"] == "function":
+				if objectRoot(tm) {
+					dirty = true
+				}
+				out = append(out, t)
+			default:
+				out = append(out, t)
+			}
+		}
+		m["tools"] = out
+	}
+	if tc, ok := m["tool_choice"].(map[string]any); ok && flatCall(tc) {
+		dirty = true
+	}
+	input, _ := m["input"].([]any)
+	for _, it := range input {
+		if im, ok := it.(map[string]any); ok && flatCall(im) {
+			dirty = true
+		}
+	}
+	if !dirty {
+		return body
+	}
+	b, err := json.Marshal(m)
+	if err != nil {
+		return body
+	}
+	return b
 }

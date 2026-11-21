@@ -60,6 +60,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await browser.close();
       });
       page.setDefaultTimeout(5000);
+      page.setDefaultNavigationTimeout(60000);
       const errors = [];
       page.on("pageerror", (e) => errors.push(e.message));
       const posts = [];
@@ -86,6 +87,14 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await box.fill("another-model");
       await box.press("Enter");
       assert.deepEqual(await on(), ["another-model", "gpt-5", "my-own-model"]);
+      // a space inside one id is kept, not split into two models
+      await box.fill("Opus 5.5");
+      await box.press("Enter");
+      assert.deepEqual(await on(), ["Opus 5.5", "another-model", "gpt-5", "my-own-model"]);
+      // comma-separated still adds several at once
+      await box.fill("id-one, id-two");
+      await box.press("Enter");
+      assert.deepEqual(await on(), ["Opus 5.5", "another-model", "gpt-5", "id-one", "id-two", "my-own-model"]);
 
       // Built-in icons: the presets' and the others, every one drawn
       await editor.locator(".icon-pick").getByRole("button", { name: w.icons, exact: true }).click();
@@ -116,7 +125,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       for (let i = 0; i < 100 && !posts.some((p) => p.path === "/api/provider/save"); i++) await page.waitForTimeout(30);
       const saved = posts.find((p) => p.path === "/api/provider/save");
       assert(saved, "nothing saved");
-      assert.deepEqual([...saved.body.models].sort(), ["another-model", "gpt-5", "my-own-model"]);
+      assert.deepEqual([...saved.body.models].sort(), ["Opus 5.5", "another-model", "gpt-5", "id-one", "id-two", "my-own-model"]);
       assert.equal(saved.body.icon, "huggingface-color");
 
       const missing = await page.evaluate(() => ["Add model", "Add a model the list doesn't have, by its id (several: comma separated)", "Find an icon…"].filter((k) => !I18N.zh[k]));

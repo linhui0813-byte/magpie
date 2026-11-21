@@ -8,11 +8,12 @@ const { test } = require("node:test");
 const { chromium, webkit } = require("playwright");
 
 const assets = path.resolve(__dirname, "../assets");
+// Eight agents' tabs fit the 1200px a wide window's page keeps to (面条 on
+// Discord); ten gave way to the menu there too.
 const agents = [
   ["qodercn", "Qoder CN", "qoder", 426], ["qoder", "Qoder", "qoder", 102],
   ["pi", "Pi", "pi", 89], ["claude", "Claude Code", "claudecode-color", 83],
-  ["deepseek", "DeepSeek Harness", "deepseek-color", 70], ["codex", "Codex", "codex-color", 37],
-  ["workbuddy", "WorkBuddy", "workbuddy-color", 24], ["opencode", "OpenCode", "opencode", 11],
+  ["codex", "Codex", "codex-color", 37], ["opencode", "OpenCode", "opencode", 11],
   ["zcode", "ZCode", "zcode", 10], ["grokbuild", "Grok Build", "xai", 3],
 ].map(([agent, name, icon, count]) => ({ agent, name, icon, count, deletable: true }));
 
@@ -54,6 +55,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         const page = await context.newPage();
         // The fixture renders hundreds of sessions, also on Windows WebKit.
         page.setDefaultTimeout(10000);
+        page.setDefaultNavigationTimeout(60000);
         const errors = [];
         page.on("pageerror", (e) => errors.push(e.message));
         await page.route("**/*", serve(lang, theme));
@@ -69,9 +71,10 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         assert.equal(await picker.locator("em").textContent(), "426");
         const filter = view.locator(".sm-filter");
         await filter.fill("Fix the session toolbar");
+        await filter.press("Enter"); // typing waits for a pause; Enter filters at once
         assert.equal(await view.locator(".row.sm-sess").count(), 1, "search still filters the current agent's sessions");
         await filter.press("Escape");
-        assert.equal(await view.locator(".row.sm-sess").count(), 426, "Escape clears the session search");
+        assert.equal(await view.locator(".row.sm-sess").count(), 100, "Escape clears the session search, back to the folder's first page");
         await filter.evaluate((e) => e.blur());
         for (const width of [1800, 900, 660, 320]) {
           await page.setViewportSize({ width, height: 560 });
@@ -94,7 +97,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
             assert(await tabs.isHidden(), "overflowing tabs give way to the menu");
             assert(await picker.isVisible());
           }
-          const boxes = await view.locator(".sm-switch, .sm-filter, .sm-trash-btn").evaluateAll((els) => els.map((e) => {
+          const boxes = await view.locator(".sm-switch, .sm-filter, .sm-trash-btn, .sm-toset").evaluateAll((els) => els.map((e) => {
             const b = e.getBoundingClientRect();
             return { name: e.className, left: b.left, right: b.right, top: b.top, bottom: b.bottom, width: b.width };
           }));
@@ -114,6 +117,14 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await menu.waitFor();
         await menu.evaluate((e) => Promise.all(e.getAnimations().map((a) => a.finished.catch(() => {}))));
         assert.equal(await menu.getByRole("menuitemradio").count(), agents.length);
+        // each agent in the menu shows its icon, as the picker does, level with its name
+        const marks = await menu.locator(".pm-item").evaluateAll((items) => items.map((b) => {
+          const ic = b.querySelector(":scope > .ic"), n = b.querySelector(".pm-name");
+          const i = ic?.getBoundingClientRect(), r = n.getBoundingClientRect();
+          return { icon: ic?.dataset.icon, w: i?.width, mid: i ? Math.abs(i.top + i.height / 2 - (r.top + r.height / 2)) : 99, before: i ? i.right <= r.left : false };
+        }));
+        assert.deepEqual(marks.map((m) => m.icon), agents.map((a) => a.icon), "every agent in the menu has its icon");
+        assert(marks.every((m) => m.w === 16 && m.mid <= 1 && m.before), `icons sit 16px wide, level with and before the name: ${JSON.stringify(marks)}`);
         assert.equal(await picker.getAttribute("aria-expanded"), "true");
         const mb = await menu.boundingBox();
         assert(mb.x >= 0 && mb.x + mb.width <= 320, "the open menu fits a narrow window");

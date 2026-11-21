@@ -77,3 +77,42 @@ func TestVersionRunsOnce(t *testing.T) {
 		t.Fatalf("npm CLI: %q, run %d times", v, asked)
 	}
 }
+
+// npm on Windows installs cline as a cline.cmd shim beside node_modules,
+// not a link into it. Its version is read from the package the shim names,
+// so Cline isn't started, and so never gets to schedule its own npm install
+// -g cline@latest (新v学员 on Discord).
+func TestVersionReadsAnNpmShim(t *testing.T) {
+	old := runVersion
+	t.Cleanup(func() { runVersion = old })
+	asked := 0
+	runVersion = func(string) (string, error) { asked++; return "", nil }
+	for _, c := range []struct{ name, shim, pkg, want string }{
+		{"cline.cmd", "@ECHO off\r\nGOTO start\r\n:find_dp0\r\nSET dp0=%~dp0\r\nEXIT /b\r\n:start\r\nSETLOCAL\r\nCALL :find_dp0\r\n\r\nIF EXIST \"%dp0%\\node.exe\" (\r\n  SET \"_prog=%dp0%\\node.exe\"\r\n) ELSE (\r\n  SET \"_prog=node\"\r\n)\r\n\r\nendLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & \"%_prog%\"  \"%dp0%\\node_modules\\cline\\bin\\cline\" %*\r\n", "cline", "3.0.71"},
+		{"cline", "#!/bin/sh\nbasedir=$(dirname \"$(echo \"$0\" | sed -e 's,\\\\,/,g')\")\nexec node  \"$basedir/node_modules/cline/bin/cline\" \"$@\"\n", "cline", "3.0.70"},
+		{"codex.ps1", "#!/usr/bin/env pwsh\n$basedir=Split-Path $MyInvocation.MyCommand.Definition -Parent\n& \"node$exe\"  \"$basedir/node_modules/@openai/codex/bin/codex.js\" $args\n", "@openai/codex", "0.162.0"},
+	} {
+		dir := t.TempDir()
+		pkg := filepath.Join(dir, "node_modules", filepath.FromSlash(c.pkg))
+		os.MkdirAll(pkg, 0o755)
+		os.WriteFile(filepath.Join(pkg, "package.json"), []byte(`{"name":"`+c.pkg+`","version":"`+c.want+`"}`), 0o644)
+		bin := filepath.Join(dir, c.name)
+		os.WriteFile(bin, []byte(c.shim), 0o755)
+		if v := Version(bin); v != c.want || asked != 0 {
+			t.Fatalf("%s: %q, run %d times", c.name, v, asked)
+		}
+	}
+}
+
+// A CLI asked its version is told not to update itself: Cline checks on
+// every start, --version too.
+func TestVersionRunTellsClineNotToUpdate(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell scripts")
+	}
+	bin := filepath.Join(t.TempDir(), "cline")
+	testenv.Program(t, bin, "#!/bin/sh\necho \"cline ${CLINE_NO_AUTO_UPDATE:-updates}\"\n")
+	if v := Version(bin); v != "cline 1" {
+		t.Fatalf("got %q", v)
+	}
+}

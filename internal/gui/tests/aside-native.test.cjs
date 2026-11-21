@@ -21,7 +21,7 @@ for (const engine of ['chromium', 'webkit']) {
           { key: 'image', label: 'image', value: 'magpie/art/gpt-image-1', options: [{ value: 'magpie/art/gpt-image-1', ref: 'art/gpt-image-1', label: 'GPT image' }] },
         ],
       };
-      const state = () => ({ agents: [a], profiles: [], settings: { lang, theme: 'light' } });
+      const state = () => ({ agents: [a], profiles: [], settings: { lang, theme: 'light', guideHidden: true } });
       await page.route('**/*', async (route) => {
         const req = route.request(), url = new URL(req.url()), p = url.pathname;
         if (req.method() === 'POST') posts.push(p);
@@ -70,17 +70,18 @@ for (const engine of ['chromium', 'webkit']) {
       t.after(() => browser.close());
       const page = await browser.newPage({ viewport: { width: 980, height: 760 } });
       page.setDefaultTimeout(5000);
+      page.setDefaultNavigationTimeout(60000);
       const posts = [], errors = [];
       page.on('pageerror', e => errors.push(e.message));
       let failure = { error: 'Aside settings could not be read', code: 'runtime_unavailable', offline: 'stage' };
       let revision = 'confirmed-plan';
       let failPreview = false, releasePreview = null, blockPreview = false;
       const a = {
-        id: 'aside', name: 'Aside', icon: 'aside', wired: true, cliMissing: true, path: '~/.aside/u/0/settings.json',
+        id: 'aside', name: 'Aside', icon: 'aside', wired: true, path: '~/.aside/u/0/settings.json',
         native: { provider: 'connected', runtime: 'applied', fields: {} },
         fields: [{ key: 'model', label: 'model', value: 'native/current', options: [{ value: 'native/current', label: 'Current model' }, { value: 'magpie/relay/m1', ref: 'relay/m1', label: 'New model' }] }],
       };
-      const current = () => ({ agents: [a], profiles: [], settings: { lang, theme: 'light' } });
+      const current = () => ({ agents: [a], profiles: [], settings: { lang, theme: 'light', guideHidden: true } });
       await page.route('**/*', async route => {
         const req = route.request(), p = new URL(req.url()).pathname;
         if (req.method() === 'POST') posts.push({ path: p, body: req.postDataJSON() });

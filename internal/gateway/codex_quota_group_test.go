@@ -207,7 +207,8 @@ func TestCodexSpentGrokFailingIsTold(t *testing.T) {
 		if rec.Code != 503 || !strings.Contains(body, "upstream busy") || strings.Contains(strings.ToLower(body), "usage limit") {
 			t.Fatalf("%d: %s (codex %v, grok %d)", rec.Code, body, tried, grok.n)
 		}
-		if r := lastRoute(s); r.Tries[len(r.Tries)-1].ID != "codex" || r.Tries[len(r.Tries)-1].Fail != failQuota {
+		// the Routing page tells the agent got another's error, not this one's (#2281)
+		if r := lastRoute(s); r.Tries[len(r.Tries)-1].ID != "codex" || r.Tries[len(r.Tries)-1].Fail != failQuota || !r.Tries[len(r.Tries)-1].Earlier {
 			t.Fatalf("tries: %+v", r.Tries)
 		}
 	})

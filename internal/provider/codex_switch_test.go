@@ -60,8 +60,45 @@ func TestCodexSwitchedWhenUsedUp(t *testing.T) {
 	if err := SetLoginOn("codex", "spare@example.com", true); err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() {
+		codexApp.Lock()
+		codexApp.switched, codexApp.spent = false, false
+		codexApp.Unlock()
+	})
+	// the sign-ins above were the user's switches, as if taken already
+	codexApp.Lock()
+	codexApp.switched, codexApp.spent, codexApp.auto = false, false, false
+	codexApp.Unlock()
 	if to := switched(); to != "spare@example.com" {
 		t.Fatalf("switched to %q", to)
+	}
+	// the Codex app's app-server is restarted past a turn left stuck on
+	// the account used up (TestCodexAppServerRestartedPastATurnStuckOnTheSpentAccount)
+	codexApp.Lock()
+	spent := codexApp.spent
+	codexApp.Unlock()
+	if !spent {
+		t.Fatal("the switch off a used-up account isn't marked spent for the Codex app")
+	}
+	// it is magpie's own: the Codex app is left running unless the user
+	// asked magpie to restart it (RestartApp; atom0964 on Discord)
+	codexApp.Lock()
+	auto := codexApp.auto
+	codexApp.Unlock()
+	if !auto {
+		t.Fatal("magpie's own switch is counted the user's: the Codex app would be restarted for it")
+	}
+	if codexRestartsApp() {
+		t.Fatal("the Codex app is restarted for magpie's own switches with RestartApp never set")
+	}
+	if err := SetRestartApp("codex", true); err != nil {
+		t.Fatal(err)
+	}
+	if !codexRestartsApp() {
+		t.Fatal("RestartApp set, and still not read")
+	}
+	if err := SetRestartApp("codex", false); err != nil {
+		t.Fatal(err)
 	}
 	var live codexAuth
 	readJSON(filepath.Join(home, ".codex", "auth.json"), &live)
@@ -170,4 +207,69 @@ func mustJSONRaw(t *testing.T, v any) json.RawMessage {
 		t.Fatal(err)
 	}
 	return b
+}
+
+// An account the Codex app holds is spent whatever its windows read: a
+// Business seat at its workspace owner's limit reads 40% and isn't
+// allowed, and the app says "You're out of Codex usage" and sends nothing
+// for it. Codex on it is signed in to the next account with room, and
+// never to another the app holds (CavillZhang on X: "有的切换不了").
+func TestCodexHeldAccountSwitchedUnderTheShare(t *testing.T) {
+	home := signIn(t) // me@example.com, acct-1
+	rememberLogins(true)
+	codexSignIn(t, home, "spare@example.com", "r-spare")
+	rememberLogins(true)
+	codexSignIn(t, home, "work@example.com", "r-work")
+	rememberLogins(true)
+	held := map[string]bool{"acct-1": true, "acct-spare@example.com": true, "acct-work@example.com": true}
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		allowed := !held[r.Header.Get("chatgpt-account-id")]
+		why := map[string]any{"type": "workspace_owner_usage_limit_reached"}
+		if allowed {
+			why = nil
+		}
+		json.NewEncoder(w).Encode(map[string]any{"plan_type": "business",
+			"credits":                 map[string]any{"has_credits": false, "unlimited": false, "overage_limit_reached": false},
+			"rate_limit_reached_type": why,
+			"rate_limit": map[string]any{"allowed": allowed, "limit_reached": !allowed,
+				"primary_window": map[string]any{"used_percent": 40, "limit_window_seconds": 18000}}})
+	}))
+	defer fake.Close()
+	old := CodexBase
+	CodexBase = fake.URL + "/backend-api/codex"
+	t.Cleanup(func() { CodexBase = old })
+	switched := func() string {
+		t.Helper()
+		loginUsageCache.Lock()
+		loginUsageCache.m = nil
+		loginUsageCache.Unlock()
+		to, err := SwitchWhenSpent(context.Background(), "codex")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return to
+	}
+	for _, u := range []string{"spare@example.com", "work@example.com"} {
+		if err := SetLoginOn("codex", u, true); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Codex is on work@; every other account held too: nothing to go to
+	if to := switched(); to != "" {
+		t.Fatalf("switched to %s, held as well", to)
+	}
+	// one with room: that one, though the held one it is on reads 40%
+	held["acct-spare@example.com"] = false
+	if to := switched(); to != "spare@example.com" {
+		t.Fatalf("switched to %q, want spare@example.com", to)
+	}
+	// and not back to the one it left while the app still holds it
+	if to := switched(); to != "" {
+		t.Fatalf("switched again, to %s", to)
+	}
+	// once that has room again, back to it
+	held["acct-work@example.com"] = false
+	if to := switched(); to != "work@example.com" {
+		t.Fatalf("switched to %q, want back to work@example.com", to)
+	}
 }

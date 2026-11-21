@@ -1,85 +1,18 @@
 package provider
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
-	"net/http"
-	"net/http/httptest"
+	"maps"
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/yetone/magpie/internal/testenv"
 )
-
-func TestParseGrokModels(t *testing.T) {
-	b := []byte(`{"object":"list","data":[
-		{"id":"grok-4.7","name":"Grok 4.7","context_window":500000,"api_backend":"responses","reasoning_efforts":[{"value":"xhigh"},{"value":"high"},{"value":"medium"},{"value":"low"}]},
-		{"id":"grok-4.7-build-fast","context_window":256000,"api_backend":"responses"},
-		{"id":"grok-old","api_backend":"chat_completions"}]}`)
-	ms := parseGrokModels(b)
-	if len(ms) != 2 || ms[0].ID != "grok-4.7" || ms[0].Name != "Grok 4.7" || ms[0].Context != 500000 ||
-		strings.Join(ms[0].Efforts, ",") != "low,medium,high,xhigh" || ms[1].Name != "grok-4.7-build-fast" || ms[1].Efforts != nil {
-		t.Fatalf("models = %+v", ms)
-	}
-}
-
-// A request is signed with the sign-in of its account's home, as the CLI
-// signs its own.
-func TestGrokSigns(t *testing.T) {
-	var got http.Header
-	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		got = r.Header.Clone()
-		w.Write([]byte(`{"data":[{"id":"grok-4.7","api_backend":"responses"}]}`))
-	}))
-	defer up.Close()
-	base := GrokBase
-	GrokBase = up.URL
-	defer func() { GrokBase = base }()
-	home := t.TempDir()
-	grokSignedIn(t, home, "me@x.ai")
-	acct := &Account{Agent: "grok"}
-	grokSigned(acct, home)
-	req, _ := http.NewRequest("POST", up.URL+"/responses", nil)
-	if err := acct.sign(context.Background(), req, []byte(`{"model":"grok-4.7","prompt_cache_key":"c1"}`)); err != nil {
-		t.Fatal(err)
-	}
-	if req.Header.Get("Authorization") != "Bearer k-me@x.ai" || req.Header.Get("x-grok-client-version") == "" ||
-		req.Header.Get("x-grok-model-override") != "grok-4.7" || req.Header.Get("x-grok-conv-id") != "c1" ||
-		!strings.HasPrefix(req.Header.Get("User-Agent"), "grok-shell/") {
-		t.Fatalf("headers = %v", req.Header)
-	}
-	ms, err := grokModels(context.Background(), acct.sign)
-	if err != nil || len(ms) != 1 || got.Get("Authorization") != "Bearer k-me@x.ai" {
-		t.Fatalf("%v %+v %v", err, ms, got)
-	}
-}
-
-func TestGrokTokenReadsTheCLIsSignIn(t *testing.T) {
-	home := t.TempDir()
-	exp := time.Now().Add(2 * time.Hour).UTC()
-	auth := map[string]any{"https://auth.x.ai::u1": map[string]any{
-		"key": "tok", "email": "me@example.com", "auth_mode": "oidc", "refresh_token": "r",
-		"expires_at": exp.Format(time.RFC3339Nano), "oidc_issuer": "https://auth.x.ai"}}
-	b, _ := json.Marshal(auth)
-	if err := os.WriteFile(filepath.Join(home, "auth.json"), b, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if u, ok := GrokUser(home); !ok || u != "me@example.com" {
-		t.Fatalf("user = %q %v", u, ok)
-	}
-	c, err := grokAccessToken(home, "", false)
-	if err != nil || c.Key != "tok" {
-		t.Fatalf("%+v %v", c, err)
-	}
-	if _, err := grokAccessToken(t.TempDir(), "", false); err == nil {
-		t.Fatal("no sign-in, yet a token")
-	}
-}
 
 // Codex's freeform apply_patch is left out: Grok's backend turns away a
 // request with a tool type it doesn't know, a namespace among them. A
@@ -156,6 +89,74 @@ func TestGrokBodyDropsLoneToolChoice(t *testing.T) {
 	same := []byte(`{"tools":[{"type":"function","name":"x"}],"tool_choice":"required","reasoning":{"effort":"low"}}`)
 	if string(grokBody(same)) != string(same) {
 		t.Fatal("a tool_choice with tools was changed")
+	}
+}
+
+// The Grok plugin is handed a lone tool_choice "none" (#3110): it reads it
+// before adding x_search, and leaves it out before Grok. Any other lone
+// tool_choice still goes, and the built-in, which is Grok's last stop,
+// sends no lone "none" either.
+func TestGrokPluginBodyKeepsLoneNone(t *testing.T) {
+	for _, in := range []string{
+		`{"model":"grok-4.7","tool_choice":"none","input":[]}`,
+		`{"model":"grok-4.7","tools":[],"tool_choice":"none","input":[]}`,
+		`{"model":"grok-4.7","tools":[{"type":"custom","name":"apply_patch"}],"tool_choice":"none","input":[]}`,
+	} {
+		if got := string(grokPluginBody([]byte(in))); !strings.Contains(got, `"tool_choice":"none"`) {
+			t.Errorf("plugin: %s\n-> %s", in, got)
+		}
+		if got := string(grokBody([]byte(in))); strings.Contains(got, "tool_choice") {
+			t.Errorf("built-in: %s\n-> %s", in, got)
+		}
+	}
+	for _, in := range []string{
+		`{"model":"grok-4.7","tool_choice":"auto","input":[]}`,
+		`{"model":"grok-4.7","tool_choice":{"type":"none"},"input":[]}`,
+	} {
+		if got := string(grokPluginBody([]byte(in))); strings.Contains(got, "tool_choice") {
+			t.Errorf("plugin: %s\n-> %s", in, got)
+		}
+	}
+}
+
+// The Grok plugin is handed a tool_choice object of a type Grok's backend
+// doesn't take (#3153), as an allowed_tools naming the client's own tools:
+// it reads it instead of adding x_search over it, and leaves it out before
+// Grok. The built-in, which is Grok's last stop, still drops it: the
+// backend turns the request away over one.
+func TestGrokPluginBodyKeepsUnsupportedToolChoice(t *testing.T) {
+	in := []byte(`{"model":"grok-4.7","tool_choice":{"type":"allowed_tools","mode":"auto","tools":[{"type":"function","name":"read_file"}]},"tools":[{"type":"function","name":"read_file"}]}`)
+	var got struct {
+		Choice struct {
+			Type  string           `json:"type"`
+			Mode  string           `json:"mode"`
+			Tools []map[string]any `json:"tools"`
+		} `json:"tool_choice"`
+		Tools []map[string]any `json:"tools"`
+	}
+	if err := json.Unmarshal(grokPluginBody(in), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Choice.Type != "allowed_tools" || got.Choice.Mode != "auto" || len(got.Choice.Tools) != 1 || got.Choice.Tools[0]["name"] != "read_file" {
+		t.Fatalf("plugin: tool_choice %+v", got.Choice)
+	}
+	if len(got.Tools) != 1 || got.Tools[0]["name"] != "read_file" {
+		t.Fatalf("plugin: tools %+v", got.Tools)
+	}
+	var builtin struct {
+		Choice struct {
+			Type string `json:"type"`
+		} `json:"tool_choice"`
+		Tools []map[string]any `json:"tools"`
+	}
+	if err := json.Unmarshal(grokBody(in), &builtin); err != nil {
+		t.Fatal(err)
+	}
+	if builtin.Choice.Type != "" {
+		t.Fatalf("built-in: tool_choice %+v", builtin.Choice)
+	}
+	if len(builtin.Tools) != 1 || builtin.Tools[0]["name"] != "read_file" {
+		t.Fatalf("built-in: tools %+v", builtin.Tools)
 	}
 }
 
@@ -264,6 +265,34 @@ func TestGrokExecutableFinds(t *testing.T) {
 // object branches' properties are merged, $refs to $defs read, a field all
 // of them require stays required, the non-object branches go. One that is
 // an object already is left as it is.
+// TestObjectRootKeepsOwnRequired: the root's and allOf's own required
+// fields stay required beside anyOf's and oneOf's branches, which only add
+// the fields they all require.
+func TestObjectRootKeepsOwnRequired(t *testing.T) {
+	var ps map[string]any
+	if err := json.Unmarshal([]byte(`{
+		"type": "object",
+		"properties": {"id": {"type": "string"}},
+		"required": ["id"],
+		"allOf": [{"properties": {"kind": {"type": "string"}}, "required": ["kind"]}],
+		"anyOf": [
+			{"type": "object", "properties": {"a": {"type": "string"}, "n": {"type": "integer"}}, "required": ["a", "n"]},
+			{"type": "object", "properties": {"b": {"type": "string"}}, "required": ["b", "n", "id"]}
+		]
+	}`), &ps); err != nil {
+		t.Fatal(err)
+	}
+	if !ObjectRoot(ps) {
+		t.Fatal("not changed")
+	}
+	if got := fmt.Sprint(ps["required"]); got != "[id kind n]" {
+		t.Fatalf("required = %s", got)
+	}
+	if props := ps["properties"].(map[string]any); len(props) != 5 {
+		t.Fatalf("properties = %v", props)
+	}
+}
+
 func TestGrokBodyObjectRoot(t *testing.T) {
 	in := []byte(`{"tools":[
 		{"type":"function","name":"mcp__codex_app__automation_update","parameters":{"anyOf":[
@@ -301,5 +330,122 @@ func TestGrokBodyObjectRoot(t *testing.T) {
 	same := []byte(`{"tools":[{"type":"function","name":"x","parameters":{"type":"object","properties":{}}}]}`)
 	if string(grokBody(same)) != string(same) {
 		t.Fatal("an object root was changed")
+	}
+}
+
+// TestObjectRootNestedUnion: Codex desktop's automation_update, whose
+// parameters are zod's discriminated union on mode with the create and
+// update branches each a union on kind of their own (toJSONSchema with
+// reused: "ref", as ChatGPT.app 26.930 builds it; #1271). Folded to an
+// object root, the nested branches' fields are kept, so a model can still
+// create an automation, and a field the branches type apart (mode, kind)
+// takes any of their types, not the first branch's alone; only mode,
+// which every branch requires, stays required.
+func TestObjectRootNestedUnion(t *testing.T) {
+	b, err := os.ReadFile("testdata/codex_automation_update_schema.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ps map[string]any
+	if err := json.Unmarshal(b, &ps); err != nil {
+		t.Fatal(err)
+	}
+	if !ObjectRoot(ps) {
+		t.Fatal("not changed")
+	}
+	if ps["type"] != "object" || ps["anyOf"] != nil || ps["oneOf"] != nil {
+		t.Fatalf("root %v", ps)
+	}
+	props, _ := ps["properties"].(map[string]any)
+	for _, k := range []string{"mode", "id", "name", "prompt", "rrule", "status", "kind", "projectId", "model", "targetThreadId", "executionEnvironment"} {
+		if props[k] == nil {
+			t.Errorf("no %s among %v", k, slices.Sorted(maps.Keys(props)))
+		}
+	}
+	if got := fmt.Sprint(ps["required"]); got != "[mode]" {
+		t.Errorf("required = %s", got)
+	}
+	// every mode a branch takes can still be sent
+	mode, _ := json.Marshal(props["mode"])
+	for _, m := range []string{`"view"`, `"delete"`, `__schema11`} {
+		if !strings.Contains(string(mode), m) {
+			t.Errorf("mode %s leaves out %s", mode, m)
+		}
+	}
+	kind, _ := json.Marshal(props["kind"])
+	if !strings.Contains(string(kind), "__schema7") || !strings.Contains(string(kind), "__schema12") {
+		t.Errorf("kind %s", kind)
+	}
+}
+
+// A plain Codex agent_message, which Grok's backend refuses with 422
+// "unknown item type", goes as the user's message: its sender and
+// recipient said first, its text and images as they came, in its place
+// among the calls beside it; a request without tools too. The plugin
+// does the same (opencode-grok-auth 0.1.11, plugins#61).
+func TestGrokBodyAgentMessageGoesAsUser(t *testing.T) {
+	task := `{"type":"agent_message","author":"/root","recipient":"/root/research","content":[{"type":"input_text","text":"Message Type: NEW_TASK\nPayload:\nresearch the failure"}]}`
+	want := `{"input":[{"content":[{"text":"From /root to /root/research\n\n","type":"input_text"},{"text":"Message Type: NEW_TASK\nPayload:\nresearch the failure","type":"input_text"}],"role":"user","type":"message"}]}`
+	if got := string(grokBody([]byte(`{"input":[` + task + `]}`))); got != want {
+		t.Fatalf("task:\ngot  %s\nwant %s", got, want)
+	}
+
+	before := `{"type":"function_call","call_id":"call_1","name":"send_message","arguments":"{}"}`
+	after := `{"type":"function_call_output","call_id":"call_1","output":"sent"}`
+	reply := `{"type":"agent_message","author":"/root/research","recipient":"/root","content":[{"type":"input_text","text":"Message Type: FINAL_ANSWER\nPayload:\nfound the cause"},{"type":"input_image","image_url":"data:image/png;base64,fixture"}]}`
+	var got struct {
+		Input []map[string]any `json:"input"`
+	}
+	if err := json.Unmarshal(grokBody([]byte(`{"tools":[],"input":[`+before+`,`+reply+`,`+after+`]}`)), &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Input) != 3 || got.Input[0]["type"] != "function_call" || got.Input[2]["type"] != "function_call_output" || got.Input[2]["call_id"] != "call_1" {
+		t.Fatalf("input %v", got.Input)
+	}
+	msg, _ := json.Marshal(got.Input[1])
+	if w := `{"content":[{"text":"From /root/research to /root\n\n","type":"input_text"},{"text":"Message Type: FINAL_ANSWER\nPayload:\nfound the cause","type":"input_text"},{"image_url":"data:image/png;base64,fixture","type":"input_image"}],"role":"user","type":"message"}`; string(msg) != w {
+		t.Fatalf("reply:\ngot  %s\nwant %s", msg, w)
+	}
+
+	// one sender alone, or none, says what it has
+	for in, w := range map[string]string{
+		`{"type":"agent_message","author":"/root","content":[{"type":"input_text","text":"x"}]}`:    `[{"text":"From /root\n\n","type":"input_text"},{"text":"x","type":"input_text"}]`,
+		`{"type":"agent_message","recipient":"/root","content":[{"type":"input_text","text":"x"}]}`: `[{"text":"To /root\n\n","type":"input_text"},{"text":"x","type":"input_text"}]`,
+		`{"type":"agent_message","content":[{"type":"input_text","text":"x"}]}`:                     `[{"text":"x","type":"input_text"}]`,
+	} {
+		var g struct {
+			Input []struct {
+				Type    string          `json:"type"`
+				Content json.RawMessage `json:"content"`
+			} `json:"input"`
+		}
+		json.Unmarshal(grokBody([]byte(`{"input":[`+in+`]}`)), &g)
+		if len(g.Input) != 1 || g.Input[0].Type != "message" || string(g.Input[0].Content) != w {
+			t.Errorf("%s\n-> %+v", in, g.Input)
+		}
+	}
+}
+
+// A sealed, empty or unknown agent_message is never converted or dropped:
+// the gateway's guard for a sealed task still sees it. A history with
+// none goes byte for byte.
+func TestGrokBodyLeavesSealedAgentMessage(t *testing.T) {
+	for _, item := range []string{
+		`{"type":"agent_message","content":[{"type":"encrypted_content","encrypted_content":"sealed fixture"}]}`,
+		`{"type":"agent_message","content":[{"type":"input_text","text":"header"},{"type":"encrypted_content","encrypted_content":"sealed fixture"}]}`,
+		`{"type":"agent_message","content":[{"type":"input_text","encrypted_content":"sealed fixture"}]}`,
+		`{"type":"agent_message","encrypted_content":"sealed fixture","content":[{"type":"input_text","text":"header"}]}`,
+		`{"type":"agent_message","content":[{"type":"future_content","payload":"keep me"}]}`,
+		`{"type":"agent_message","content":[]}`,
+		`{"type":"agent_message","content":null}`,
+	} {
+		body := `{"input":[` + item + `]}`
+		if got := string(grokBody([]byte(body))); got != body {
+			t.Errorf("%s\n-> %s", body, got)
+		}
+	}
+	same := `{ "input": [{"type":"message","role":"user","content":"hello"}] }`
+	if got := string(grokBody([]byte(same))); got != same {
+		t.Fatalf("an ordinary history was changed: %s", got)
 	}
 }

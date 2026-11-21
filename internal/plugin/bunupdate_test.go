@@ -11,7 +11,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -19,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yetone/magpie/internal/stall"
 	"github.com/yetone/magpie/internal/testenv"
 )
 
@@ -67,8 +67,8 @@ func bunReleases(t *testing.T, exe []byte) *atomic.Int32 {
 	return &asked
 }
 
-// bunHome gives the test its own magpie folders, no $MAGPIE_BUN, and Bun's
-// newest release as given.
+// bunHome gives the test its own magpie folders, no $MAGPIE_BUN, no Bun
+// on PATH taken, and Bun's newest release as given.
 func bunHome(t *testing.T, latest string, published time.Time) {
 	t.Helper()
 	dir := t.TempDir()
@@ -81,6 +81,10 @@ func bunHome(t *testing.T, latest string, published time.Time) {
 	old := bunLatest
 	bunLatest = func(context.Context) (string, time.Time, error) { return latest, published, nil }
 	t.Cleanup(func() { bunLatest = old })
+	// nor a Bun on the machine's PATH to fall back on
+	oldPath := pathBuns
+	pathBuns = func() []string { return nil }
+	t.Cleanup(func() { pathBuns = oldPath })
 }
 
 func stubTry(t *testing.T, f func(exe, v string) error) {
@@ -97,7 +101,10 @@ func TestBunDefaultSums(t *testing.T) {
 		"bun-darwin-x64",
 		"bun-linux-aarch64",
 		"bun-linux-x64-baseline",
+		"bun-linux-aarch64-musl",
+		"bun-linux-x64-musl-baseline",
 		"bun-windows-x64-baseline",
+		"bun-windows-aarch64",
 		"bun-linux-aarch64-android",
 		"bun-linux-x64-android-baseline",
 	} {
@@ -114,6 +121,15 @@ func TestBunDefaultSums(t *testing.T) {
 	}
 }
 
+// The tests' oldest Bun (testenv.Bun skips an older one on PATH) is the
+// oldest magpie runs plugins on. testenv can't import this package, whose
+// own tests use it, so it keeps a copy (#1600).
+func TestMinBunIsBunVersion(t *testing.T) {
+	if testenv.MinBun != BunVersion {
+		t.Fatalf("testenv.MinBun is %s, BunVersion %s: change both", testenv.MinBun, BunVersion)
+	}
+}
+
 func TestBunTarget(t *testing.T) {
 	want := map[string]string{
 		"darwin/arm64":  "bun-darwin-aarch64",
@@ -121,6 +137,7 @@ func TestBunTarget(t *testing.T) {
 		"linux/arm64":   "bun-linux-aarch64",
 		"linux/amd64":   "bun-linux-x64-baseline",
 		"windows/amd64": "bun-windows-x64-baseline",
+		"windows/arm64": "bun-windows-aarch64",
 		"android/arm64": "bun-linux-aarch64-android",
 		"android/amd64": "bun-linux-x64-android-baseline",
 	}[runtime.GOOS+"/"+runtime.GOARCH]
@@ -133,6 +150,28 @@ func TestBunTarget(t *testing.T) {
 	}
 	if err != nil || got != want {
 		t.Fatalf("bunTarget = %q, %v; want %q", got, err, want)
+	}
+}
+
+// Windows on ARM downloads Bun's native bun-windows-aarch64 build, with
+// the checksum magpie carries for it, and runs plugins on it: it was
+// turned away as having no build (#2183, EdwinDigital).
+func TestWindowsOnArmGetsNativeBun(t *testing.T) {
+	bunHome(t, BunVersion, time.Now())
+	stubPlatform(t, "windows", "arm64", false)
+	if got, err := bunTarget(); err != nil || got != "bun-windows-aarch64" {
+		t.Fatalf("bunTarget = %q, %v; want bun-windows-aarch64", got, err)
+	}
+	if got := bunChecksum(BunVersion, "bun-windows-aarch64"); got != "a7a16b876a305fd1029c66dbd27007b4f6112ae896532f675878731a21e50cfd" {
+		t.Fatalf("bun-windows-aarch64 checksum = %q, not Bun %s's SHASUMS256.txt", got, BunVersion)
+	}
+	asked := bunReleases(t, []byte("windows arm64 build"))
+	exe, err := Bun(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(exe); string(b) != "windows arm64 build" || asked.Load() != 1 {
+		t.Fatalf("Bun = %s holding %q after %d downloads", exe, b, asked.Load())
 	}
 }
 
@@ -211,10 +250,7 @@ func TestCheckBunSetsAsideOneThatFailsItsTry(t *testing.T) {
 
 // The real try: the Bun on PATH passes it, as its own version.
 func TestTryBunOnRealBun(t *testing.T) {
-	bun, err := exec.LookPath("bun")
-	if err != nil {
-		t.Skip("no bun on PATH")
-	}
+	bun := testenv.Bun(t)
 	v := bunReported(bun)
 	if err := tryBun(context.Background(), bun, v); err != nil {
 		t.Fatalf("bun %s: %v", v, err)
@@ -230,10 +266,7 @@ func TestHostFallsBackWhenTheNewBunDies(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("the dying bun is a shell script")
 	}
-	bun, err := exec.LookPath("bun")
-	if err != nil {
-		t.Skip("no bun on PATH")
-	}
+	bun := testenv.Bun(t)
 	bunHome(t, "9.9.9", time.Now().Add(-72*time.Hour))
 	t.Cleanup(Settle)
 	if err := os.MkdirAll(bunDirOf(BunVersion), 0o755); err != nil {
@@ -316,5 +349,26 @@ func TestDownloadBunDefaultSkipsOfficialSums(t *testing.T) {
 	}
 	if zipAsked.Load() != 1 {
 		t.Fatalf("zip asked %d times", zipAsked.Load())
+	}
+}
+
+// Bun's download has no bound on the whole (#5572); a server that goes
+// silent part way is ended by the stall, said as one.
+func TestBunDownloadThatGoesSilentIsAStall(t *testing.T) {
+	old := downloadStall
+	downloadStall = 100 * time.Millisecond
+	t.Cleanup(func() { downloadStall = old })
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "1000")
+		w.Write([]byte("PK"))
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	_, err := getURL(ctx, srv.URL+"/bun.zip", 1<<20)
+	if !errors.Is(err, stall.ErrStalled) || ctx.Err() != nil {
+		t.Fatalf("err = %v, want a stall", err)
 	}
 }

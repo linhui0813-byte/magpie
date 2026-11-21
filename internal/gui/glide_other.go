@@ -18,8 +18,7 @@ func (h *host) glidePanel(height int, g Glide) bool {
 	go stepGlide(g, from, height, func() bool { return h.glides.Load() == gen }, func(v int) {
 		application.InvokeSync(func() {
 			if h.panel == w { // not let go meanwhile (lightweight mode)
-				w.SetSize(h.panelW(), v)
-				_ = h.tray.PositionWindow(w, 6)
+				h.sizeOpenPanel(w, h.panelW(), v)
 			}
 		})
 	})
@@ -28,7 +27,3 @@ func (h *host) glidePanel(height int, g Glide) bool {
 
 // TintPanel: the page paints the panel's tint itself here.
 func (h *host) TintPanel(c [4]uint8, ms int) bool { return false }
-
-// setPageZoom zooms w's page to z, as a browser zooms (WebView2's zoom
-// factor, WebKitGTK's zoom level): the text size.
-func setPageZoom(w *application.WebviewWindow, z float64) { w.SetZoom(z) }

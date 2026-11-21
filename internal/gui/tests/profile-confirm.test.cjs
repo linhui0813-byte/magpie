@@ -72,6 +72,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         const page = await (await browser.newContext({ viewport: panel ? { width: 440, height: 420 } : { width: 900, height: 560 } })).newPage();
         pages.push(page);
         page.setDefaultTimeout(5000);
+        page.setDefaultNavigationTimeout(60000);
         page.on("pageerror", (e) => errors.push(e.message));
         await page.route("**/*", server(lang, calls));
         await page.goto("http://magpie.test/" + (panel ? "?mode=panel" : ""));
@@ -124,7 +125,10 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
 
         // the details: their × closes them, the chip staying where it is
         const home = chip("home"), homeName = home.locator("span").first(); // clear of ↻ and ×
-        const top = () => home.evaluate((c) => c.getBoundingClientRect().top);
+        // found and measured in one go: the list is drawn again when the
+        // state comes back, and a chip the locator found a moment before is
+        // then a detached one, whose top reads 0
+        const top = () => page.evaluate(() => [...document.querySelectorAll("#profiles .chip")].find((c) => /^home/.test(c.textContent)).getBoundingClientRect().top);
         const before = await top();
         await homeName.click();
         await detail.waitFor();

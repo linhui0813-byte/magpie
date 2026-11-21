@@ -11,6 +11,7 @@ const fs = require("node:fs/promises");
 const path = require("node:path");
 const { test } = require("node:test");
 const { chromium, webkit } = require("playwright");
+const { openPart } = require("./reader.cjs");
 
 const assets = path.resolve(__dirname, "../assets");
 
@@ -71,12 +72,13 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await browser.close();
       });
       page.setDefaultTimeout(5000);
+      page.setDefaultNavigationTimeout(60000);
       const errors = [], posts = [];
       page.on("pageerror", (e) => errors.push(e.message));
       await page.route("**/*", server(lang, posts));
       await page.goto("http://magpie.test/?view=usage");
       await page.locator("#prefs").click();
-      await page.locator("#setTab-usage").click();
+      await openPart(page, "usage");
       const pill = page.locator("#trayUsagePick button");
       await pill.waitFor();
       await pill.scrollIntoViewIfNeeded();
@@ -86,7 +88,8 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await pill.click();
       const items = page.locator(".proto-menu .pm-item");
       await items.first().waitFor();
-      const rows = await items.evaluateAll((bs) => bs.map((b) => [b.querySelector(".pm-name").textContent.trim(), b.querySelector(".pm-note").textContent.trim()]));
+      // magpie's own two totals follow (#1984, tray-totals.test.cjs)
+      const rows = (await items.evaluateAll((bs) => bs.map((b) => [b.querySelector(".pm-name").textContent.trim(), b.querySelector(".pm-note").textContent.trim()]))).slice(0, -2);
       assert.deepEqual(rows, [
         [w.off, ""], ["Claude Code", w.inUse], ["Claude Code", "Max · a@b.c"], ["Claude Code", "Pro · d@e.f"], ["Codex", "Plus · x@y.z"],
       ], "the account in use before Claude's two accounts; none for Codex's one");
@@ -98,7 +101,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       // ticked when opened again
       await pill.click();
       await items.first().waitFor();
-      assert.deepEqual(await items.evaluateAll((bs) => bs.map((b) => b.getAttribute("aria-checked"))), ["false", "true", "false", "false", "false"]);
+      assert.deepEqual(await items.evaluateAll((bs) => bs.map((b) => b.getAttribute("aria-checked"))), ["false", "true", "false", "false", "false", "false", "false"]);
       await page.keyboard.press("Escape");
       await page.waitForTimeout(200);
       assert.equal(await top(), before, "no click moved the page");

@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/yetone/magpie/internal/agentenv"
@@ -67,9 +68,17 @@ func TestRefreshOneCard(t *testing.T) {
 	clear(asked)
 	mu.Unlock()
 
+	// the menu bar, showing the same cards, hears of the read at once,
+	// not at its next tick minutes later (#2357)
+	var told atomic.Int32
+	OnSubscriptionUsage(func() { told.Add(1) })
+	t.Cleanup(func() { OnSubscriptionUsage(nil) })
 	RefreshUsage(context.Background(), "relay", "Spare")
 	if got, want := cards(), "relay|main|$2.00,relay|spare|$0.20,other||$1.00"; got != want {
 		t.Fatalf("after spare's refresh %s, want %s", got, want)
+	}
+	if told.Load() == 0 {
+		t.Fatal("a card read again on its own didn't tell the menu bar")
 	}
 	if len(asked) != 1 || asked["Bearer sk-two"] != 1 {
 		t.Fatalf("asked %v, want sk-two alone", asked)

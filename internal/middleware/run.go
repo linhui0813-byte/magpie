@@ -8,25 +8,34 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Calcium-Ion/moejs"
+	"github.com/MoeForge/moejs"
+
+	"github.com/yetone/magpie/internal/gwmw"
 )
 
 func jsonMarshal(v any) ([]byte, error) { return json.Marshal(v) }
 
 // Info is what a request's hooks are told of it, in ctx.
-type Info struct {
-	Protocol string `json:"protocol"` // the agent's API: anthropic, chat, responses, gemini
-	Model    string `json:"model"`
-	Stream   bool   `json:"stream"`
-	Path     string `json:"path"`
-	Agent    string `json:"agent,omitempty"`
-}
+type Info = gwmw.Info
 
 // Reject is a request a middleware turned away (ctx.reject).
-type Reject struct {
-	Status  int
-	Message string
+type Reject = gwmw.Reject
+
+// Chain is the JS middleware as one agent middleware of the gateway's
+// middleware point (gwmw.Use, by plugins/middleware): every middleware
+// plugins.json has on, in its order.
+type Chain struct{}
+
+// Begin is Begin, nil when there is no middleware.
+func (Chain) Begin(info gwmw.Info) gwmw.Run {
+	if r := Begin(info); r != nil {
+		return r
+	}
+	return nil
 }
+
+// On counts the middleware plugins.json has on, whether or not it loads.
+func On() int { return len(middlewares()) }
 
 // Run is the middleware of one request. Each middleware's hooks run in
 // one runtime for the whole request, so they share ctx.state.
@@ -43,7 +52,7 @@ type Run struct {
 // Run does nothing.
 func Begin(info Info) *Run {
 	s := current()
-	if s == nil || len(s.list) == 0 {
+	if s == nil || !s.hooked {
 		return nil
 	}
 	b, _ := json.Marshal(info)
@@ -59,6 +68,20 @@ func (r *Run) End() {
 		if in != nil {
 			r.set.list[i].put(in)
 			r.insts[i] = nil
+		}
+	}
+}
+
+// letGo lets the runtimes drop the request's body as its hooks were
+// given it, and what they made of it: a runtime is the request's until its
+// reply has streamed, minutes on a long one, and kept a long context's
+// body alive all that time, ~10 MB a 7 MB body (#3383). ctx, and what
+// ctx.state holds, stay. Not after each onEvent: an event is small, and
+// its hooks run a thousand times a reply.
+func (r *Run) letGo() {
+	for _, in := range r.insts {
+		if in != nil {
+			in.rt.ReleaseCallData()
 		}
 	}
 }
@@ -121,6 +144,7 @@ func (r *Run) Request(body []byte) ([]byte, *Reject) {
 	if r == nil {
 		return body, nil
 	}
+	defer r.letGo()
 	for i, m := range r.set.list {
 		if !m.hasReq {
 			continue
@@ -138,6 +162,47 @@ func (r *Run) Request(body []byte) ([]byte, *Reject) {
 		}
 	}
 	return body, nil
+}
+
+// Tried runs each onProvider on body as it goes to one provider, in turn,
+// with ctx.provider saying which (gwmw.To): what one returns is the body
+// the next is given and that try is sent, and undefined leaves it as it
+// was. Another try, on another provider or the same one, starts again from
+// the body onRequest left. A hook that throws, takes too long or returns
+// null leaves it as it was; ctx.reject turns nothing away here.
+func (r *Run) Tried(body []byte, to gwmw.To) []byte {
+	if r == nil {
+		return body
+	}
+	defer r.letGo()
+	b, _ := json.Marshal(to)
+	for i, m := range r.set.list {
+		if !m.hasProv {
+			continue
+		}
+		in, ctx, err := r.acquire(i)
+		if err == nil {
+			var v moejs.Value
+			if v, err = in.rt.ParseJSON(b); err == nil {
+				realm := in.rt.Realm()
+				err = realm.SetV(ctx, realm.KeyFromGoString("provider"), v)
+			}
+		}
+		if err != nil {
+			m.fail("onProvider", err)
+			continue
+		}
+		out, err := r.apply(i, m.onProv, requestLimit, body, nil)
+		switch {
+		case errors.Is(err, errDropped):
+			m.fail("onProvider", errors.New("returned null; a request can't be dropped"))
+		case err != nil:
+			m.fail("onProvider", err)
+		case out != nil:
+			body = out
+		}
+	}
+	return body
 }
 
 var errDropped = errors.New("dropped")
@@ -267,6 +332,18 @@ func (rw *writer) Write(p []byte) (int, error) {
 	rw.buf.Write(p)
 	for {
 		b := rw.buf.Bytes()
+		// a comment between two events (": keepalive") goes on as it
+		// comes, as no onEvent sees it: held for the event after it, an
+		// agent behind a proxy heard nothing while its vendor reasoned
+		// silently, and the proxy hung up (#2402)
+		if c := commentLines(b); c > 0 {
+			_, err := rw.w.Write(b[:c])
+			rw.buf.Next(c)
+			if err != nil {
+				return len(p), err
+			}
+			continue
+		}
 		i, n := eventEnd(b)
 		if i < 0 {
 			break
@@ -348,6 +425,21 @@ func (rw *writer) event(ev []byte) error {
 	out := make([]byte, 0, len(pre)+len(data)+len(post))
 	_, err := rw.w.Write(append(append(append(out, pre...), data...), post...))
 	return err
+}
+
+// commentLines is how long the whole comment lines (": keepalive") and
+// blank lines at the start of b are: b starts where an event does, so none
+// of them is part of one.
+func commentLines(b []byte) int {
+	n := 0
+	for n < len(b) && (b[n] == ':' || b[n] == '\n' || b[n] == '\r') {
+		i := bytes.IndexByte(b[n:], '\n')
+		if i < 0 || b[n] == '\r' && i != 1 {
+			break
+		}
+		n += i + 1
+	}
+	return n
 }
 
 // eventEnd is where the first complete event in b ends, and the length of

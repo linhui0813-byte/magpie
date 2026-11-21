@@ -30,6 +30,17 @@ const row = (i, model, out, ttft) => ({
 const ROWS = [row(0, "glm-fast", 135, 600), row(1, "kimi-slow", 20, 600), row(2, "glm-fast", 135, 600)];
 ROWS.push({ ...row(3, "glm-fast", 135, 0), ttft_ms: undefined, ms: 3000 });
 for (let i = 4; i < 30; i++) ROWS.push(row(i, "glm-fast", 135, 600));
+// one whose content came in a burst (flow_ms, John on Discord: a Kimi Code
+// reply read 1,367 tok/s): its tokens over the wait tell no speed
+ROWS[4].flow_ms = 2;
+// and John's after that fix (Kimi Code: 2,237 tok/s): 550 tokens, 22 of
+// them reasoning, in 16 s from a first content at 5.2 s, the rest let go
+// over 236 ms, its text early or with the burst; then a steady 50 tok/s
+// answer after the same reasoning
+const kimi = { out: 550, reasoning: 22, ms: 16000, ttft_ms: 5200, flow_ms: 236 };
+Object.assign(ROWS[5], kimi, { first_text_ms: 5400 });
+Object.assign(ROWS[6], kimi, { first_text_ms: 15764 });
+Object.assign(ROWS[7], kimi, { out: 552, first_text_ms: 5400, flow_ms: 10600 });
 
 const FAST = { id: "glm-fast", calls: 28, input: 1, output: 3780, cache_read: 0, cache_write: 0, cost: 0.3, timed: 27, ttft_ms: 27 * 600, decode_ms: 27 * 1800, decode_out: 27 * 135 };
 const SLOW = { id: "kimi-slow", calls: 1, input: 1, output: 20, cache_read: 0, cache_write: 0, cost: 0.01, timed: 1, ttft_ms: 600, decode_ms: 2000, decode_out: 20 };
@@ -85,8 +96,8 @@ function server(lang) {
 }
 
 const L = {
-  en: { speed: "Speed", kpi: "Output speed", fast: "75 tok/s", slow: "10 tok/s", all: "72 tok/s", first: "first token in 600 ms on average", sent: "Sent", hint: "Sent, Effort and the cache are in each row's details" },
-  zh: { speed: "速度", kpi: "输出速度", fast: "75 token/秒", slow: "10 token/秒", all: "72 token/秒", first: "首字平均 600 毫秒", sent: "发送模型", hint: "窗口较窄：发送模型、推理强度和缓存在每行的详情里" },
+  en: { speed: "Speed", kpi: "Output speed", fast: "75 tok/s", slow: "10 tok/s", all: "72 tok/s", first: "first token in 600 ms on average · 28 timed replies", sent: "Sent", hint: "Sent, Effort and the cache are in each row's details" },
+  zh: { speed: "速度", kpi: "输出速度", fast: "75 token/秒", slow: "10 token/秒", all: "72 token/秒", first: "首字平均 600 毫秒 · 28 次计时", sent: "发送模型", hint: "窗口较窄：发送模型、推理强度和缓存在每行的详情里" },
 };
 
 for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium", "webkit"])) {
@@ -102,12 +113,13 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         const ctx = await browser.newContext({ viewport: { width: 975, height: 778 }, reducedMotion: "reduce" });
         const p = await ctx.newPage();
         p.setDefaultTimeout(5000);
+        p.setDefaultNavigationTimeout(60000);
         p.on("pageerror", (e) => errors.push(e.message));
         await p.route("**/*", server(lang));
         await p.goto("http://magpie.test/");
         assert(await p.evaluate(() => document.body.classList.contains("window")), "the app's window");
         await p.locator('[data-view="usage"]').first().click();
-        await p.locator("#usageTab .opt").nth(1).click();
+        await p.locator(":is(#usageTab .opt, .nav-s):visible").nth(1).click();
         await p.locator("#ledWrap .led tbody tr").first().waitFor();
         await p.waitForTimeout(300);
 
@@ -119,19 +131,23 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         assert.equal((await cell(0).textContent()).trim(), w.fast);
         assert.equal((await cell(1).textContent()).trim(), w.slow);
         assert.equal((await cell(3).textContent()).trim(), "—");
+        assert.equal((await cell(4).textContent()).trim(), "—");
+        assert.equal((await cell(5).textContent()).trim(), "—");
+        assert.equal((await cell(6).textContent()).trim(), "—");
+        assert.equal((await cell(7).textContent()).trim(), lang === "en" ? "50 tok/s" : "50 token/秒");
 
-        // the table fits the window; what it leaves out is in the details
+        // the table fits the window; what it leaves out is in the details,
+        // the first token's column (#2522) under each duration at this width
         const wrap = p.locator("#ledWrap");
         assert(await wrap.evaluate((e) => e.scrollWidth <= e.clientWidth + 1), "the table fits: " + JSON.stringify(await wrap.evaluate((e) => [e.scrollWidth, e.clientWidth])));
         assert.equal(await p.locator("#ledHScroll").isVisible(), false, "no sideways scrollbar");
         assert.equal((await p.locator("#ledTight").textContent()).trim(), w.hint);
         assert(await p.locator("#ledTight").isVisible(), "says where the columns went");
-        await reader.click(p, p.locator(".led tbody tr.led-row").nth(0).locator("td").nth(2));
-        const d = p.locator(".led tbody tr.led-detail");
+        const d = await reader.openRequest(p, p.locator(".led tbody tr.led-row").nth(0));
         const shown = await d.locator("dt").evaluateAll((dts) => dts.filter((x) => x.offsetParent).map((x) => x.textContent));
         assert(shown.includes(w.sent), "the details say what was sent: " + shown.join(", "));
         assert(shown.includes(w.speed), "and the speed: " + shown.join(", "));
-        await reader.click(p, p.locator(".led tbody tr.led-row").nth(0).locator("td").nth(2));
+        await reader.closeRequest(p);
 
         // the period's speed and its first-token time
         const kpi = p.locator("#ledKpi .blk").filter({ hasText: w.kpi });

@@ -6,6 +6,7 @@ const fs = require("node:fs/promises");
 const path = require("node:path");
 const { test } = require("node:test");
 const { chromium, webkit } = require("playwright");
+const reader = require("./reader.cjs");
 const assets = path.resolve(__dirname, "../assets");
 const now = new Date().toISOString();
 const rows = [
@@ -50,7 +51,7 @@ for (const engine of ["chromium", "webkit"]) {
         });
         await page.goto("http://magpie.test/");
         await page.locator('[data-view="usage"]').first().click();
-        await page.locator("#usageTab .opt").nth(1).click();
+        await page.locator(":is(#usageTab .opt, .nav-s):visible").nth(1).click();
         await page.locator(".led-row").first().waitFor();
         const cells = page.locator(".led-row .where");
         const localName = lang === "zh" ? "本地会话" : "Local session";
@@ -110,17 +111,27 @@ for (const engine of ["chromium", "webkit"]) {
           await page.locator(".led-wrap").screenshot({path:process.env.MAGPIE_STYLE_SHOTS+"/badges-"+theme+".png"});
           await page.setViewportSize({width:1200,height:900});
         }
-        await page.locator(".led-row").nth(2).click();
-        const detail = page.locator(".led-detail");
+        // beside the sidebar the cards above wrap and the row sits under the
+        // footer, where WebKit's click leaves it: the reader's wheel brings
+        // it up first
+        const rowTop = (await page.locator(".led-row").nth(2).boundingBox()).y;
+        await page.mouse.move(700, 400);
+        await page.mouse.wheel(0, rowTop - 400);
+        await page.waitForFunction((y) => document.querySelectorAll(".led-row")[2].getBoundingClientRect().top < y - 100, rowTop);
+        const detail = await reader.openRequest(page, page.locator(".led-row").nth(2));
         assert((await detail.textContent()).includes("relay"),"raw provider ID remains available in details");
         assert((await detail.textContent()).includes("creator@example.com"));
         assert((await detail.textContent()).includes(lang === "zh" ? "不推断供应商" : "no service provider is inferred"));
+        await reader.closeRequest(page);
         const review = page.locator(".led-row").nth(7);
         assert.equal(await review.locator("td").nth(5).textContent(),"—","an estimate must not claim a served model");
         assert.equal(await review.locator(".swap").count(),0,"price alias is not observed forwarding");
         assert((await review.locator(".price-reference").textContent()).includes("gpt-5.6-luna"));
         for (const width of [1200,440]) {
           await page.setViewportSize({width,height:900});
+          // the table is fitted to the new width on a frame after the resize
+          // (ledFit, which may cut names shorter): look once it has been
+          await page.evaluate(() => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(() => setTimeout(r, 100)))));
           const layout = await cells.nth(7).evaluate(cell => {
             const badges = [...cell.querySelectorAll(".source-badges .src")].map(n => n.getBoundingClientRect());
             const bounds = cell.getBoundingClientRect();
@@ -132,7 +143,8 @@ for (const engine of ["chromium", "webkit"]) {
         await page.setViewportSize({width:1200,height:900});
         await review.focus();
         await page.keyboard.press("Enter");
-        const officialDetail = page.locator(".led-detail").last();
+        const officialDetail = page.locator("#ledReqPane .led-detail");
+        await officialDetail.waitFor();
         assert((await officialDetail.textContent()).includes(lang === "zh" ? "官方登录" : "Official login"));
         assert((await cells.nth(7).locator(".official").getAttribute("title")).includes(lang === "zh" ? "不代表已确认这次请求" : "does not establish the route"));
         assert.deepEqual(errors,[]);

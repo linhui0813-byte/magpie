@@ -137,7 +137,7 @@ func TestGooseRunsOnMagpie(t *testing.T) {
 		t.Fatalf("%v: %s", err, readFile(file))
 	}
 	if p.Name != "magpie" || p.Engine != "openai" || p.BaseURL != gatewayV1() ||
-		p.Headers["Authorization"] != "Bearer "+gateway.Token || p.APIKeyEnv == nil || *p.APIKeyEnv != "" ||
+		p.Headers["Authorization"] != "Bearer "+gateway.TokenFor("goose") || p.APIKeyEnv == nil || *p.APIKeyEnv != "" ||
 		p.RequiresAuth == nil || *p.RequiresAuth || p.DynamicModels == nil || *p.DynamicModels || !p.Skip {
 		t.Fatalf("provider: %s", readFile(file))
 	}
@@ -180,6 +180,41 @@ func TestGooseRunsOnMagpie(t *testing.T) {
 	}
 	if f.Get() != "" {
 		t.Fatalf("model left: %q", f.Get())
+	}
+}
+
+// goose sends no User-Agent, so the key magpie hands it is the one that
+// names it (#1083, EZN7L2C3: Goose's requests showed as "your agent" on
+// Routing and "other" in Usage). A custom provider an older magpie wrote
+// with the plain key counts as drift, and a sync puts the named key in.
+func TestGooseKeyNamesGoose(t *testing.T) {
+	home := syncHome(t)
+	t.Setenv("APPDATA", filepath.Join(home, "AppData", "Roaming"))
+	a := goose(home, filepath.Join(home, ".config"))
+	if err := a.Fields[0].Set("magpie/relay/glm-4.6"); err != nil {
+		t.Fatal(err)
+	}
+	file := gooseProviderPath(a.Path)
+	want := "Bearer " + gateway.TokenFor("goose")
+	if got, _ := edit.GetJSON(file, "headers.Authorization"); got != want {
+		t.Fatalf("Authorization = %q, want %q", got, want)
+	}
+	if c := a.Check(); c != "" {
+		t.Fatalf("check: %s", c)
+	}
+
+	// the file an older magpie wrote
+	if err := edit.SetJSON(file, edit.KV{Path: "headers.Authorization", Value: "Bearer " + gateway.Token}); err != nil {
+		t.Fatal(err)
+	}
+	if a.Check() == "" {
+		t.Fatal("the plain key not noticed")
+	}
+	if err := a.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := edit.GetJSON(file, "headers.Authorization"); got != want || a.Check() != "" {
+		t.Fatalf("after sync Authorization = %q, check %q", got, a.Check())
 	}
 }
 
@@ -352,4 +387,73 @@ func TestGooseModelInEitherLayout(t *testing.T) {
 	if got := gooseUses(t, a.Path); got != "magpie/relay/glm-4.6" {
 		t.Fatalf("goose uses %q", got)
 	}
+}
+
+// What the user set on magpie's custom provider in Goose stays through every
+// sync and pick (#2030's siblings): a name, a timeout, the tool shim, a
+// header beside magpie's key. The engine, address, key and model list stay
+// magpie's.
+func TestGooseKeepsTheUsersSettings(t *testing.T) {
+	home := syncHome(t)
+	t.Setenv("APPDATA", filepath.Join(home, "AppData", "Roaming"))
+	a := goose(home, filepath.Join(home, ".config"))
+	f := a.Fields[0]
+	if err := f.Set("magpie/relay/glm-4.6"); err != nil {
+		t.Fatal(err)
+	}
+	file := gooseProviderPath(a.Path)
+	var p map[string]any
+	if err := json.Unmarshal([]byte(readFile(file)), &p); err != nil {
+		t.Fatal(err)
+	}
+	p["display_name"] = "My GW"
+	p["timeout_seconds"] = 900
+	p["toolshim"] = true
+	p["headers"].(map[string]any)["X-Mine"] = "1"
+	p["base_url"] = "http://127.0.0.1:1/v1"
+	p["models"] = []any{map[string]any{"name": "gone/old"}}
+	b, _ := json.Marshal(p)
+	os.WriteFile(file, b, 0o644)
+	if err := provider.Save(provider.Provider{ID: "deepseek", Name: "DeepSeek", Key: "k", Chat: "http://127.0.0.1:1/v1", Models: []string{"pro"}}); err != nil {
+		t.Fatal(err)
+	}
+	for range 3 {
+		if err := a.Sync(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	check := func(when string) {
+		t.Helper()
+		var got struct {
+			DisplayName string            `json:"display_name"`
+			Timeout     int               `json:"timeout_seconds"`
+			Toolshim    bool              `json:"toolshim"`
+			Headers     map[string]string `json:"headers"`
+			BaseURL     string            `json:"base_url"`
+			Engine      string            `json:"engine"`
+			Models      []struct {
+				Name string `json:"name"`
+			} `json:"models"`
+		}
+		raw := readFile(file)
+		if err := json.Unmarshal([]byte(raw), &got); err != nil {
+			t.Fatalf("%v\n%s", err, raw)
+		}
+		if got.DisplayName != "My GW" || got.Timeout != 900 || !got.Toolshim || got.Headers["X-Mine"] != "1" {
+			t.Errorf("%s: the user's settings not kept:\n%s", when, raw)
+		}
+		var ids []string
+		for _, m := range got.Models {
+			ids = append(ids, m.Name)
+		}
+		if got.BaseURL != gatewayV1() || got.Engine != "openai" || got.Headers["Authorization"] != "Bearer "+gateway.TokenFor("goose") ||
+			slices.Contains(ids, "gone/old") || !slices.Contains(ids, "deepseek/pro") {
+			t.Errorf("%s: magpie's own parts not written:\n%s", when, raw)
+		}
+	}
+	check("sync")
+	if err := f.Set("magpie/deepseek/pro"); err != nil {
+		t.Fatal(err)
+	}
+	check("pick")
 }

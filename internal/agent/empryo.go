@@ -39,7 +39,7 @@ func empryoIn(at place) *Agent { return empryoAt(at) }
 // does.
 func empryoAt(at place) *Agent {
 	gatewayV1 := at.v1
-	dir := filepath.Join(at.home, ".empryo")
+	dir := at.join(".empryo")
 	path := filepath.Join(dir, "config.json")
 	keyModel := "empryo:" + path + ":" + empryoModel
 	// keyNew marks a file magpie made, which goes again once magpie's
@@ -102,11 +102,11 @@ func empryoAt(at place) *Agent {
 		return edit.SetJSON(path, edit.KV{Path: empryoModel, Value: v})
 	}
 	return atomic(&Agent{
-		ID: "empryo", Name: "Empryo", Icon: "empryo-color", Aliases: []string{"soulforge"}, Spelled: prefixed,
+		ID: "empryo", Name: "Empryo", Icon: "empryo-color", Aliases: []string{"soulforge"}, Spelled: prefixed, NoNames: true,
 		Bin: "empryo", Dir: dir, Path: path,
 		Notice: func() string {
 			if Running(`(^|/)empryo( |$)`) {
-				return "Empryo reads its config at start-up — restart open empryo sessions to use this."
+				return noticeEmpryo.String()
 			}
 			return ""
 		},
@@ -170,8 +170,13 @@ func empryoAt(at place) *Agent {
 					_, id, _ := strings.Cut(c, "/")
 					own = append(own, Option{Value: c, Icon: modelIcon("", id)})
 				}
-				return append(group("Empryo", own), viaMagpie("empryo", magpieID+"/")...)
+				return withVia(group("Empryo", own), "empryo", magpieID+"/")
 			},
 		}},
 	}, path)
 }
+
+// what empryo says after a change (notice.go)
+var (
+	noticeEmpryo = newNotice("Empryo reads its config at start-up — restart open empryo sessions to use this.")
+)

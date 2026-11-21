@@ -24,13 +24,9 @@ func TestHostJSCancellation(t *testing.T) {
 	if err != nil {
 		t.Skip("no node on PATH")
 	}
-	for _, name := range []string{"stopped-gate", "split-chunk", "terminal", "blocked-head", "blocked-head-cancel-error", "ready-wait", "ready-success", "ready-error", "local-error", "local-error-cancel", "normal-reply"} {
+	for _, name := range []string{"stopped-gate", "split-chunk", "terminal", "blocked-head", "blocked-head-cancel-error", "ready-wait", "ready-success", "ready-error", "local-error", "local-error-cancel", "normal-reply", "held-window"} {
 		t.Run(name, func(t *testing.T) {
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel()
-			cmd := exec.CommandContext(ctx, node, "-e", hostJSCancellationTest, name)
-			cmd.Stdin = bytes.NewReader(hostJS)
-			out, err := cmd.CombinedOutput()
+			out, err := runHostJSCase(t, node, name)
 			if err != nil {
 				t.Fatalf("JavaScript cancellation regression: %v\n%s", err, out)
 			}
@@ -39,6 +35,27 @@ func TestHostJSCancellation(t *testing.T) {
 			}
 		})
 	}
+}
+
+// runHostJSCase runs one case of hostJSCancellationTest in node against the
+// embedded host.js. A case that hangs is stopped after two minutes, or before
+// this run's own deadline if that comes first, rather than at a fixed 10s a
+// loaded machine can spend starting node. The cap keeps a real hang from
+// using up most of a 10m -timeout, and from hanging a -timeout 0 run.
+func runHostJSCase(t *testing.T, node, name string) ([]byte, error) {
+	limit := 2 * time.Minute
+	if d, ok := t.Deadline(); ok {
+		limit = min(limit, time.Until(d)*9/10)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), limit)
+	defer cancel()
+	// ready-wait forces a garbage collection (--expose-gc). A function V8 is
+	// optimizing on a worker thread is held until a worker is done with it,
+	// and with it the request it was made for, so V8 optimizes on the main
+	// thread (--no-concurrent-recompilation).
+	cmd := exec.CommandContext(ctx, node, "--expose-gc", "--no-concurrent-recompilation", "-e", hostJSCancellationTest, name)
+	cmd.Stdin = bytes.NewReader(hostJS)
+	return cmd.CombinedOutput()
 }
 
 const hostJSCancellationTest = `
@@ -67,7 +84,7 @@ const context = vm.createContext({
   process: { stdout, stdin: {}, exit: () => { throw Error('unexpected exit') } },
   readline: { createInterface: () => rl },
   options: async () => ({ fetch: async () => context.reply }),
-  info: async () => ({ models: {} }),
+  infoOf: async () => ({ models: {} }),
   sdkHeaders: () => ({}), bodyOf: () => undefined,
   accountKey: () => '',
   via: { run: (_, fn) => fn() }, inScope: (_, key, fn) => fn(),
@@ -104,6 +121,34 @@ async function main() {
     assert.equal(await run('gate.take(64)'), 64)
     run('gate.stop(); gate.add(1)')
     assert.equal(await run('gate.take(64)'), -1, 'stopped gate refuses remaining credit')
+  } else if (name === 'chunk-frames') {
+    const parts = [new Uint8Array([0, 1, 2, 250, 251, 252]), Buffer.from('data: {"a":"\\u00e9 \\"q\\""}\n\n'), new Uint8Array(70 << 10).fill(65)]
+    context.reply.body = (async function* () { for (const p of parts) yield p })()
+    let copies = 0
+    let stringified = 0
+    const realJSON = run('JSON')
+    context.Buffer = new Proxy(Buffer, { get(target, key) {
+      if (key !== 'from') return Reflect.get(target, key)
+      return (...args) => {
+        if (args.length === 1 && ArrayBuffer.isView(args[0])) copies++
+        return target.from(...args)
+      }
+    } })
+    context.JSON = { parse: realJSON.parse, stringify: (v, ...rest) => {
+      if (v && v.event === 'chunk') stringified++
+      return realJSON.stringify(v, ...rest)
+    } }
+    fetchOne()
+    await until(idle, 'streamed fetch settles')
+    context.Buffer = Buffer
+    delete context.JSON
+    const chunks = lines.filter(msg => msg.event === 'chunk')
+    assert.ok(chunks.every(msg => msg.id === 1), 'every frame is the fetch\'s')
+    assert.equal(chunks.length, 4, 'a chunk over 64 KB goes in two frames')
+    assert.deepEqual(Buffer.concat(chunks.map(msg => Buffer.from(msg.data, 'base64'))), Buffer.concat(parts))
+    assert.deepEqual(lines.map(msg => msg.event || 'result'), ['head', 'chunk', 'chunk', 'chunk', 'chunk', 'result'])
+    assert.equal(stringified, 0, 'chunk frames are joined, not stringified')
+    assert.equal(copies, 0, 'chunks are viewed, not copied')
   } else if (name === 'split-chunk') {
     blockOn = 'chunk'
     context.reply.body = (async function* () { yield Buffer.alloc(3 * (64 << 10)) })()
@@ -146,20 +191,44 @@ async function main() {
     unresolved.then = (...args) => { readyReactions++; return originalThen(...args) }
     initialize(unresolved)
     run('send({id: 99, result: null})')
+    const counts = emitter => Object.fromEntries(emitter.eventNames().map(event => [event, emitter.listenerCount(event)]))
+    const listeners = () => ({ stdin: counts(rl), stdout: counts(stdout) })
+    const sharedListeners = listeners()
+    // A cancelled wait lets its request, controller, signal and credit gate
+    // go. watch() reads them itself, so none stays in a variable of main,
+    // which main keeps while it waits.
+    const requests = []
+    const watch = () => {
+      const request = run('inflight.get(1)')
+      assert.ok(request, 'a fetch waiting for init is in flight')
+      requests.push([request, request.controller, request.controller.signal, request.gate].map(part => new WeakRef(part)))
+    }
     for (let iteration = 0; iteration < 1000; iteration++) {
       fetchOne()
+      watch()
       abortOne()
       await until(idle, 'cancelled bootstrap wait cleans registries')
       assert.equal(queued(), 0, 'cancelled bootstrap emits no late error')
     }
     assert.equal(lines.length, 1, 'stdout stayed blocked at original line')
     assert.equal(stdout.listenerCount('drain'), 1, 'only shared drain listener remains')
+    assert.deepEqual(listeners(), sharedListeners, 'cancelled bootstrap waits leave no listener on stdin or stdout')
     const retainedWaiters = run('typeof readyWaiters === "undefined" ? -1 : readyWaiters.size')
     const retainedReadyReactions = readyReactions - (run('typeof setReady') === 'function' ? 1 : 0)
-    console.log(JSON.stringify({ cancellations: 1000, idle: idle(), queued: queued(), readyReactions, retainedReadyReactions, retainedWaiters }))
+    // Waiters are counted before the collection: a FinalizationRegistry could
+    // tidy them up after it. A WeakRef keeps its target until the turn that
+    // made it ends, and what runs once a request is collected (a registry's
+    // callback) runs on a later turn.
+    await tick()
+    gc()
+    await tick()
+    const retainedRequests = requests.filter(parts => parts.some(part => part.deref() !== undefined)).length
+    console.log(JSON.stringify({ cancellations: 1000, idle: idle(), queued: queued(), readyReactions, retainedReadyReactions, retainedWaiters, retainedRequests }))
+    assert.equal(queued(), 0, 'collected requests emit no late error')
     assert.equal(retainedWaiters, 0, 'cancelled bootstrap leaves no retained waiters')
     assert.equal(retainedReadyReactions, 0, 'cancelled requests leave no reactions on shared ready')
     assert.equal(readyReactions, 1, 'only shared initialization reaction remains')
+    assert.equal(retainedRequests, 0, 'cancelled requests are garbage collected')
   } else if (name === 'ready-success' || name === 'ready-error') {
     let settle
     initialize(new Promise((resolve, reject) => { settle = name === 'ready-success' ? resolve : reject }))
@@ -184,10 +253,13 @@ async function main() {
         if (stage === 'options') { entered = true; await barrier }
         return { fetch: async () => { vendorCalls++; return context.reply } }
       }
-      context.info = async () => {
+      context.infoOf = async () => {
         if (stage === 'info') { entered = true; await barrier }
         return { models: {} }
       }
+      // a request is told the provider only for a chat.headers hook
+      run('hooks.length = 0')
+      if (stage === 'info') run('hooks.push({ spec: "t", hooks: { "chat.headers": async () => {} } })')
       fetchOne()
       await until(() => entered, 'plugin setup entered its deferred await')
       assert.equal(run('inflight.get(1).state'), 'setup')
@@ -198,7 +270,7 @@ async function main() {
       await until(idle, 'cancelled setup finishes')
       assert.equal(vendorCalls, 0, 'cancelled setup never starts vendor')
       context.options = async () => ({ fetch: async () => { vendorCalls++; return context.reply } })
-      context.info = async () => ({ models: {} })
+      context.infoOf = async () => ({ models: {} })
       fetchOne()
       await until(idle, 'healthy fetch after cancelled setup')
       assert.equal(vendorCalls, 1)
@@ -225,6 +297,22 @@ async function main() {
     abortOne()
     await until(idle, 'host cancel ends error wait even after local signal aborted')
     assert.equal(queued(), 0, 'late error removed after host cancel')
+  } else if (name === 'held-window') {
+    // the reader credits nothing back, so the fetch spends its whole window
+    // and waits in gate.take; a cancel must wake that wait, or the fetch
+    // never finishes
+    context.reply.body = (async function* () { yield Buffer.alloc(1 << 20) })()
+    fetchOne()
+    const chunks = () => lines.filter(msg => msg.event === 'chunk')
+    const spent = () => chunks().reduce((n, msg) => n + Buffer.from(msg.data, 'base64').length + run('FRAME_OVERHEAD'), 0)
+    await until(() => spent() === 512 << 10, 'fetch spends its whole window')
+    const held = chunks().length
+    for (let iteration = 0; iteration < 5; iteration++) await tick()
+    assert.equal(chunks().length, held, 'no frame past the window')
+    assert.equal(idle(), false, 'fetch waits for credit')
+    abortOne()
+    await until(idle, 'cancel wakes a fetch waiting for credit')
+    assert.equal(lines.filter(msg => msg.id === 1 && ('result' in msg || 'error' in msg)).length, 0)
   } else if (name === 'normal-reply') {
     context.reply.body = (async function* () { yield Buffer.from('complete reply') })()
     fetchOne()
@@ -236,7 +324,15 @@ async function main() {
     throw Error('unknown test case')
   }
 }
-main().catch(err => { console.error(err); process.exitCode = 1 })
+// node exits 0 once nothing is left to run, even while main() still awaits a
+// promise that never settles, so a case passes only by reaching its end
+let finished = false
+process.on('exit', code => {
+  if (finished || code !== 0) return
+  process.exitCode = 1
+  console.error(process.argv[1] + ' never finished: main() was still awaiting a promise that never settled when node ran out of work')
+})
+main().then(() => { finished = true }, err => { console.error(err); process.exitCode = 1 })
 `
 
 // fakeSignedIn starts a real Bun host with the fake plugin signed in to, its
@@ -583,16 +679,26 @@ func TestFlowBigReplyProd(t *testing.T) {
 // vendor's head — leave the host able to answer a later request. It is the Go
 // side of the lifecycle: the host's slots come back, and the JS side's own
 // finally (covered by construction) lets each request's controller and gate go.
+// TestHostFramesChunksCheaply: the body's chunks go out as the same frames,
+// but without copying each chunk or stringifying each frame: stringify
+// scanned every base64 byte for something to escape, which cost more than
+// the base64.
+func TestHostFramesChunksCheaply(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("no node on PATH")
+	}
+	if out, err := runHostJSCase(t, node, "chunk-frames"); err != nil {
+		t.Fatalf("chunk frames: %v\n%s", err, out)
+	}
+}
+
 func TestFlowAbortDuringSetupStaysHealthy(t *testing.T) {
 	node, err := exec.LookPath("node")
 	if err != nil {
 		t.Skip("no node on PATH")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, node, "-e", hostJSCancellationTest, "mid-setup")
-	cmd.Stdin = bytes.NewReader(hostJS)
-	if out, err := cmd.CombinedOutput(); err != nil {
+	if out, err := runHostJSCase(t, node, "mid-setup"); err != nil {
 		t.Fatalf("mid-setup cancellation: %v\n%s", err, out)
 	}
 }

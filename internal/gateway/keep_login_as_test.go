@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/yetone/magpie/internal/provider"
@@ -16,10 +17,20 @@ import (
 // and the one Codex is signed in to at its own place behind it.
 func TestKeptLoginStandsAtItsPlace(t *testing.T) {
 	codexSignedIn(t, "spare@example.com")
-	var tried []string
+	// a usage read the gateway starts behind a reply reaches the same server
+	// on a goroutine of its own, so only the replies are counted, under mu
+	var (
+		mu    sync.Mutex
+		tried []string
+	)
+	replies := func() []string { mu.Lock(); defer mu.Unlock(); return append([]string(nil), tried...) }
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		io.ReadAll(r.Body)
-		tried = append(tried, r.Header.Get("chatgpt-account-id"))
+		if strings.HasSuffix(r.URL.Path, "/responses") {
+			mu.Lock()
+			tried = append(tried, r.Header.Get("chatgpt-account-id"))
+			mu.Unlock()
+		}
 		io.WriteString(w, sse(
 			`data: {"type":"response.created","response":{"id":"r1","model":"gpt-5.5"}}`,
 			`data: {"type":"response.output_text.delta","delta":"pong"}`,
@@ -41,11 +52,15 @@ func TestKeptLoginStandsAtItsPlace(t *testing.T) {
 		}
 	}
 	code, body := codexPost(t, `{"model":"gpt-5.5","stream":true,"input":"ping"}`)
-	if code != 200 || strings.Join(tried, ",") != "acct-1" {
-		t.Fatalf("%d %s: tried %v, not the first (acct-1)", code, body, tried)
+	if code != 200 || strings.Join(replies(), ",") != "acct-1" {
+		t.Fatalf("%d %s: tried %v, not the first (acct-1)", code, body, replies())
 	}
 	if got := provider.InUseLogin("codex"); got != "me@example.com" {
 		t.Fatalf("in use %q", got)
+	}
+	// the account a model's note names as first (#1957) is the one tried
+	if got := provider.FirstLogin("codex"); got != "me@example.com" {
+		t.Fatalf("first %q", got)
 	}
 	// let go, Codex is signed in to the first again, and it goes first
 	if err := provider.SetKeepLogin("codex", false); err != nil {
@@ -56,9 +71,11 @@ func TestKeptLoginStandsAtItsPlace(t *testing.T) {
 			t.Fatalf("let go, signed in as %+v", l)
 		}
 	}
+	mu.Lock()
 	tried = nil
+	mu.Unlock()
 	codexPost(t, `{"model":"gpt-5.5","stream":true,"input":"ping"}`)
-	if strings.Join(tried, ",") != "acct-1" {
-		t.Fatalf("let go, tried %v", tried)
+	if strings.Join(replies(), ",") != "acct-1" {
+		t.Fatalf("let go, tried %v", replies())
 	}
 }

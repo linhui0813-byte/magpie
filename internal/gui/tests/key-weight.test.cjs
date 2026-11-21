@@ -67,6 +67,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await browser.close();
       });
       page.setDefaultTimeout(5000);
+      page.setDefaultNavigationTimeout(60000);
       const errors = [];
       page.on("pageerror", (e) => errors.push(e.message));
       const posts = [];
@@ -79,6 +80,8 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
 
       // smart: no weights shown
       assert.equal(await chip("aaaaaaaaaa").isVisible(), false);
+      // Routing is under Advanced
+      { const adv = page.locator(".editor details.advanced"); await adv.waitFor({ state: "attached" }); if (!(await adv.evaluate((d) => d.open))) await adv.locator(":scope > summary").click(); }
       const by = page.locator(".editor").getByRole("button", { name: w.by, exact: true });
       await by.scrollIntoViewIfNeeded();
       const sc = await scrolled();
@@ -103,11 +106,13 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       assert.equal((await chip("aaaaaaaaaa").textContent()).trim(), w.a2);
       // still shown: the routing picked stays in the editor's draft
       assert.equal(await chip("bbbbbbbbbb").isVisible(), true);
+      // said once state is read again, after the chips are drawn: wait for it
+      await page.waitForFunction((n) => document.querySelector("#status")?.textContent.trim() == n, w.note).catch(() => {});
       assert.equal((await page.locator("#status").textContent()).trim(), w.note);
 
       if (process.env.ARTIFACT_DIR) await page.locator(".editor .accts").screenshot({ path: path.join(process.env.ARTIFACT_DIR, `${engine}-${lang}-key-weight-rows.png`) });
       // back to Smart hides them
-      await page.locator(".editor").getByRole("button", { name: lang === "en" ? "Smart" : "智能", exact: true }).first().click();
+      await page.locator(".editor").getByRole("button", { name: lang === "en" ? "Quota first" : "额度优先", exact: true }).first().click();
       assert.equal(await chip("aaaaaaaaaa").isVisible(), false);
       assert.deepEqual(errors, []);
     });

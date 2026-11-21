@@ -73,10 +73,21 @@ function server(lang, theme, posts, opts = {}) {
   };
 }
 
+// each is listed on the tab it is about; another tab names how many wait
+// where (#1896: Claude Desktop's skills read as duplicated MCP servers)
 const words = {
-  en: { title: "Some of the Library couldn't be written", again: "Try again", lines: ["Claude Code · Instructions", "Codex · MCP servers", "ZCode · Skill " + LONG, "~/code/app · The project"] },
-  zh: { title: "资源库有部分内容未能写入", again: "重试", lines: ["Claude Code · 指令", "Codex · MCP 服务器", "ZCode · 技能 " + LONG, "~/code/app · 项目"] },
+  en: {
+    title: "Some of the Library couldn't be written", again: "Try again",
+    lines: ["ZCode · Skill " + LONG, "~/code/app · The project"], away: ["Instructions: 1 more", "MCP servers: 1 more"],
+    instr: ["Claude Code · Instructions"], instrAway: ["MCP servers: 1 more", "Skills: 2 more"],
+  },
+  zh: {
+    title: "资源库有部分内容未能写入", again: "重试",
+    lines: ["ZCode · 技能 " + LONG, "~/code/app · 项目"], away: ["指令：另有 1 项", "MCP 服务器：另有 1 项"],
+    instr: ["Claude Code · 指令"], instrAway: ["MCP 服务器：另有 1 项", "技能：另有 2 项"],
+  },
 };
+const lineOf = (ls) => ls.map((l) => [...l.childNodes].filter((c) => !c.classList.contains("lib-problems-err")).map((c) => c.textContent).join(""));
 
 for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium", "webkit"])) {
   test(engine + ": the Library's items", async (t) => {
@@ -92,6 +103,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await ctx.addInitScript(() => { try { localStorage.setItem("magpie.libTab", "skills"); } catch {} });
       const page = await ctx.newPage();
       page.setDefaultTimeout(5000);
+      page.setDefaultNavigationTimeout(60000);
       page.on("pageerror", (e) => errors.push(e.message));
       // only the page's own address: a blob: URL (the grey copies) is left alone
       await page.route("http://magpie.test/**", server(lang, theme, posts, { flaky }));
@@ -141,17 +153,23 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         const card = page.locator("#view-library > .lib-problems");
         await card.waitFor();
         assert.equal(await card.locator(".lib-problems-head b").textContent(), words[lang].title);
-        const lines = await card.locator("li").evaluateAll((ls) => ls.map((l) => [...l.childNodes].filter((c) => !c.classList.contains("lib-problems-err")).map((c) => c.textContent).join("")));
-        assert.deepEqual(lines, words[lang].lines);
+        assert.deepEqual(await card.locator("li").evaluateAll(lineOf), words[lang].lines);
         const errs = await card.locator(".lib-problems-err").allTextContents();
-        assert.deepEqual(errs, problems.map((p) => p.error));
+        assert.deepEqual(errs, problems.slice(2).map((p) => p.error));
+        assert.deepEqual(await card.locator(".lib-problems-away button").allTextContents(), words[lang].away);
         // a dot says it, not a coloured stripe down its side
         const side = await card.evaluate((c) => getComputedStyle(c).borderLeftWidth);
         assert.equal(side, "0px");
-        // on every tab
-        await page.locator("#view-library .lib-tabs .opt").first().click();
-        await card.waitFor();
-        await page.locator("#view-library .lib-tabs .opt").nth(2).click();
+        // on every tab, each where it belongs: the button opens its tab
+        // and scrolls nothing
+        const top0 = await page.evaluate(() => document.querySelector("#view-library").scrollTop);
+        await card.locator(".lib-problems-away button").first().click();
+        await page.waitForFunction((want) => [...document.querySelectorAll("#view-library > .lib-problems li")].map((l) => l.textContent).join("|").startsWith(want), words[lang].instr[0]);
+        assert.deepEqual(await card.locator("li").evaluateAll(lineOf), words[lang].instr);
+        assert.deepEqual(await card.locator(".lib-problems-away button").allTextContents(), words[lang].instrAway);
+        assert.equal(await page.locator("#view-library .lib-tabs .opt.on").textContent(), lang === "zh" ? "指令" : "Instructions");
+        assert.equal(await page.evaluate(() => document.querySelector("#view-library").scrollTop), top0);
+        await page.locator(":is(#view-library .lib-tabs .opt, .nav-s):visible").nth(3).click();
         await page.locator("#view-library .lib-body:not(.lib-skel) .lib-row").first().waitFor();
 
         const again = card.getByRole("button", { name: words[lang].again });
@@ -183,7 +201,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         const pi = await row.locator('.lib-ag[data-agent="pi"]').boundingBox();
         const top = await row.evaluate((r) => r.getBoundingClientRect().top);
         await page.mouse.click(pi.x + pi.width / 2, pi.y + pi.height / 2);
-        await page.waitForFunction(() => document.querySelectorAll("#view-library > .lib-problems li").length === 5);
+        await page.waitForFunction(() => document.querySelectorAll("#view-library > .lib-problems li").length === 3);
         await page.waitForTimeout(100);
         assert.deepEqual(posts, [{ name, agents: [...had, "pi"] }]);
         assert.equal(await card.locator("li").last().textContent(), (lang === "zh" ? "Pi · 技能 " : "Pi · Skill ") + name + "read-only file system");

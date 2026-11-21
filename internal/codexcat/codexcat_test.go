@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/yetone/magpie/internal/catalog"
@@ -39,8 +40,8 @@ func TestCodexCatalogKeepsOwnEntries(t *testing.T) {
 		own["context_window"] != float64(272000) || len(own["input_modalities"].([]any)) != 2 {
 		t.Errorf("own entry: %v", own)
 	}
-	if own["base_instructions"] != Prompt {
-		t.Error("own entry without base_instructions")
+	if own["base_instructions"] != codexOwn(t)["gpt-5.5"] {
+		t.Error("own entry without Codex's own base_instructions for it")
 	}
 	if _, ok := own["upgrade"]; ok {
 		t.Error("upgrade prompt kept")
@@ -70,11 +71,13 @@ func TestCodexCatalogImages(t *testing.T) {
 
 // A model magpie describes has Codex search its MCP tools rather than send
 // every one in each request (#258), with its prompt, context window, and
-// neither code mode nor Responses Lite. A window above the working window
-// is told as that, the whole one as its max, unless settings.FullContext.
+// neither code mode nor Responses Lite. Its whole window is told, and a
+// window above the working one is compacted at that (auto_compact_token_
+// limit), unless settings.FullContext.
 func TestCodexCatalogToolSearch(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("USERPROFILE", os.Getenv("HOME"))
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(os.Getenv("HOME"), ".config"))
 	var got struct {
 		Models []map[string]any `json:"models"`
 	}
@@ -85,7 +88,7 @@ func TestCodexCatalogToolSearch(t *testing.T) {
 		t.Fatalf("%v", got)
 	}
 	e := got.Models[0]
-	if e["supports_search_tool"] != true || e["base_instructions"] != Prompt || e["context_window"] != float64(settings.WorkingWindow) || e["max_context_window"] != float64(996147) {
+	if e["supports_search_tool"] != true || e["base_instructions"] != Prompt || e["context_window"] != float64(996147) || e["auto_compact_token_limit"] != float64(settings.WorkingWindow) || e["max_context_window"] != nil {
 		t.Errorf("entry: %v", e)
 	}
 	if err := settings.Save(settings.Settings{FullContext: true}); err != nil {
@@ -97,13 +100,17 @@ func TestCodexCatalogToolSearch(t *testing.T) {
 	json.Unmarshal(Catalog([]catalog.Model{
 		{ID: "group/auto-gemini-3-8-flash", Name: "auto", Context: 996147},
 	}), &full)
-	if e := full.Models[0]; e["context_window"] != float64(996147) || e["max_context_window"] != nil {
+	if e := full.Models[0]; e["context_window"] != float64(996147) || e["auto_compact_token_limit"] != nil || e["max_context_window"] != nil {
 		t.Errorf("full context: %v", e)
 	}
-	for _, off := range []string{"tool_mode", "use_responses_lite", "multi_agent_version", "model_messages"} {
+	for _, off := range []string{"tool_mode", "use_responses_lite", "model_messages"} {
 		if v, ok := e[off]; ok {
 			t.Errorf("%s = %v", off, v)
 		}
+	}
+	// V2 for the Ultra it offers (TestUltraOnOtherVendorsModels)
+	if v := e["multi_agent_version"]; v != "v2" {
+		t.Errorf("multi_agent_version = %v", v)
 	}
 }
 
@@ -164,5 +171,37 @@ func TestCodexCatalogServiceTiers(t *testing.T) {
 		if m.Tiers == nil || len(m.Tiers) != 0 {
 			t.Errorf("%s offers tiers: %+v", m.Slug, m.Tiers)
 		}
+	}
+}
+
+// Codex turns a pasted image away for a model without "image" itself, so
+// /model says such a model is text-only and where that is changed, and the
+// entry still reads as magpie's (KimYx0207 on X).
+func TestCodexCatalogSaysTextOnly(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	var got struct {
+		Models []struct {
+			Slug        string   `json:"slug"`
+			Description string   `json:"description"`
+			Modalities  []string `json:"input_modalities"`
+		} `json:"models"`
+	}
+	json.Unmarshal(Catalog([]catalog.Model{
+		{ID: "probe/text", Name: "Text"},
+		{ID: "probe/sees", Name: "Sees", Images: true},
+		{ID: "group/words", Name: "Words"},
+		{ID: "auto/found", Name: "Found"}, // a group magpie found, as it is listed
+	}), &got)
+	if len(got.Models) != 4 {
+		t.Fatalf("%+v", got.Models)
+	}
+	text, sees, group, found := got.Models[0], got.Models[1], got.Models[2], got.Models[3]
+	if !strings.Contains(text.Description, "text only") || !strings.Contains(text.Description, "Model settings") || !catalog.MagpieAdded("", text.Slug, text.Description) {
+		t.Errorf("text-only model: %q", text.Description)
+	}
+	if sees.Description != "Sees via magpie" || group.Description != "Words via magpie" || found.Description != "Found via magpie" {
+		t.Errorf("a model that sees, a group and a found one: %q, %q, %q", sees.Description, group.Description, found.Description)
 	}
 }

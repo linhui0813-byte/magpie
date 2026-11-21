@@ -28,6 +28,8 @@ func claudeMadeFirst(t *testing.T, bRefuses bool) {
 	if runtime.GOOS == "windows" {
 		t.Skip("a shell script stands in for Claude Code")
 	}
+	noRests() // a rest an earlier test left must not hold this account (#6717)
+	t.Cleanup(noRests)
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)
@@ -52,7 +54,7 @@ func claudeMadeFirst(t *testing.T, bRefuses bool) {
 	if bRefuses {
 		refuses = "yes"
 	}
-	day := time.Now().UTC().AddDate(0, 0, 1).Format("Jan 2")
+	session := time.Now().UTC().Add(3 * time.Hour).Format("Jan 2 at 3:04pm")
 	reset := strconv.FormatInt(time.Now().Add(3*time.Hour).Unix(), 10)
 	script := `#!/bin/sh
 case "$1" in auth) exit 1;; esac
@@ -60,7 +62,7 @@ creds="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.credentials.json"
 if [ "$2" = "/usage" ]; then
   used=10
   grep -q tok-b "$creds" && used=100
-  echo '{"type":"result","is_error":false,"result":"Current session: '$used'% used · resets ` + day + ` at 3:30pm (UTC)"}'
+  echo '{"type":"result","is_error":false,"result":"Current session: '$used'% used · resets ` + session + ` (UTC)"}'
   exit 0
 fi
 n=0

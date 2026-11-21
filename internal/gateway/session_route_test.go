@@ -163,7 +163,7 @@ func TestSessionRoute(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("MAGPIE_ADDR", "0.0.0.0:3425")
-	if code, _ := get("192.168.1.9:5000", "/v1/magpie/route?session=pi-1"); code != http.StatusForbidden {
-		t.Fatal("MAGPIE_ADDR, not shared, got", code)
+	if code, _ := get("192.168.1.9:5000", "/v1/magpie/route?session=pi-1"); code != http.StatusUnauthorized {
+		t.Fatal("MAGPIE_ADDR, not shared, no key, got", code)
 	}
 }

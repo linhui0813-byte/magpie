@@ -523,3 +523,27 @@ func TestCodexUsageRepeatedSnapshotAdvancesRevisionAcrossReload(t *testing.T) {
 		t.Fatal("newer correction was lost", cs)
 	}
 }
+
+// A Codex Desktop fork (thread_spawn, 0.146) replays its parent's checkpoints
+// beside its own: two cumulative counters interleave, and each replayed one
+// says last=0. Going back up to the parent's counter is not usage. These are
+// the reporter's lines, numbers untouched (#2234): one request, 72,448 read
+// from the cache, not the 82,834,688 the counter's jump books.
+func TestCodexUsageForkReplayCountsOnlyLast(t *testing.T) {
+	b, err := os.ReadFile("testdata/codex-fork-replay-checkpoints.jsonl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	codexUsageLog(t, strings.Split(strings.TrimSpace(string(b)), "\n"))
+	want := Tokens{Input: 75721 - 72448, Output: 1201, CacheRead: 72448}
+	var total Tokens
+	for _, c := range Calls(time.Time{}) {
+		total.add(c.Tokens)
+	}
+	if total != want {
+		t.Fatalf("calls booked %+v, want %+v", total, want)
+	}
+	if ss := List(0); len(ss) != 1 || ss[0].Tokens != want {
+		t.Fatalf("summary booked %+v, want %+v", ss, want)
+	}
+}

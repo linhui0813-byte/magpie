@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -94,5 +95,116 @@ func TestHold(t *testing.T) {
 	os.WriteFile(p, []byte("e"), 0o600)
 	if v, _ := Read("hold", p, parse); v != "e" {
 		t.Fatalf("a file written just now: %q", v)
+	}
+}
+
+// A file not there is, while a request holds what was read, taken as
+// still not there as a file found unchanged is: a provider with no list
+// fetched was a look at the disk for each of its models, each request. A
+// write magpie makes (Forget), another's (Look), or the hold's end has it
+// looked at again; unheld, every read looks.
+func TestHoldMissing(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "none")
+	parse := func(b []byte) (string, error) { return string(b), nil }
+	looks := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return stats
+	}
+	release := Hold()
+	before := looks()
+	for range 100 {
+		if _, err := Read("missing", p, parse); !os.IsNotExist(err) {
+			t.Fatalf("a file not there: %v", err)
+		}
+	}
+	if n := looks() - before; n != 1 {
+		t.Fatalf("%d looks at a file not there, held", n)
+	}
+	os.WriteFile(p, []byte("a"), 0o600)
+	if _, err := Read("missing", p, parse); !os.IsNotExist(err) {
+		t.Fatalf("looked at again while held: %v", err)
+	}
+	Forget()
+	if v, err := Read("missing", p, parse); v != "a" || err != nil {
+		t.Fatalf("after a write magpie made: %q %v", v, err)
+	}
+	os.Remove(p)
+	Read("missing", p, parse)
+	os.WriteFile(p, []byte("b"), 0o600)
+	Look(p)
+	if v, err := Read("missing", p, parse); v != "b" || err != nil {
+		t.Fatalf("after another's write: %q %v", v, err)
+	}
+	os.Remove(p)
+	Read("missing", p, parse)
+	release()
+	os.WriteFile(p, []byte("c"), 0o600)
+	if v, err := Read("missing", p, parse); v != "c" || err != nil {
+		t.Fatalf("released: %q %v", v, err)
+	}
+	os.Remove(p)
+	before = looks()
+	for range 3 {
+		Read("missing", p, parse)
+	}
+	if n := looks() - before; n != 3 {
+		t.Fatalf("unheld, %d looks for 3 reads", n)
+	}
+}
+
+// Written is closed by the next Forget, and a wait begun after it waits for
+// the one after.
+func TestWritten(t *testing.T) {
+	w := Written()
+	select {
+	case <-w:
+		t.Fatal("closed before any write")
+	default:
+	}
+	Forget()
+	select {
+	case <-w:
+	case <-time.After(5 * time.Second):
+		t.Fatal("not closed by Forget")
+	}
+	select {
+	case <-Written():
+		t.Fatal("the next wait is closed already")
+	default:
+	}
+}
+
+// A test that saves inside a synctest bubble writes through Forget too,
+// and neither the channel it closes nor the next one may be the bubble's:
+// the next write from outside the bubble, another bubble's or none's,
+// closing it is a fatal error that took internal/provider's tests down
+// (#3632). Another process's write (wake) is held to the same, each in
+// bubbles of its own, so neither cleans up after the other. Loops
+// waiting outside are still told of a write made in a bubble, two of them
+// on the one wait they share.
+func TestWrittenAcrossBubbles(t *testing.T) {
+	for _, write := range []struct {
+		name string
+		do   func()
+	}{{"Forget", Forget}, {"wake", wake}} {
+		w, also := Written(), Written() // two loops waiting
+		for range 2 {
+			synctest.Test(t, func(t *testing.T) { write.do() })
+		}
+		for _, c := range []<-chan struct{}{w, also} {
+			select {
+			case <-c:
+			default:
+				t.Fatalf("%s in a bubble left a wait taken outside it open", write.name)
+			}
+		}
+		w = Written()
+		write.do()
+		select {
+		case <-w:
+		default:
+			t.Fatalf("not closed by the %s after the bubbles'", write.name)
+		}
 	}
 }

@@ -7,13 +7,13 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strings"
 
 	"gopkg.in/yaml.v3"
 
 	"github.com/yetone/magpie/internal/edit"
+	"github.com/yetone/magpie/internal/lazyre"
 )
 
 // Goose (Block's goose, its CLI and desktop app alike) reaches magpie as a
@@ -48,7 +48,7 @@ const gooseProviderID = magpieID
 // thinking_effort is one of its own request params, never sent — so a
 // level offered for it would change nothing; it is declared without
 // reasoning rather than shown a picker that does nothing.
-var gooseThinks = regexp.MustCompile(`(?i)(?:^|[-/])(?:o\d+(?:$|-)|gpt-(?:5|6)(?:$|[-.]))`)
+var gooseThinks = lazyre.New(`(?i)(?:^|[-/])(?:o\d+(?:$|-)|gpt-(?:5|6)(?:$|[-.]))`)
 
 // gooseKeys are the secrets goose reads for the native providers whose
 // models magpie can list, and which goose takes from the environment before
@@ -118,7 +118,7 @@ func gooseProviderPath(cfg string) string {
 // place, its models the catalog as Goose is shown it.
 func gooseProviderJSON(at place) map[string]any {
 	models := []map[string]any{}
-	for _, m := range magpieModels("goose") {
+	for _, m := range sharedModels("goose") {
 		e := map[string]any{"name": m.ID, "reasoning": gooseThinks.MatchString(m.ID)}
 		if m.Context > 0 {
 			e["context_limit"] = m.Context
@@ -132,7 +132,7 @@ func gooseProviderJSON(at place) map[string]any {
 		"description":              "Every model magpie has, through its local gateway",
 		"api_key_env":              "",
 		"base_url":                 at.v1(),
-		"headers":                  map[string]any{"Authorization": "Bearer " + at.gwKey()},
+		"headers":                  map[string]any{"Authorization": "Bearer " + gooseKey(at)},
 		"requires_auth":            false,
 		"skip_canonical_filtering": true,
 		"models":                   models,
@@ -144,9 +144,43 @@ func gooseProviderJSON(at place) map[string]any {
 	return p
 }
 
+// gooseKey is the key magpie's custom provider hands the Goose at a place:
+// one that names Goose (agentKeyAt), since goose's HTTP client sends no
+// User-Agent (reqwest's default, crates/goose-providers/src/api_client.rs),
+// so the plain key left its requests to "your agent" on Routing and "other"
+// in Usage (#1083).
+func gooseKey(at place) string { return agentKeyAt("goose", at.gw()) }
+
+// gooseProviderKept is magpie's custom provider laid over the file at path.
+// Goose's own editor (update_custom_provider, crates/goose/src/config/
+// declarative_providers.rs) carries the keys it doesn't show into the file it
+// writes, and the user sets timeout_seconds, toolshim, supports_streaming,
+// preserves_thinking, a header or a name there (DeclarativeProviderConfig).
+// Each stays (#2030); what reaches the gateway, its key and the model list
+// are magpie's.
+func gooseProviderKept(path string, at place) map[string]any {
+	want := gooseProviderJSON(at)
+	raw, err := edit.Read(path)
+	if err != nil || raw == nil {
+		return want
+	}
+	var have map[string]any
+	if json.Unmarshal(raw, &have) != nil || have == nil {
+		return want
+	}
+	if name, _ := have["display_name"].(string); strings.TrimSpace(name) != "" {
+		want["display_name"] = name
+	}
+	if h, _ := have["headers"].(map[string]any); h != nil {
+		// a header of the user's, beside magpie's Authorization
+		want["headers"] = mergeKept(h, want["headers"].(map[string]any), nil)
+	}
+	return mergeKept(have, want, []string{"name", "engine", "api_key_env", "base_url", "requires_auth", "dynamic_models", "models", "headers"})
+}
+
 // writeGooseProvider writes magpie's custom provider file for Goose.
 func writeGooseProvider(path string, at place) error {
-	b, err := json.MarshalIndent(gooseProviderJSON(at), "", "  ")
+	b, err := json.MarshalIndent(gooseProviderKept(path, at), "", "  ")
 	if err != nil {
 		return err
 	}
@@ -163,7 +197,7 @@ func syncGooseProvider(path string, at place) error {
 	if err != nil || raw == nil {
 		return nil
 	}
-	if sameJSON(string(raw), gooseProviderJSON(at)) {
+	if sameJSON(string(raw), gooseProviderKept(path, at)) {
 		return nil
 	}
 	return writeGooseProvider(path, at)

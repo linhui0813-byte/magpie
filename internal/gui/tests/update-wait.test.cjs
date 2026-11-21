@@ -13,6 +13,7 @@ const fs = require("node:fs/promises");
 const path = require("node:path");
 const { test } = require("node:test");
 const { chromium, webkit } = require("playwright");
+const { watchSettingsReads, settingsDrawn } = require("./reader.cjs");
 
 const assets = path.resolve(__dirname, "../assets");
 
@@ -25,6 +26,8 @@ const words = {
     gaveUp: "0.1.401 is downloaded · the gateway stayed busy for an hour, so magpie didn't restart; it updates when you restart or quit it",
     pill: "Update", pillWaiting: "Waiting to update",
     pillTitle: "magpie restarts to update to 0.1.401 once the agents' requests through the gateway have finished: 2 in flight · 1 awaiting tool results. Click to restart now.",
+    handoverWaiting: "0.1.401 is downloaded · restarts once the Claude subscription's replies have finished · 1 in flight",
+    handoverPillTitle: "magpie restarts to update to 0.1.401 once the replies through a Claude subscription have finished: 1 in flight. Other requests carry on across the restart. Click to restart now.",
   },
   zh: {
     version: "版本", restart: "重启以更新", now: "立即重启", cancel: "取消", restarting: "正在重启…",
@@ -34,6 +37,8 @@ const words = {
     gaveUp: "0.1.401 已下载 · 网关忙碌了一小时，magpie 未重启；重启或退出 magpie 时完成更新",
     pill: "更新", pillWaiting: "等待更新",
     pillTitle: "网关中 Agent 的请求结束后，magpie 将重启以更新到 0.1.401：2 个请求进行中 · 1 个工具调用待返回。点击立即重启。",
+    handoverWaiting: "0.1.401 已下载 · Claude 订阅的回复结束后自动重启 · 1 个请求进行中",
+    handoverPillTitle: "Claude 订阅的回复结束后，magpie 将重启以更新到 0.1.401：1 个请求进行中。其他请求不受重启影响。点击立即重启。",
   },
 };
 
@@ -102,9 +107,13 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       const errors = [];
       const page = await (await browser.newContext({ viewport: { width, height: 560 }, reducedMotion: "reduce" })).newPage();
       page.setDefaultTimeout(5000);
-      page.on("pageerror", (e) => errors.push(e.message));
+      page.setDefaultNavigationTimeout(60000);
+      // WebKit's notice when a layout outruns its observers, not a fault
+      page.on("pageerror", (e) => { if (!/^ResizeObserver loop completed with undelivered notifications/.test(e.message)) errors.push(e.message); });
       await page.route("**/*", server(lang, ctl));
+      await watchSettingsReads(page);
       await page.goto("http://magpie.test/" + query);
+      await settingsDrawn(page); // rows found are the ones that stay (#1659)
       return { page, errors };
     };
     const subIs = (page, row, text) => page.waitForFunction(({ text }) => {
@@ -186,6 +195,25 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         assert.equal(ctl.restarted, true);
         assert.equal(await scrolls(page), before, "no click moves the page");
         assert.deepEqual(errors, []);
+      });
+
+      // xuanwo on X: a restart that hands the gateway to the new version
+      // waits only for the Claude subscription's replies, and says so
+      await t.test(lang + ": handing over, the wait names the Claude subscription's replies", async () => {
+        const ctl = fresh({ handover: true, busy: { requests: 1 } });
+        const { page, errors } = await open(lang, ctl, "?view=settings&tab=about", 900);
+        const row = page.locator("#about .row.pref", { has: page.locator(".name", { hasText: w.version }) }).first();
+        await row.locator("button", { hasText: w.restart }).click();
+        await confirmAsk(page);
+        await row.locator("button", { hasText: w.now }).waitFor();
+        assert.equal((await row.locator(".sub").textContent()).trim(), w.handoverWaiting);
+        const panel = await open(lang, fresh({ handover: true, busy: { requests: 1 } }), "?mode=panel", 420);
+        const pill = panel.page.locator("#update");
+        await pill.click();
+        await panel.page.waitForFunction((t) => document.querySelector("#update span").textContent.trim() === t, w.pillWaiting);
+        assert.equal(await pill.getAttribute("title"), w.handoverPillTitle);
+        assert.deepEqual(errors, []);
+        assert.deepEqual(panel.errors, []);
       });
 
       await t.test(lang + ": with nothing in flight the click restarts at once", async () => {

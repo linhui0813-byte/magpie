@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/yetone/magpie/internal/catalog"
+	"github.com/yetone/magpie/internal/probelog"
 )
 
 // Which APIs a vendor or relay serves behind the one URL the user typed is
@@ -17,32 +18,47 @@ import (
 // 请求看是否返回200): each of the three magpie speaks upstream — Chat
 // Completions, Responses and Anthropic Messages — is sent the smallest
 // request Test sends, at that URL as the API takes it, and what answered
-// is what the provider can be given. Gemini's isn't among them: magpie
-// serves it to clients but never asks a vendor on it, so a URL for it
-// would be one the provider has nowhere to keep.
+// is what the provider can be given. Since a custom provider can keep a
+// Gemini API's URL (#1346), Gemini's generateContent is asked too, at the
+// …/v1beta a relay serves it under (NagaseMinato: 「检测」不会探测 Gemini
+// 端点，为什么呢？).
+
+// detectProtocols are the APIs a detection asks, in the order it says
+// what they answered: magpie's three, then Gemini's.
+var detectProtocols = []Protocol{Chat, Responses, Anthropic, Gemini}
 
 // Detection is what one API answered at the URL it was asked at.
 type Detection struct {
 	Result
 	// Base is the URL the provider keeps for it, as the editor's fields
-	// take it: …/v1 for OpenAI's two, the root for Anthropic's.
+	// take it: …/v1 for OpenAI's two, the root for Anthropic's, …/v1beta
+	// for Gemini's.
 	Base string `json:"base"`
 }
 
 // DetectBase is base as proto takes it: an endpoint pasted whole (…/v1/chat/
-// completions) cut to its base, then the root for Anthropic, which adds
-// /v1/messages itself, and …/v1 for OpenAI's two when base is a bare host —
+// completions, …/models/gemini-2.5-pro:generateContent) cut to its base, then the root for Anthropic, which adds
+// /v1/messages itself, …/v1 for OpenAI's two when base is a bare host, and
+// for Gemini's the …/v1beta beside a …/v1 or on a bare host (GeminiBase) —
 // the editor's respellURL, in Go.
 func DetectBase(base string, proto Protocol) string {
 	u := strings.TrimRight(strings.TrimSpace(base), "/")
 	for _, end := range []string{"/chat/completions", "/responses", "/v1/messages", "/messages"} {
 		u = strings.TrimSuffix(u, end)
 	}
+	// a Gemini endpoint or a model list pasted whole
+	u = strings.TrimRight(geminiMethod.ReplaceAllString(u, ""), "/")
 	if u == "" {
 		return ""
 	}
-	if proto == Anthropic {
+	switch proto {
+	case Anthropic:
 		return strings.TrimSuffix(u, "/v1")
+	case Gemini:
+		if pu, err := url.Parse(u); err == nil && pu.Host != "" && strings.Trim(pu.Path, "/") == "v1" {
+			return u + "beta"
+		}
+		return geminiVersioned(u)
 	}
 	if pu, err := url.Parse(u); err == nil && strings.Trim(pu.Path, "/") == "" {
 		return u + "/v1"
@@ -53,28 +69,37 @@ func DetectBase(base string, proto Protocol) string {
 // ErrNoURL is a detection with no URL to ask at.
 var ErrNoURL = errors.New("type the base URL first")
 
-// Detect asks each of Chat, Responses and Anthropic at the URL p has for
+// Detect asks each of Chat, Responses, Anthropic and Gemini at the URL p has for
 // it, else at base as it takes it (DetectBase), the smallest request, and
 // says what each answered, in that order. model is asked on all three;
-// with none, one from p's list is picked for each — a Claude model on
-// Anthropic's, an OpenAI one on Responses — and with no list, the vendor
-// is asked for one first (a GET of its models, which costs nothing).
-// Only those URLs are asked, and only a key's provider: a sign-in's API
-// is its agent's.
-func (p Provider) Detect(ctx context.Context, base, model string) ([]Detection, error) {
+// with none, one is picked for each — a Claude model on Anthropic's, an
+// OpenAI one on Responses — from picked, the models the editor's form has
+// and hasn't saved yet (#1545: a relay with no model list is asked for
+// the models typed in the form, not only after a Save), else from p's
+// list, and with no list the vendor is asked for one first (a GET of its
+// models, which costs nothing). Only those URLs are asked, and only a
+// key's provider: a sign-in's API is its agent's.
+func (p Provider) Detect(ctx context.Context, base, model string, picked ...string) ([]Detection, error) {
 	q, err := p.detecting(base)
 	if err != nil {
 		return nil, err
 	}
-	ctx = q.Via(ctx)
+	ctx = q.ownRequests(q.Via(ctx), probelog.KindDetect)
 	model = strings.TrimSpace(model)
 	var ids []string
 	if model == "" {
-		ids = q.detectModels(ctx)
+		for _, m := range picked {
+			if m = strings.TrimSpace(m); m != "" && !slices.Contains(ids, m) {
+				ids = append(ids, m)
+			}
+		}
+		if len(ids) == 0 {
+			ids = q.detectModels(ctx)
+		}
 	}
-	out := make([]Detection, len(Protocols))
+	out := make([]Detection, len(detectProtocols))
 	var wg sync.WaitGroup
-	for i, proto := range Protocols {
+	for i, proto := range detectProtocols {
 		m := model
 		if m == "" {
 			m = detectModel(ids, proto)
@@ -91,6 +116,13 @@ func (p Provider) Detect(ctx context.Context, base, model string) ([]Detection, 
 		}()
 	}
 	wg.Wait()
+	for i := range out {
+		if out[i].V1 != "" {
+			// answered under the /v1 the URL was typed without: the
+			// base the editor keeps for it is that one
+			out[i].Base = out[i].V1
+		}
+	}
 	return out, nil
 }
 
@@ -101,7 +133,7 @@ func (p Provider) detecting(base string) (Provider, error) {
 		return p, errors.New("a sign-in is asked on its agent's own API; there is nothing to detect")
 	}
 	q := p
-	for _, proto := range Protocols {
+	for _, proto := range detectProtocols {
 		u := strings.TrimSpace(p.Base(proto))
 		if u == "" {
 			u = DetectBase(base, proto)
@@ -118,6 +150,8 @@ func (p Provider) detecting(base string) (Provider, error) {
 			q.Responses = u
 		case Anthropic:
 			q.Anthropic = u
+		case Gemini:
+			q.Gemini = u
 		}
 	}
 	if len(q.Speaks()) == 0 {
@@ -138,14 +172,31 @@ func (q Provider) detectOne(proto Protocol, m string, wait time.Duration) (Detec
 		d.Error = "no model to try: type one the vendor serves"
 		return d, nil
 	}
-	k, ok := q.keyFor(proto)
+	// the key a request for m goes to (keySeeing, #4992): a relay whose
+	// keys are each kept for some models is asked m with one that serves it
+	k, ok := q.keySeeing(proto, m)
 	if !ok {
 		d.Error = "no key is on for this endpoint"
+		if _, any := q.keyFor(proto); any {
+			d.Error = "no key that's on for this endpoint serves this model"
+		}
 		return d, nil
+	}
+	if proto != Chat {
+		// served by OpenAI's base alone, at /embeddings or /rerank
+		switch retrievalOf(m) {
+		case catalog.ServesEmbedding:
+			d.Error = "an embedding model: asked at OpenAI's URL, on /embeddings"
+			return d, nil
+		case catalog.ServesRerank:
+			d.Error = "a rerank model: asked at OpenAI's URL, on /rerank"
+			return d, nil
+		}
 	}
 	return d, func(ctx context.Context) Result {
 		u, body := tiny(k, proto, UpstreamName(q, m))
-		return probe(ctx, k, proto, u, k.Prepare([]byte(body)), m, wait)
+		ctx, b := k.tested(ctx, u, body)
+		return probe(ctx, k, proto, u, b, m, wait)
 	}
 }
 
@@ -154,9 +205,7 @@ func (q Provider) detectOne(proto Protocol, m string, wait time.Duration) (Detec
 // the one p is asked with when none is given, and says how it answered.
 func (p Provider) DetectDecide(ctx context.Context, model string) Detection {
 	p.Decide = strings.TrimSuffix(strings.TrimRight(strings.TrimSpace(p.Decide), "/"), "/systemone")
-	if p.Decide != "" && !strings.Contains(p.Decide, "://") {
-		p.Decide = "https://" + p.Decide
-	}
+	p.Decide = WithScheme(p.Decide, "https")
 	if model = strings.TrimSpace(model); model == "" {
 		model = p.Jev()
 	}
@@ -170,7 +219,7 @@ func (p Provider) DetectDecide(ctx context.Context, model string) Detection {
 		return d
 	}
 	t0 := time.Now()
-	err := p.AskSystemOne(p.Via(ctx), model)
+	err := p.AskSystemOne(p.ownRequests(p.Via(ctx), probelog.KindDetect), model)
 	d.Millis = time.Since(t0).Milliseconds()
 	if err != nil {
 		d.Error = err.Error()
@@ -197,8 +246,8 @@ const (
 )
 
 // DetectModels asks each of models (the first DetectMax, an image model
-// left out: it is asked on the images API) on each of Chat, Responses and
-// Anthropic at the URL p has for it, else at base as it takes it, and
+// left out: it is asked on the images API) on each of Chat, Responses,
+// Anthropic and Gemini at the URL p has for it, else at base as it takes it, and
 // says what each answered, model by model; and, by API, the first answer
 // from a model it served, else the first model's — what Detect says for
 // one. A probe not started before ctx ends says so, unasked.
@@ -219,13 +268,13 @@ func (p Provider) DetectModels(ctx context.Context, base string, models []string
 	if len(ids) > DetectMax {
 		ids = ids[:DetectMax]
 	}
-	ctx = q.Via(ctx)
+	ctx = q.ownRequests(q.Via(ctx), probelog.KindDetect)
 	out := make([]ModelDetection, len(ids))
 	sem := make(chan struct{}, DetectWide)
 	var wg sync.WaitGroup
 	for i, m := range ids {
-		out[i] = ModelDetection{Model: m, Results: make([]Detection, len(Protocols))}
-		for j, proto := range Protocols {
+		out[i] = ModelDetection{Model: m, Results: make([]Detection, len(detectProtocols))}
+		for j, proto := range detectProtocols {
 			d, ask := q.detectOne(proto, m, detectWait)
 			if ask != nil && catalog.ImagesAPI(m) {
 				d.Error, ask = "an image model: asked on the images API, not here", nil
@@ -253,8 +302,8 @@ func (p Provider) DetectModels(ctx context.Context, base string, models []string
 		}
 	}
 	wg.Wait()
-	sum := make([]Detection, len(Protocols))
-	for j := range Protocols {
+	sum := make([]Detection, len(detectProtocols))
+	for j := range detectProtocols {
 		sum[j] = out[0].Results[j]
 		for _, md := range out {
 			if md.Results[j].OK {
@@ -282,19 +331,20 @@ func (p Provider) detectModels(ctx context.Context) []string {
 	if len(ids) > 0 {
 		return ids
 	}
-	ms, _, err := p.fetchOne(ctx)
+	l, err := p.fetchOne(ctx)
 	if err != nil {
 		return nil
 	}
-	for _, m := range ms {
+	for _, m := range l.models {
 		ids = append(ids, m.ID)
 	}
 	return ids
 }
 
 // detectModel is the model of ids to ask proto for: one made for it — a
-// Claude model on Anthropic's, an OpenAI one on Responses, any other on
-// Chat — else the first that chats.
+// Claude model on Anthropic's, an OpenAI one on Responses, a Gemini one on
+// Gemini's, any other on Chat — else the first that chats, else, on Chat,
+// an embedding or rerank model.
 func detectModel(ids []string, proto Protocol) string {
 	made := func(id string) bool {
 		switch proto {
@@ -302,12 +352,20 @@ func detectModel(ids []string, proto Protocol) string {
 			return isClaude(id)
 		case Responses:
 			return openAIModel(id)
+		case Gemini:
+			return strings.Contains(strings.ToLower(id), "gemini")
 		}
 		return !isClaude(id)
 	}
-	for _, want := range []func(string) bool{made, func(string) bool { return true }} {
+	chats := func(id string) bool { return !catalog.ImagesAPI(id) && retrievalOf(id) == "" }
+	for _, want := range []func(string) bool{
+		func(id string) bool { return made(id) && chats(id) }, chats,
+		// none chats: an embedding or rerank model, which OpenAI's base
+		// is asked for at /embeddings or /rerank (tiny)
+		func(id string) bool { return proto == Chat && retrievalOf(id) != "" },
+	} {
 		for _, id := range ids {
-			if want(id) && !catalog.ImagesAPI(id) {
+			if want(id) {
 				return id
 			}
 		}

@@ -3,7 +3,8 @@ const fs = require("node:fs/promises");
 const path = require("node:path");
 const { test } = require("node:test");
 const { chromium, webkit } = require("playwright");
-const { fixture } = require("./fixtures/caller-keys.cjs");
+const { fixture, keyAction } = require("./fixtures/caller-keys.cjs");
+const { openPart } = require("./reader.cjs");
 
 async function palette(page, selectors) {
   return page.evaluate((selectors) => {
@@ -29,7 +30,9 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       t.after(() => browser.close());
       const context = await browser.newContext({ viewport: { width: 1000, height: 760 }, reducedMotion: "reduce", colorScheme: "light" });
       const page = await context.newPage();
+      await page.addInitScript(() => { try { localStorage.setItem("magpie.gwConnectFolded", "0"); } catch {} }); // Connect opened, as a user who reads it
       page.setDefaultTimeout(6000);
+      page.setDefaultNavigationTimeout(60000);
       const events = [], errors = [];
       page.on("pageerror", (e) => errors.push(e.message));
       await page.route("**/*", fixture("en", theme, events, { lan: true }));
@@ -42,7 +45,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await page.mouse.move(500, 20);
       const gatewaySelectors = { card: "#gatewayKeys .accts", enabled: '#gatewayKeys .acc[data-key="work"] .dot',
         disabled: "#gatewayKeys .acc.off .dot", masked: "#gatewayKeys .acc .plan", form: "#gatewayKeys .adding",
-        input: "#gatewayKeys .adding input", rename: "#gatewayKeys .rename-in", create: "#gatewayKeys .primary", rotate: '#gatewayKeys .acc[data-key="work"] .text', keyPick: "#connectKey" };
+        input: "#gatewayKeys .adding input", rename: "#gatewayKeys .rename-in", create: "#gatewayKeys .primary", more: '#gatewayKeys .acc[data-key="work"] .gw-key-more', keyPick: "#connectKey" };
       const gatewayPaints = [];
       for (const scheme of ["light", "dark"]) {
         await page.emulateMedia({ colorScheme: scheme });
@@ -60,7 +63,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
           assert.equal(input.bg, c.card, "key inputs must not use the browser's default background");
           assert.equal(input.color, c.fg);
         }
-        assert.equal(e.rotate.color, c["ctl-fg"]); // a text button, in a control's quiet text (#477)
+        assert.equal(e.more.color, c.muted); // the key's …, in the row's quiet text
         assert.equal(e.keyPick.bg, "rgba(0, 0, 0, 0)");
         assert.equal(e.create.bg, c.accent);
         assert.equal(e.create.color, c["accent-fg"]);
@@ -72,7 +75,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       }
       assert.equal(gatewayPaints[0] === gatewayPaints[1], theme !== "system", "only System follows an OS palette change");
 
-      await page.locator('#gatewayKeys .acc[data-key="work"]').getByRole("button", { name: "Rotate key", exact: true }).click();
+      await keyAction(page, page.locator('#gatewayKeys .acc[data-key="work"]'), "Rotate key");
       await page.locator("#modal .lib-confirm").waitFor();
       for (const scheme of ["light", "dark"]) {
         await page.emulateMedia({ colorScheme: scheme });
@@ -95,9 +98,13 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await page.goto("http://magpie.test/?view=settings&tab=network");
       const on = page.locator("#lanList").getByRole("button", { name: "On", exact: true });
       await on.waitFor();
-      const bounds = await on.boundingBox();
+      // the settings are read twice as the page opens (its own read and the
+      // state's), each drawing #lanList again: where On is comes from one read
+      // in the page, since a box asked of a button already replaced is null
+      const y = await (await page.waitForFunction(() => [...document.querySelectorAll("#lanList button")]
+        .find((b) => b.textContent.trim() === "On")?.getBoundingClientRect().y)).jsonValue();
       await page.mouse.move(500, 400);
-      await page.mouse.wheel(0, bounds.y - 250);
+      await page.mouse.wheel(0, y - 250);
       await on.click();
       await page.locator("#lanList .lan-url").waitFor();
       await page.mouse.move(500, 20);
@@ -115,11 +122,11 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await page.mouse.move(500, 400);
         await page.mouse.wheel(0, -5000);
         for (const choice of ["Dark", "Light", "System"]) {
-          await page.locator("#setTab-general").click();
+          await openPart(page, "general");
           await page.locator("#themeSegs").getByRole("button", { name: choice, exact: true }).click();
           await page.waitForFunction((want) => (document.documentElement.dataset.theme || "system") === want, choice.toLowerCase());
           await page.waitForFunction(() => !document.documentElement.classList.contains("theming"));
-          await page.locator("#setTab-network").click();
+          await openPart(page, "network");
           const { colors: c, elements: e } = await palette(page, { card: "#lanList", key: "#lanList .lan-url" });
           assert.equal(e.card.bg, c.card);
           assert.equal(e.key.color, c["fg-2"]);

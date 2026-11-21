@@ -89,7 +89,7 @@ const words = {
     nav: "Sessions", del: "Delete", cancel: "Cancel", trash: "Trash", restore: "Restore", resume: "Resume",
     askOne: "Delete this session?", askTwo: "Delete 2 sessions?", moved: "2 sessions moved to magpie's trash",
     active: "still running is still being written to; close it in Claude Code and try again in a minute",
-    restored: "fix the login form restored", picked: "2 selected", filter: "Filter sessions",
+    restored: "fix the login form restored", picked: "2 selected", filter: "Search sessions",
     cant: "magpie can list OpenCode's sessions and resume them, but not delete them: they aren't kept as files of their own.",
     hermesNote: "These Hermes sessions are read only; magpie can list them, but cannot resume or delete them.",
     codexNote: "Some Codex sessions are read only and cannot be deleted.",
@@ -99,7 +99,7 @@ const words = {
     nav: "会话", del: "删除", cancel: "取消", trash: "回收站", restore: "恢复", resume: "继续",
     askOne: "删除这个会话？", askTwo: "删除这 2 个会话？", moved: "2 个会话已移到 magpie 的回收站",
     active: "「still running」仍在写入；请在 Claude Code 中关闭它，一分钟后再试",
-    restored: "已恢复「fix the login form」", picked: "已选 2 个", filter: "筛选会话",
+    restored: "已恢复「fix the login form」", picked: "已选 2 个", filter: "搜索会话",
     cant: "可列出并继续 OpenCode 的会话，但无法删除：它们没有独立文件。",
     hermesNote: "这些 Hermes 会话只读：可列出，但无法继续或删除。",
     codexNote: "部分 Codex 会话为只读，无法删除。",
@@ -121,6 +121,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await browser.close();
       });
       page.setDefaultTimeout(5000);
+      page.setDefaultNavigationTimeout(60000);
       const errors = [];
       page.on("pageerror", (e) => errors.push(e.message));
       page.on("dialog", (d) => { errors.push("a browser dialog: " + d.message()); d.dismiss(); });
@@ -173,7 +174,11 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       // the id's line is named for it (#465: it read 整个会话, the routing option's word)
       assert((await view.locator(".sess-detail .sess-line .k").allInnerTexts()).includes(w.idLine));
 
-      // picking: two rows, the page held still
+      // picking: Select brings the boxes; two rows, the page held still
+      assert.equal(await view.locator(".sm-check").count(), 0, "no boxes before Select");
+      assert(!(await view.locator(".sm-bar").isVisible()), "no bar before Select");
+      await reach(view.locator(".sm-select"));
+      await view.locator(".sm-select").click();
       await still(row("a-old"), "picking", () => row("a-old").locator(".sm-check").click());
       await reach(row("b-1"));
       await row("b-1").locator(".sm-check").click();
@@ -239,14 +244,15 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await row("a-old").waitFor();
       await view.locator(".sm-agents .opt", { hasText: "OpenCode" }).click();
       await view.locator('.row.sm-sess[data-id="o-1"]').waitFor();
-      assert.equal((await view.locator(".sm-note").textContent()).trim(), w.cant);
+      assert.equal((await view.locator(".sm-note:not(.sm-speed-note)").textContent()).trim(), w.cant);
       assert.equal(await view.locator(".sm-del, .sm-check").count(), 0);
+      assert(!(await view.locator(".sm-select").isVisible()), "no Select where nothing can be deleted");
       assert(!(await view.locator(".sm-bar").isVisible()));
       const mutationCount = calls.length;
       await view.locator(".sm-agents .opt", { hasText: "Hermes" }).click();
       const hermes = view.locator('.row.sm-sess[data-id="h-1"]');
       await hermes.waitFor();
-      assert.equal((await view.locator(".sm-note").textContent()).trim(), w.hermesNote);
+      assert.equal((await view.locator(".sm-note:not(.sm-speed-note)").textContent()).trim(), w.hermesNote);
       assert.equal(await hermes.locator(".sm-resume, .sess-resume, .sess-term, .sm-del, .sm-check").count(), 0);
       assert.equal(await view.locator(".sm-folder-del").count(), 0);
       assert(!(await view.locator(".sm-bar").isVisible()));
@@ -257,7 +263,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       }
 
       const missing = await page.evaluate(() => [
-        "Sessions", "Filter sessions", "No sessions yet", "Select every session shown", "Select", "Delete", "Trash", "No folder", "deleted {when}",
+        "Sessions", "Search sessions", "No sessions yet", "Select every session shown", "Select", "Delete", "Trash", "No folder", "deleted {when}",
         "Delete this session?", "Delete {n} sessions?", "Moved to magpie's trash", "{n} sessions moved to magpie's trash", "Restore", "{title} restored",
         "{title} is still being written to; close it in {agent} and try again in a minute",
         "{n} sessions are still being written to; close them in {agent} and try again in a minute",

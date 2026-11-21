@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"runtime"
 	"slices"
 	"strings"
 
@@ -13,8 +14,9 @@ import (
 	"github.com/yetone/magpie/internal/settings"
 )
 
-// corsGuard lets the web pages the user listed in Settings › Gateway
-// (settings.CORSOrigins, #1051) call the gateway from a browser: their
+// corsGuard lets the web pages and browser extensions the user listed
+// in Settings › Network (settings.CORSOrigins, #1051) call the gateway
+// from a browser: their
 // preflight is answered, and their calls get the headers that let the page
 // read the reply. Such a call carries an enabled gateway key — a page is
 // not an agent the user started, and on loopback a call needs no key, so
@@ -28,13 +30,41 @@ import (
 // user merely visits could send a "simple" text/plain POST and spend their
 // subscriptions blind. Such a page never read a reply before (no CORS
 // headers), so refusing it breaks nothing that worked.
+//
+// An Origin of "null" is refused too (403) unless the call carries an
+// enabled gateway key: any web page can send it from a sandboxed iframe,
+// which is that same "simple" POST one frame away (a file:// page and an
+// app's webview send it as well). A key, as for a listed origin, still
+// lets such a client through; neither gets CORS headers, so a frame or a
+// local page still sends blind, as before.
+//
+// So is a page at a subdomain of localhost (localhostSubdomain, #2256):
+// Safari and other WebKit views ask the DNS for such a name, and a
+// resolver that answers it serves the page from anywhere.
+//
+// Obsidian (appOrigin) gets the headers without being listed and without a
+// key: its plugins call from app://obsidian.md, which only Obsidian's own
+// window sends, and Copilot for Obsidian's streaming chat goes through
+// the window's fetch, which reads no reply without them (the agent
+// "obsidian" wires it keyless, shirotokiren on X).
 func corsGuard(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")
-		if origin == "" || !corsAllowed(origin) {
+		app := appOrigin(origin)
+		if origin == "" || !app && !corsAllowed(origin) {
 			if foreignPage(r, origin) {
 				log.Printf("refused %s %s from the web page %s: not one listed in Settings", r.Method, r.URL.Path, origin)
 				writeError(w, provider.Chat, http.StatusForbidden, "magpie doesn't answer the web page "+origin+": list it in Settings → Network and sharing → Web pages to let it call magpie with a gateway key")
+				return
+			}
+			if origin == "null" && !keyedCaller(r) {
+				log.Printf("refused %s %s from Origin: null: a sandboxed frame or a local page, with no gateway key", r.Method, r.URL.Path)
+				writeError(w, provider.Chat, http.StatusForbidden, "magpie doesn't answer a sandboxed frame or a local page (Origin: null) without a gateway key: create one in magpie's Gateway page and send it as Authorization: Bearer <key> (or x-api-key)")
+				return
+			}
+			if localhostSubdomain(origin) && !keyedCaller(r) {
+				log.Printf("refused %s %s from the web page %s: a localhost subdomain, with no gateway key", r.Method, r.URL.Path, origin)
+				writeError(w, provider.Chat, http.StatusForbidden, "magpie doesn't answer the web page "+origin+" without a gateway key: Safari and other WebKit browsers ask the network's DNS for a localhost subdomain, so the page may not be on this computer. Open it at localhost or 127.0.0.1, or create a key in magpie's Gateway page and send it as Authorization: Bearer <key> (or x-api-key)")
 				return
 			}
 			next.ServeHTTP(w, r)
@@ -42,8 +72,9 @@ func corsGuard(next http.Handler) http.Handler {
 		}
 		h := w.Header()
 		h.Set("Access-Control-Allow-Origin", origin)
+		h.Add("Access-Control-Expose-Headers", SessionHeader)
 		h.Add("Vary", "Origin")
-		if r.Method == http.MethodOptions && r.Header.Get("Access-Control-Request-Method") != "" {
+		if corsPreflight(r) {
 			h.Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 			if asked := corsHeaders(r.Header.Get("Access-Control-Request-Headers")); asked != "" {
 				h.Set("Access-Control-Allow-Headers", asked)
@@ -57,15 +88,23 @@ func corsGuard(next http.Handler) http.Handler {
 			return
 		}
 		// lanGuard, in front of Handler on the real server, has already
-		// taken the key and put magpie's own token in its place
-		keyed := access.Caller(r.Context()).KeyID != "" ||
-			slices.ContainsFunc(callerKeys(r), func(k string) bool { _, ok := access.Authenticate(k); return ok })
-		if !keyed {
-			writeError(w, provider.Chat, http.StatusUnauthorized, "a web page calls magpie with a gateway key: create one in magpie's Gateway page and send it as Authorization: Bearer <key> (or x-api-key)")
+		// taken the key and put magpie's own token in its place. An app's
+		// window is no page: it is held to the network's rules alone, as
+		// the app's own requests without an Origin are.
+		if !app && !keyedCaller(r) {
+			writeError(w, provider.Chat, http.StatusUnauthorized, "a web page or browser extension calls magpie with a gateway key: create one in magpie's Gateway page and send it as Authorization: Bearer <key> (or x-api-key)")
 			return
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// keyedCaller: the request carries an enabled gateway key — the caller
+// lanGuard recorded, or one in its own headers, which is where a handler
+// called without lanGuard finds it (the web app's embedded calls, tests).
+func keyedCaller(r *http.Request) bool {
+	return access.Caller(r.Context()).KeyID != "" ||
+		slices.ContainsFunc(callerKeys(r), func(k string) bool { _, ok := access.Authenticate(k); return ok })
 }
 
 // foreignPage: origin is an http(s) web page that is neither on this
@@ -75,16 +114,16 @@ func corsGuard(next http.Handler) http.Handler {
 // site elsewhere. usemagpie.ai may still read the Omarchy theme
 // (omarchyTheme).
 //
-// Only http and https are judged. "null" (a sandboxed frame, a file://
-// page, some Electron renderers) and other schemes — app://, file://,
-// tauri://, vscode-webview://, chrome-extension:// — come from desktop
-// apps, editor webviews and browser extensions. Such a client could call
-// magpie before only because it doesn't enforce CORS (a webview with web
-// security off, an extension holding host permissions), and no ordinary
-// web page can send those origins, so they pass as before. *.localhost
-// counts as this computer: browsers resolve it to loopback, and Tauri's
-// and Wails' webviews on Windows are http://tauri.localhost and
-// http://wails.localhost, whose HTTP plugins send that Origin outside CORS.
+// Only http and https are judged. A scheme only an app or an extension
+// can send — app://, file://, tauri://, vscode-webview://,
+// chrome-extension:// — comes from desktop apps, editor webviews and
+// browser extensions that don't enforce CORS (a webview with web security
+// off, an extension holding host permissions), and no ordinary web page
+// can put one on a request, so those pass as before. "null" is not one of
+// them: any web page sends it from a sandboxed frame and a local file
+// sends it too, which corsGuard judges (a gateway key, or 403). A
+// subdomain of localhost isn't foreign here either, but corsGuard asks a
+// gateway key of it (localhostSubdomain).
 func foreignPage(r *http.Request, origin string) bool {
 	if origin == "" {
 		return false
@@ -114,6 +153,40 @@ func foreignPage(r *http.Request, origin string) bool {
 	return true
 }
 
+// webviewOS is the system magpie runs on, which localhostSubdomain asks;
+// a variable so a test can be each.
+var webviewOS = runtime.GOOS
+
+// localhostSubdomain: origin is an http(s) page at a subdomain of
+// localhost (#2256, ggbdpq), which may not be on this computer. Chrome and
+// Firefox resolve *.localhost to loopback by a rule of their own, but
+// Safari and other WebKit views hand the name to the system resolver, and
+// before macOS 26 that asks the network's DNS (WebKit bug 160504, closed
+// when macOS 26 resolved it below WebKit; WebKitGTK asks whatever the
+// system's resolver is). A resolver that answers — a captive portal's, a
+// hostile network's — serves the page from anywhere, and it would send the
+// "simple" POST Origin "null" was refused for (#2242). The request doesn't
+// say which browser resolved the name, so every such page is held to a
+// key. tauri.localhost and wails.localhost on Windows are left out: Tauri's
+// and Wails' webviews there serve themselves at those names and their HTTP
+// plugins send that Origin outside CORS, and no browser on Windows asks the
+// DNS for them. On macOS and Linux those apps use tauri:// and wails://, so
+// the two names are any page's there.
+func localhostSubdomain(origin string) bool {
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	if s := strings.ToLower(u.Scheme); s != "http" && s != "https" {
+		return false
+	}
+	host := strings.TrimSuffix(strings.ToLower(u.Hostname()), ".")
+	if !strings.HasSuffix(host, ".localhost") {
+		return false
+	}
+	return webviewOS != "windows" || host != "tauri.localhost" && host != "wails.localhost"
+}
+
 // hostPort is host[:port] lower-cased with the scheme's port filled in, so
 // https://a.example and a Host of a.example:443 compare equal.
 func hostPort(hp, scheme string) string {
@@ -131,6 +204,19 @@ func hostPort(hp, scheme string) string {
 	return net.JoinHostPort(strings.Trim(hp, "[]"), port)
 }
 
+// appOrigins are the origins of desktop apps whose plugins call the
+// gateway from the app's own window, under its CORS: Obsidian's
+// (app://obsidian.md, the origin Copilot for Obsidian's docs give Ollama's
+// OLLAMA_ORIGINS). No web page and no browser extension can send one, so
+// a call that carries it is the app's, and is answered as the app's calls
+// without an Origin are.
+var appOrigins = []string{"app://obsidian.md"}
+
+// appOrigin: origin is one of appOrigins.
+func appOrigin(origin string) bool {
+	return slices.Contains(appOrigins, strings.ToLower(strings.TrimRight(origin, "/")))
+}
+
 // corsAllowed: origin is one the user listed.
 func corsAllowed(origin string) bool {
 	saved := settings.Load().CORSOrigins
@@ -141,6 +227,15 @@ func corsAllowed(origin string) bool {
 	list, _ := settings.CleanOrigins(saved)
 	o, err := settings.CleanOrigins([]string{origin})
 	return err == nil && len(o) == 1 && slices.Contains(list, o[0])
+}
+
+// corsPreflight: r is a browser's CORS preflight, an OPTIONS that
+// declares the actual call to come. A browser puts no key on one —
+// neither an Origin-headered one on the headers it asks for — which is
+// why lanGuard passes one to this file's guard before asking for a key
+// (#4931).
+func corsPreflight(r *http.Request) bool {
+	return r.Method == http.MethodOptions && r.Header.Get("Origin") != "" && r.Header.Get("Access-Control-Request-Method") != ""
 }
 
 // corsHeaders is a preflight's Access-Control-Request-Headers as the

@@ -103,3 +103,63 @@ func TestProviderSaveSink(t *testing.T) {
 	post("save", `{`+form+`,"from":"relay"}`)
 	is(true)
 }
+
+// A decision-only preset's provider (TypeSafe Jev) has no chat URL, so its
+// editor's Save is rebuilt from the preset: what the editor picks beside
+// the key — Routing, Stays, Rate limited, Unlisted, each key's proxy — is
+// kept, not put back to Smart (fflake33 on Discord: In order saved, and
+// reopened as Smart). The body is the editor's, as app.js sends it; its
+// decision API is a closed local port, so the list fetched after a new key
+// reaches no network.
+func TestDecidePresetSaveKeepsRouting(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("USERPROFILE", os.Getenv("HOME"))
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	mux := http.NewServeMux()
+	providerRoutes(mux, nil)
+	post := func(action, body string) {
+		t.Helper()
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, httptest.NewRequest("POST", "/api/provider/"+action, strings.NewReader(body)))
+		if w.Code != 200 {
+			t.Fatalf("%s: %d %s", action, w.Code, w.Body)
+		}
+	}
+	post("save", `{"id":"typesafe","name":"TypeSafe Jev","preset":"typesafe","key":"jev-key-1","decide":"http://127.0.0.1:1/v1","models":[],"headers":{},"new":true}`)
+	if _, _, err := provider.AddKeys("typesafe", []string{"jev-key-2"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	p, err := provider.Find("typesafe")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Chat != "" || p.Decide == "" || len(p.KeysOn()) != 2 {
+		t.Fatalf("not a decision-only provider of two keys: %+v", p)
+	}
+	second := p.KeyList()[1].ID
+	form := `"id":"typesafe","from":"typesafe","name":"TypeSafe Jev","preset":"typesafe","key":"","decide":"http://127.0.0.1:1/v1","models":[],"headers":{},"fallback":[],"noModels":false,"searches":false,"pinUpstream":false,"unredacted":false,"passUserAgent":true,"contexts":{},"proxy":"","maxConcurrency":0`
+	post("save", `{`+form+`,"unlisted":true,"accountProxies":{"`+second+`":"http://127.0.0.1:7890"},"routing":"order","affinity":"session","sink":true}`)
+	p, err = provider.Find("typesafe")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Routing != provider.Ordered || p.Affinity != provider.AffinitySession || !p.Sink || !p.Unlisted || p.AccountProxies[second] != "http://127.0.0.1:7890" {
+		t.Fatalf("after Save: routing %q, affinity %q, sink %v, unlisted %v, proxies %v", p.Routing, p.Affinity, p.Sink, p.Unlisted, p.AccountProxies)
+	}
+	if got := providerInfo(*p, nil).Routing; got != provider.Ordered {
+		t.Fatalf("the editor reopens on %q, want order", got)
+	}
+	if p.Key != "jev-key-1" || len(p.KeysOn()) != 2 {
+		t.Fatalf("keys changed by the Save: %q, %d on", p.Key, len(p.KeysOn()))
+	}
+	// a Save that doesn't carry them keeps them; Smart picked is "" sent
+	post("save", `{`+form+`}`)
+	if p, _ = provider.Find("typesafe"); p.Routing != provider.Ordered || p.Affinity != provider.AffinitySession || !p.Sink {
+		t.Fatalf("a Save without them: %q %q %v", p.Routing, p.Affinity, p.Sink)
+	}
+	post("save", `{`+form+`,"routing":"","affinity":"","sink":false}`)
+	if p, _ = provider.Find("typesafe"); p.Routing != "" || p.Affinity != "" || p.Sink {
+		t.Fatalf("Smart picked: %q %q %v", p.Routing, p.Affinity, p.Sink)
+	}
+}

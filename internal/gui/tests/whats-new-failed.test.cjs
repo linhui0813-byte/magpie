@@ -12,6 +12,7 @@ const fs = require("node:fs/promises");
 const path = require("node:path");
 const { test } = require("node:test");
 const { chromium, webkit } = require("playwright");
+const { watchSettingsReads, settingsDrawn } = require("./reader.cjs");
 
 const assets = path.resolve(__dirname, "../assets");
 const PAGE = "https://github.com/yetone/magpie-releases/releases/tag/v0.1.737";
@@ -74,11 +75,14 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       const ctl = { mode: "fail", asked: 0, opened: [] };
       const page = await context.newPage();
       page.setDefaultTimeout(5000);
+      page.setDefaultNavigationTimeout(60000);
       const errors = [];
       page.on("pageerror", (e) => errors.push(e.message));
       page.on("dialog", (d) => { errors.push("dialog: " + d.message()); d.dismiss(); });
       await page.route("**/*", serve(lang, ctl));
+      await watchSettingsReads(page);
       await page.goto("http://magpie.test/?view=settings&tab=about");
+      await settingsDrawn(page); // rows found are the ones that stay (#1659)
       const dialog = page.locator("#modal .editor.whatsnew");
       const view = page.locator("#view-settings");
       const again = page.locator("#about .row.pref.whatsnew-row").getByRole("button", { name: w.open, exact: true });

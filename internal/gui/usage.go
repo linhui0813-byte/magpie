@@ -7,113 +7,46 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
-	"slices"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/yetone/magpie/internal/access"
 	"github.com/yetone/magpie/internal/agent"
 	"github.com/yetone/magpie/internal/edit"
+	"github.com/yetone/magpie/internal/gateway"
 	"github.com/yetone/magpie/internal/provider"
 	"github.com/yetone/magpie/internal/sessions"
+	"github.com/yetone/magpie/internal/settings"
 	"github.com/yetone/magpie/internal/usage"
+	"github.com/yetone/magpie/internal/usageapi"
 )
 
-// usageGroup is a usage.Group with what the UI needs to draw it.
-type usageGroup struct {
-	usage.Group
-	Name string `json:"name"`
-	Sub  string `json:"sub,omitempty"`  // models: the provider's name
-	Icon string `json:"icon,omitempty"` // a real logo, or "generic" for an unknown client
-}
+// The Usage page's JSON is built in usageapi, which the gateway's
+// /v1/magpie/usage answers from too.
+type (
+	usageGroup = usageapi.Group
+	usageJSON  = usageapi.Usage
+	ledgerRow  = usageapi.Row
+	ledgerJSON = usageapi.Ledger
+)
 
-type usageJSON struct {
-	usage.Summary
-	Agents     []usageGroup `json:"agents"`
-	Models     []usageGroup `json:"models"`
-	Accounts   []usageGroup `json:"accounts"`
-	CallerKeys []usageGroup `json:"callerKeys"`
-	Path       string       `json:"path"`
-}
+var (
+	usageState   = usageapi.PageIn
+	ledgerPage   = usageapi.LedgerPage
+	periodOf     = usageapi.PeriodOf
+	ledgerFilter = usageapi.FilterIn
+)
 
-func usageState(p usage.Period) usageJSON {
-	s := usage.Summarize(p)
-	out := usageJSON{Summary: s, Agents: []usageGroup{}, Models: []usageGroup{}, Accounts: []usageGroup{}, Path: tilde(usage.Path())}
-	agents := map[string]*agent.Agent{}
-	for _, a := range agent.Clients() {
-		agents[a.ID] = a
-	}
-	for _, g := range s.Agents {
-		ug := usageGroup{Group: g, Name: g.ID, Icon: "generic"}
-		if a := agents[g.ID]; a != nil {
-			ug.Name, ug.Icon = a.Name, a.Icon
+func init() {
+	usageapi.Clients = func() []usageapi.Client {
+		var out []usageapi.Client
+		for _, a := range agent.Looks() {
+			out = append(out, usageapi.Client{ID: a.ID, Name: a.Name, Icon: a.Icon})
 		}
-		out.Agents = append(out.Agents, ug)
+		return out
 	}
-	providers := map[string]provider.Provider{}
-	for _, p := range provider.All() {
-		providers[p.ID] = p
-	}
-	for _, g := range s.Models {
-		ug := usageGroup{Group: g, Name: g.Model, Sub: g.Provider, Icon: "generic"}
-		if p, ok := providers[g.Provider]; ok {
-			ug.Sub = p.Name
-			if p.Icon != "" {
-				ug.Icon = p.Icon
-			}
-		}
-		if g.Host != "" {
-			ug.Sub += " · " + g.Host
-		}
-		out.Models = append(out.Models, ug)
-	}
-	// each subscription account's share, by the account that answered
-	// (#557); Name "" is the calls whose record names none, the page
-	// saying "account not recorded"
-	for _, g := range s.Accounts {
-		ug := usageGroup{Group: g, Name: g.Account, Sub: g.Provider, Icon: "generic"}
-		if p, ok := providers[g.Provider]; ok {
-			ug.Sub = p.Name
-			if p.Icon != "" {
-				ug.Icon = p.Icon
-			}
-		}
-		out.Accounts = append(out.Accounts, ug)
-	}
-	out.CallerKeys = callerUsageGroups(s)
-	return out
-}
-
-func callerUsageGroups(s usage.Summary) []usageGroup {
-	keys := []usageGroup{}
-	current, _ := access.List()
-	names := map[string]string{}
-	for _, k := range current {
-		names[k.ID] = k.Name
-	}
-	for _, g := range s.CallerKeys {
-		n := names[g.CallerKeyID]
-		if n == "" {
-			n = g.CallerKeyName
-		}
-		if n == "" {
-			n = g.CallerKeyID
-		}
-		keys = append(keys, usageGroup{Group: g, Name: n, Icon: "generic"})
-	}
-	return keys
-}
-
-func periodOf(s string) usage.Period {
-	switch p := usage.Period(s); p {
-	case usage.Today, usage.Week, usage.Month, usage.All:
-		return p
-	}
-	return usage.Month
 }
 
 // csvStamp names the selected day, or, when no day is selected, the period
@@ -122,220 +55,14 @@ func csvStamp(p usage.Period, day string, now time.Time) string {
 	if _, err := time.Parse(time.DateOnly, day); err == nil {
 		return "magpie-requests-day-" + day
 	}
-	return "magpie-requests-" + string(p) + "-" + now.Format(time.DateOnly)
-}
-
-func ledgerFilter(q url.Values) usage.Filter {
-	id, _ := strconv.ParseInt(q.Get("route"), 10, 64)
-	return usage.Filter{Day: q.Get("day"), RouteID: id, Model: q.Get("model"), Agent: q.Get("agent"), Provider: q.Get("provider"), Purpose: q.Get("purpose"), Account: q.Get("account"), CallerKey: q.Get("callerKey"), Failed: q.Get("failed") == "1", Query: q.Get("q"), Computer: q.Get("computer"), Through: viaOf(q.Get("via"))}
-}
-
-// viaOf is the source a request's ?via= names, "" for both.
-func viaOf(s string) string {
-	switch s {
-	case usage.SourceGateway, usage.SourceSession:
-		return s
+	if p.IsRange() { // the days picked, which already say when
+		// a minute an end names ("T09:30") without the colon Windows
+		// doesn't take in a file name
+		return "magpie-requests-" + strings.ReplaceAll(strings.Replace(string(p), "..", "-to-", 1), ":", "")
 	}
-	return ""
-}
-
-// ledgerRow is a usage.Row with the names the page shows it by.
-type ledgerRow struct {
-	usage.Row
-	CallerKeyLabel string `json:"callerKeyLabel,omitempty"`
-	AgentName      string `json:"agentName"`
-	Icon           string `json:"icon"` // the agent's
-	ProviderName   string `json:"providerName"`
-	Access         string `json:"access,omitempty"` // known account/route type, independent of model maker
-	PricingModel   string `json:"pricing_model,omitempty"`
-	// ComputerName is the other computer a call was made on, shared through sync (#542)
-	ComputerName string `json:"computerName,omitempty"`
-}
-
-type ledgerJSON struct {
-	CallerKeys []usageGroup `json:"callerKeys"`
-	Period     usage.Period `json:"period"`
-	Rows       []ledgerRow  `json:"rows"`
-	Offset     int          `json:"offset"`
-	Total      int          `json:"total"` // the rows the filter keeps, on every page
-	// Series: the period by hour, day or week (Bucket), before the day filter
-	Bucket string              `json:"bucket"`
-	Series []usage.SeriesPoint `json:"series"`
-	// By: the rows told apart by provider, agent, model and model at each
-	// provider ("modelAt", named "model · provider"), the most tokens
-	// first. The one by a dimension the filter has picked is of the rows
-	// without that pick, so the others are still there to switch to.
-	By      map[string][]ledgerShare `json:"by"`
-	ChartBy map[string][]ledgerShare `json:"chartBy,omitempty"`
-	Day     string                   `json:"day,omitempty"`
-	usage.Totals
-	// Through and Direct: the rows the gateway served, and the rows read
-	// from the agents' own session files, which it never saw. Totals is
-	// the two together, so the page can show all three (#the usage report).
-	Through usage.Totals `json:"through"`
-	Direct  usage.Totals `json:"direct"`
-	// Agents, Providers and Purposes: those with calls in the period, for the filters
-	Agents    []ledgerAgent `json:"agents"`
-	Providers []ledgerAgent `json:"providers"`
-	Purposes  []string      `json:"purposes"`
-	// Accounts: the subscription accounts that answered calls in the
-	// period, for the Account filter (#557)
-	Accounts []ledgerAccount `json:"accounts"`
-	// Computers: this one ("this", no name) and the others whose usage
-	// sync brought (#542), for the filter; none while there are none
-	Computers []ledgerShare `json:"computers,omitempty"`
-}
-
-// ledgerShare is a usage.Share with the name and logo the page shows it by.
-type ledgerShare struct {
-	usage.Share
-	Name string `json:"name"`
-	Icon string `json:"icon,omitempty"`
-}
-
-// ledgerAccount is a subscription account the Account filter offers: its
-// name, and the providers it answered for, by name.
-type ledgerAccount struct {
-	ID        string   `json:"id"`
-	Providers []string `json:"providers"`
-}
-
-type ledgerAgent struct {
-	ID   string `json:"id"`
-	Name string `json:"name"`
-	Icon string `json:"icon"`
-}
-
-// ledgerPage is one page of the ledger: limit rows (100 when none is
-// given, 500 at most) from offset.
-func ledgerPage(p usage.Period, f usage.Filter, offset, limit int) ledgerJSON {
-	l := usage.QueryPage(p, f, offset, limit)
-	offset = max(0, min(offset, l.Total))
-	page := l.Rows
-	agents := map[string]*agent.Agent{}
-	for _, a := range agent.Clients() {
-		agents[a.ID] = a
-	}
-	// A session file without route evidence is a local source, not a supplier.
-	names := map[string]string{usage.UnknownProvider: "Local session"}
-	icons := map[string]string{}
-	access := map[string]string{}
-	for _, pr := range provider.All() {
-		names[pr.ID], icons[pr.ID] = pr.Name, pr.Icon
-		if pr.Account != nil {
-			access[pr.ID] = "subscription"
-		} else if pr.Key != "" {
-			access[pr.ID] = "api"
-		}
-	}
-	who := func(id string) ledgerAgent {
-		if a := agents[id]; a != nil {
-			return ledgerAgent{ID: id, Name: a.Name, Icon: a.Icon}
-		}
-		return ledgerAgent{ID: id, Name: id, Icon: "generic"}
-	}
-	which := func(id string) ledgerAgent {
-		a := ledgerAgent{ID: id, Name: names[id], Icon: icons[id]}
-		if a.Name == "" {
-			a.Name = id
-		}
-		if a.Icon == "" {
-			a.Icon = "generic"
-		}
-		return a
-	}
-	out := ledgerJSON{Period: p, Rows: make([]ledgerRow, 0, len(page)), Offset: offset, Total: l.Total, Totals: l.Sum, Agents: []ledgerAgent{}, Providers: []ledgerAgent{}, Accounts: []ledgerAccount{}}
-	out.Through, out.Direct = l.Through, l.Direct
-	out.Bucket, out.Series = l.Bucket, l.Series
-	out.Purposes = l.Purposes
-	out.Day = f.Day
-	out.CallerKeys = callerUsageGroups(usage.Summary{CallerKeys: l.CallerKeys})
-	callerLabels := map[string]string{}
-	for _, g := range out.CallerKeys {
-		callerLabels[g.CallerKeyID] = g.Name
-	}
-	for _, r := range page {
-		a := who(r.Agent)
-		lr := ledgerRow{Row: r, AgentName: a.Name, Icon: a.Icon, ProviderName: names[r.Provider]}
-		if r.Source != "log" {
-			lr.Access = access[r.Provider]
-		}
-		if r.Priced {
-			if model := provider.PricedName(r.Model); model != r.Model {
-				lr.PricingModel = model
-			}
-		}
-		if lr.ProviderName == "" {
-			lr.ProviderName = r.Provider
-		}
-		lr.CallerKeyLabel = callerLabels[r.CallerKeyID]
-		if r.Computer != "" {
-			lr.ComputerName = l.Names[r.Computer]
-			if lr.ComputerName == "" {
-				lr.ComputerName = r.Computer
-			}
-		}
-		out.Rows = append(out.Rows, lr)
-	}
-	for _, id := range l.Agents {
-		out.Agents = append(out.Agents, who(id))
-	}
-	for _, id := range l.Providers {
-		out.Providers = append(out.Providers, which(id))
-	}
-	// one choice per account, most used first, with the providers it
-	// answered for: the same email may be a Codex and a Claude account
-	at := map[string]int{}
-	for _, g := range l.Accounts {
-		name := which(g.Provider).Name
-		if i, ok := at[g.Account]; ok {
-			if a := &out.Accounts[i]; !slices.Contains(a.Providers, name) {
-				a.Providers = append(a.Providers, name)
-			}
-			continue
-		}
-		at[g.Account] = len(out.Accounts)
-		out.Accounts = append(out.Accounts, ledgerAccount{ID: g.Account, Providers: []string{name}})
-	}
-	// what each is of: the rows of the filter, or, for the dimension the
-	// filter has picked, of the rows without that pick
-	sharesJSON := func(by map[string][]usage.Share) map[string][]ledgerShare {
-		out := map[string][]ledgerShare{}
-		for _, d := range usage.Dimensions {
-			shares := []ledgerShare{}
-			for _, s := range by[d] {
-				ls := ledgerShare{Share: s, Name: s.ID}
-				switch d {
-				case "provider":
-					a := which(s.ID)
-					ls.Name, ls.Icon = a.Name, a.Icon
-				case "agent":
-					a := who(s.ID)
-					ls.Name, ls.Icon = a.Name, a.Icon
-				case "modelAt":
-					// the model, and the provider it went to
-					prov, model, _ := strings.Cut(s.ID, "/")
-					a := which(prov)
-					ls.Name, ls.Icon = model+" · "+a.Name, a.Icon
-				}
-				shares = append(shares, ls)
-			}
-			out[d] = shares
-		}
-		return out
-	}
-	out.By = sharesJSON(l.By)
-	if l.ChartBy != nil {
-		out.ChartBy = sharesJSON(l.ChartBy)
-	}
-	for _, s := range l.Computers {
-		ls := ledgerShare{Share: s, Name: l.Names[s.ID]}
-		if s.ID != usage.ThisComputer && ls.Name == "" {
-			ls.Name = s.ID
-		}
-		out.Computers = append(out.Computers, ls)
-	}
-	return out
+	// a rolling window ("last:24h0m0s") without the colon, which Windows
+	// doesn't take in a file name (#2075)
+	return "magpie-requests-" + strings.ReplaceAll(string(p), ":", "-") + "-" + now.Format(time.DateOnly)
 }
 
 // contentJSON is what was said in a request, or why it can't be told.
@@ -374,22 +101,101 @@ func requestContent(agent, session string, from, to, at time.Time) contentJSON {
 }
 
 func usageRoutes(mux *http.ServeMux, w Windows) {
-	mux.HandleFunc("GET /api/usage", func(rw http.ResponseWriter, r *http.Request) {
-		p := usage.Period(r.URL.Query().Get("period"))
-		switch p {
-		case usage.Today, usage.Week, usage.Month, usage.All:
-		default:
-			p = usage.Month
+	mux.HandleFunc("GET /api/usage", coldTurn(func(rw http.ResponseWriter, r *http.Request) {
+		// the days and hours of the reader's zone, which the page names
+		writeJSON(rw, usageState(periodOf(r.URL.Query().Get("period")), usageapi.ZoneOf(r)))
+	}))
+	// the providers a deleted one's calls can be merged into: those there
+	// are now and shown, by name
+	mux.HandleFunc("GET /api/usage/deleted/into", func(rw http.ResponseWriter, r *http.Request) {
+		type target struct {
+			ID   string `json:"id"`
+			Name string `json:"name"`
+			Icon string `json:"icon"`
 		}
-		writeJSON(rw, usageState(p))
+		out := []target{}
+		for _, p := range provider.All() {
+			if p.Hidden {
+				continue
+			}
+			name, icon := p.Name, p.Icon
+			if name == "" {
+				n, i := provider.KnownFace(p.ID)
+				name = n
+				if icon == "" {
+					icon = i
+				}
+			}
+			if name == "" {
+				name = p.ID
+			}
+			out = append(out, target{p.ID, name, icon})
+		}
+		writeJSON(rw, out)
+	})
+	// a clear of usage from the Usage page (CrazyMouse_TT on X): the calls up to
+	// now of one provider's model, or of everything with both "", stop
+	// being counted on the usage pages. usage.jsonl keeps them, and a key's
+	// spending limit and the allowances still count them
+	// (settings.UsageCleared).
+	mux.HandleFunc("POST /api/usage/clear", func(rw http.ResponseWriter, r *http.Request) {
+		var in struct{ Provider, Model string }
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+			fail(rw, err)
+			return
+		}
+		if err := settings.ClearUsage(in.Provider, in.Model, usage.Clock()); err != nil {
+			fail(rw, err)
+			return
+		}
+		writeJSON(rw, map[string]bool{"ok": true})
+	})
+	// a deleted provider's calls, as the Usage page lists them under id:
+	// merged into a provider there is now (Into, "" to part them again)
+	// or shown by a name of the user's (Name, "" for its own); one not
+	// sent stays as it is (CyberCaius on Discord)
+	mux.HandleFunc("POST /api/usage/deleted", func(rw http.ResponseWriter, r *http.Request) {
+		var in struct {
+			ID   string
+			Into *string
+			Name *string
+		}
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+			fail(rw, err)
+			return
+		}
+		if in.Into != nil {
+			if err := provider.MergeDeleted(in.ID, *in.Into); err != nil {
+				fail(rw, err)
+				return
+			}
+		}
+		if in.Name != nil {
+			if err := provider.NameDeleted(in.ID, *in.Name); err != nil {
+				fail(rw, err)
+				return
+			}
+		}
+		writeJSON(rw, map[string]bool{"ok": true})
 	})
 	// the ledger: the period's calls, newest first, a page at a time
-	mux.HandleFunc("GET /api/usage/requests", func(rw http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET /api/usage/requests", coldTurn(func(rw http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
 		offset, _ := strconv.Atoi(q.Get("offset"))
 		limit, _ := strconv.Atoi(q.Get("limit"))
-		writeJSON(rw, ledgerPage(periodOf(q.Get("period")), ledgerFilter(q), offset, limit))
+		writeJSON(rw, ledgerPage(periodOf(q.Get("period")), ledgerFilter(r), offset, limit))
+	}))
+	// the gateway's bytes up and down so far and its requests in flight,
+	// which the Requests read a moment apart for how fast its traffic flows
+	// now; {} when another magpie serves the gateway
+	mux.HandleFunc("GET /api/usage/traffic", func(rw http.ResponseWriter, r *http.Request) {
+		writeJSON(rw, trafficNow())
 	})
+	// the heatmap (#1369): the last 53 weeks a day each, of the requests the
+	// page's filters keep, read from the same index as the page
+	mux.HandleFunc("GET /api/usage/heatmap", coldTurn(func(rw http.ResponseWriter, r *http.Request) {
+		writeJSON(rw, usage.HeatmapOf(ledgerFilter(r)))
+	}))
 	// what was said in one request, read from the agent's session file when the
 	// row is opened, between two times (the call's own, or a gateway request's
 	// span): magpie keeps no copy
@@ -413,9 +219,11 @@ func usageRoutes(mux *http.ServeMux, w Windows) {
 	mux.HandleFunc("GET /api/usage/requests.csv", func(rw http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
 		p := periodOf(q.Get("period"))
-		// one moment for the rows and the day in the file's name
-		now := usage.Clock()
-		rows := usage.LedgerOfAt(p, ledgerFilter(q), now).Rows
+		// one moment for the rows and the day in the file's name, the
+		// reader's day
+		f := ledgerFilter(r)
+		now := usage.Clock().In(f.Zone)
+		rows := usage.LedgerOfAt(p, f, now).Rows
 		rw.Header().Set("Content-Type", "text/csv; charset=utf-8")
 		rw.Header().Set("Content-Disposition", `attachment; filename="`+csvStamp(p, q.Get("day"), now)+`.csv"`)
 		usage.WriteCSV(rw, rows)
@@ -424,8 +232,9 @@ func usageRoutes(mux *http.ServeMux, w Windows) {
 	mux.HandleFunc("POST /api/usage/requests/export", func(rw http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
 		p := periodOf(q.Get("period"))
-		now := usage.Clock()
-		rows := usage.LedgerOfAt(p, ledgerFilter(q), now).Rows
+		f := ledgerFilter(r)
+		now := usage.Clock().In(f.Zone)
+		rows := usage.LedgerOfAt(p, f, now).Rows
 		var b bytes.Buffer
 		if err := usage.WriteCSV(&b, rows); err != nil {
 			fail(rw, err)
@@ -453,15 +262,37 @@ func usageRoutes(mux *http.ServeMux, w Windows) {
 	// apart from the local log.
 	// ?asked=1 is the user opening or refreshing the page: Claude Code's
 	// own /usage is run at once (provider.AskClaudeUsage).
+	// Only then are they read while the user has allowances read only
+	// when asked (#1518).
+	// &all=1 is the user's Refresh of every allowance by hand (the tray
+	// panel's, the Usage page's, routing's): each saved Claude account's
+	// /usage is run too, as its card's refresh runs it (#5380); opening
+	// the page asks without it.
 	mux.HandleFunc("GET /api/usage/quotas", func(rw http.ResponseWriter, r *http.Request) {
-		if r.URL.Query().Get("asked") != "" {
-			provider.AskClaudeUsage()
+		ctx := r.Context()
+		if q := r.URL.Query(); q.Get("asked") != "" {
+			if q.Get("all") != "" {
+				provider.AskEveryClaudeUsage()
+			} else {
+				provider.AskClaudeUsage()
+			}
+			ctx = provider.Asked(ctx)
 		}
-		ctx, cancel := context.WithTimeout(r.Context(), 12*time.Second)
+		ctx, cancel := context.WithTimeout(ctx, 12*time.Second)
 		defer cancel()
 		// a WorkBuddy (China) account's card says how its daily check-in
 		// went (#694)
-		qs := provider.WithCheckins(provider.Quotas(ctx))
+		qs := provider.InProviderOrder(provider.WithCheckins(provider.Quotas(ctx)))
+		// and what each window holds whole, by what magpie routed in it
+		qs = usage.WithWindowHolds(qs, usage.Clock())
+		// and when each began, for its Pace number (fflake33)
+		qs = provider.WithWindowStarts(qs, usage.Clock())
+		// and which an account can't spend for another window used up,
+		// for the accounts' sum (#4791)
+		qs = provider.WithHeldWindows(qs, usage.Clock())
+		// and which the menu bar can show, by kind, for Settings to pick
+		// among (settings.TrayWindows)
+		qs = withTrayKinds(qs)
 		// an account's card may be the stale copy a read under way will
 		// replace: the page asks again until it has landed (#959)
 		if provider.SubscriptionUsageReading() {
@@ -481,7 +312,7 @@ func usageRoutes(mux *http.ServeMux, w Windows) {
 		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 		defer cancel()
 		provider.RefreshUsage(ctx, id, r.URL.Query().Get("user"))
-		writeJSON(rw, provider.WithCheckins(provider.Quotas(ctx)))
+		writeJSON(rw, withTrayKinds(provider.WithHeldWindows(provider.WithWindowStarts(usage.WithWindowHolds(provider.InProviderOrder(provider.WithCheckins(provider.Quotas(ctx))), usage.Clock()), usage.Clock()), usage.Clock())))
 	})
 	// WorkBuddy's daily check-in pressed now, from the Usage card, for
 	// each account not in yet today, as `magpie accounts checkin` does; the
@@ -540,6 +371,34 @@ func usageRoutes(mux *http.ServeMux, w Windows) {
 		}
 		writeJSON(rw, rs)
 	})
+	// and one account's, from Settings' Check in now (xiaowu_95660), by
+	// its vendor and key as /api/settings lists them: asked once now,
+	// whatever its switch says, which it leaves as it is
+	mux.HandleFunc("POST /api/usage/checkin-account", func(rw http.ResponseWriter, r *http.Request) {
+		var in struct{ By, Key string }
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil || in.Key == "" {
+			fail(rw, errors.New("no account"))
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), time.Minute)
+		defer cancel()
+		rs := provider.CheckInAccount(ctx, in.By, in.Key)
+		if len(rs) == 0 {
+			fail(rw, errors.New("No daily check-in reaches this account"))
+			return
+		}
+		writeJSON(rw, rs[0])
+	})
+	// the accounts a check-in reaches whose provider is switched off, for
+	// the Usage page's folded Switched off group (wxkwxk666 on X): asks
+	// nothing, switches nothing on
+	mux.HandleFunc("GET /api/usage/checkins/off", func(rw http.ResponseWriter, r *http.Request) {
+		qs := provider.OffCheckins()
+		if qs == nil {
+			qs = []provider.SubscriptionQuota{}
+		}
+		writeJSON(rw, qs)
+	})
 	// what was left of each window over time, for the quota cards' curves
 	// (#651); ?days= back
 	mux.HandleFunc("GET /api/usage/quotas/history", func(rw http.ResponseWriter, r *http.Request) {
@@ -550,21 +409,66 @@ func usageRoutes(mux *http.ServeMux, w Windows) {
 		defer cancel()
 		writeJSON(rw, append(hs, provider.RemoteQuotaHistories(ctx, days)...))
 	})
+	// Historical whole-window estimates come only from this computer's
+	// readings and ledger. Selecting a cycle never asks a vendor.
+	mux.HandleFunc("GET /api/usage/quotas/history/holds", func(rw http.ResponseWriter, r *http.Request) {
+		args := r.URL.Query()
+		from, e1 := time.Parse(time.RFC3339Nano, args.Get("from"))
+		to, e2 := time.Parse(time.RFC3339Nano, args.Get("to"))
+		now := usage.Clock()
+		if e1 != nil || e2 != nil || !from.Before(to) || to.After(now) || args.Get("provider") == "" || args.Get("user") == "" {
+			http.Error(rw, "provider, user and a completed time range are required", http.StatusBadRequest)
+			return
+		}
+		hist := provider.QuotaHistories(now.Add(-45*24*time.Hour), args.Get("provider"), args.Get("user"))
+		writeJSON(rw, usage.HistoricalWindowHolds(provider.CachedCards(now), hist, from, to))
+	})
 	// spends one of a Codex account's rate-limit resets, which the page
-	// has asked the user about first; what it did comes back
+	// has asked the user about first: the one they chose (Credit, an id
+	// of its resets.each), else the one that runs out first; what it did
+	// comes back. A card from a remote magpie (Provider "office/codex")
+	// has that magpie spend it, on its account (#3850)
 	mux.HandleFunc("POST /api/usage/codex-reset", func(rw http.ResponseWriter, r *http.Request) {
-		var in struct{ User string }
+		var in struct{ Provider, User, Credit string }
 		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
 			fail(rw, err)
 			return
 		}
+		if in.Provider != "" && in.Provider != "codex" {
+			ctx, cancel := context.WithTimeout(r.Context(), provider.RemoteResetWait+10*time.Second)
+			defer cancel()
+			out, err := provider.UseRemoteCodexReset(ctx, in.Provider, in.User, in.Credit)
+			if err != nil {
+				fail(rw, err)
+				return
+			}
+			writeJSON(rw, out)
+			return
+		}
 		ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
 		defer cancel()
-		out, err := provider.UseCodexReset(ctx, in.User)
+		out, err := provider.SpendCodexReset(ctx, in.User, in.Credit)
 		if err != nil {
 			fail(rw, err)
 			return
 		}
 		writeJSON(rw, out)
 	})
+}
+
+// trafficJSON is the gateway's bytes so far (gateway.Traffic) with its
+// requests in flight; all left out when this process serves no gateway.
+type trafficJSON struct {
+	*gateway.Traffic
+	Requests *int `json:"requests,omitempty"`
+}
+
+// trafficNow is what /api/usage/traffic answers.
+func trafficNow() trafficJSON {
+	gw := served.Load()
+	if gw == nil {
+		return trafficJSON{}
+	}
+	t, n := gw.Traffic(), gw.Busy().Requests
+	return trafficJSON{Traffic: &t, Requests: &n}
 }

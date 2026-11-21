@@ -128,7 +128,7 @@ func TestStandaloneNativeAccounts(t *testing.T) {
 							got, _ = io.ReadAll(r.Body)
 							account = r.Header.Get("chatgpt-account-id")
 							w.Header().Set("Content-Type", "text/event-stream")
-							io.WriteString(w, sse(`data: {"type":"response.completed","response":{"id":"r1","status":"completed","output":[]}}`))
+							io.WriteString(w, sse(`data: {"type":"response.completed","response":{"id":"r1","status":"completed","output":[],"usage":{"input_tokens":3,"output_tokens":1,"total_tokens":4}}}`))
 						}))
 						defer up.Close()
 						old := provider.CodexBase
@@ -204,7 +204,7 @@ func TestStandaloneNativeFallback(t *testing.T) {
 		}
 		native = b
 		w.Header().Set("Content-Type", "text/event-stream")
-		io.WriteString(w, sse(`data: {"type":"response.completed","response":{"id":"r1","status":"completed","output":[]}}`))
+		io.WriteString(w, sse(`data: {"type":"response.completed","response":{"id":"r1","status":"completed","output":[],"usage":{"input_tokens":3,"output_tokens":1,"total_tokens":4}}}`))
 	}))
 	defer up.Close()
 	old := provider.CodexBase

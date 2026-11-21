@@ -20,7 +20,7 @@ func TestTrayImagePlain(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cells, _, _ := trayUsageView(trayCards(), time.Now(), false)
+	cells, _, _ := trayUsageView(trayCards(), time.Now(), false, false)
 	cells = cells[:2]
 	plain := trayPlain(cells)
 	for _, dark := range []bool{false, true} {
@@ -33,9 +33,9 @@ func TestTrayImagePlain(t *testing.T) {
 		// at 2x: the bird 44 px, then 2pt, 3pt, the first card's digits
 		_, oneW, _ := trayImagePNG(plain[:1], bird, 22, 2, dark, false)
 		_, birdW, _ := trayImagePNG(nil, bird, 22, 2, dark, false)
-		// two logos and their gaps (14+3 each) gone, 3 before the first
+		// two logos and their gaps (16+3 each) gone, 3 before the first
 		// card's digits and the line's 5+1+5 for the 8 between cards come
-		if d, want := logoW-w, 2*(2*(14+3)-3-(5+1+5-8)); d < want-2 || d > want+2 {
+		if d, want := logoW-w, 2*(2*(16+3)-3-(5+1+5-8)); d < want-2 || d > want+2 {
 			t.Errorf("dark %v: %d px with logos, %d without", dark, logoW, w)
 		}
 		// right after the bird come the digits, not an empty logo's room

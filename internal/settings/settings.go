@@ -34,7 +34,14 @@ import (
 	"github.com/yetone/magpie/internal/lazyre"
 	"github.com/yetone/magpie/internal/redact"
 	"github.com/yetone/magpie/internal/steady"
+	"golang.org/x/text/currency"
 )
+
+// SubscriptionPrice is the account's recurring monthly charge.
+type SubscriptionPrice struct {
+	Amount   float64 `json:"amount"`
+	Currency string  `json:"currency"`
+}
 
 // CodexAutoReviewSession is the CodexAutoReview that runs Codex's
 // auto-review on the session's own model.
@@ -1094,6 +1101,9 @@ type Settings struct {
 	// bar's cells still have them. The panel's order is UsageOrder, and it
 	// leaves out what UsageCardsHidden and UsageWindowsHidden do too.
 	PanelUsageHidden []string `json:"panelUsageHidden,omitempty"`
+	// PanelSubscriptionPrices holds amounts entered for local accounts, keyed
+	// by provider id and account name as used by the tray's Allowances cards.
+	PanelSubscriptionPrices map[string]SubscriptionPrice `json:"panelSubscriptionPrices,omitempty"`
 	// UsageAgentsHidden are the clients, by the id the ledger records them
 	// under ("curl", "Go-http-client", an agent's id), that the Usage page's
 	// Agents list leaves out (ikunbots on X). It is that list's only: the
@@ -1863,6 +1873,7 @@ func (s *Settings) KeepOwn(cur Settings) {
 	s.WindowAt, s.OnTop = cur.WindowAt, cur.OnTop
 	s.TrayUsages, s.TrayUsage, s.TrayUsageEvery, s.TrayNoLogos, s.TrayNoBird, s.TrayPace, s.TrayNoCost = cur.TrayUsages, cur.TrayUsage, cur.TrayUsageEvery, cur.TrayNoLogos, cur.TrayNoBird, cur.TrayPace, cur.TrayNoCost
 	s.TrayWindows, s.TrayNoNumber, s.TrayCurrency, s.TrayAnthropicMark = cur.TrayWindows, cur.TrayNoNumber, cur.TrayCurrency, cur.TrayAnthropicMark
+	s.PanelSubscriptionPrices = cur.PanelSubscriptionPrices
 	s.GatewayMode = cur.GatewayMode
 	s.NoWSLAgents = cur.NoWSLAgents
 	s.QuotaReads = cur.QuotaReads
@@ -2925,6 +2936,23 @@ func saveOwn(s Settings, recording, reads bool) error {
 	s.UsageOrder = ids(s.UsageOrder)
 	s.PluginPageOrder = ids(s.PluginPageOrder)
 	s.PanelUsageHidden = ids(s.PanelUsageHidden)
+	prices := maps.Clone(s.PanelSubscriptionPrices)
+	for card, price := range prices {
+		provider, account, ok := strings.Cut(card, "|")
+		if !ok || strings.TrimSpace(provider) == "" || strings.TrimSpace(account) == "" || strings.TrimSpace(card) != card {
+			return errors.New("a panel subscription price needs a provider|account key")
+		}
+		unit, err := currency.ParseISO(strings.ToUpper(strings.TrimSpace(price.Currency)))
+		if err != nil || unit.String() == "XXX" {
+			return errors.New("a panel subscription price needs an ISO currency code such as USD")
+		}
+		if math.IsNaN(price.Amount) || math.IsInf(price.Amount, 0) || price.Amount < 0 {
+			return errors.New("a panel subscription price needs a finite, non-negative amount")
+		}
+		price.Currency = unit.String()
+		prices[card] = price
+	}
+	s.PanelSubscriptionPrices = prices
 	s.UsageAgentsHidden = ids(s.UsageAgentsHidden)
 	s.UsageCardsHidden = ids(s.UsageCardsHidden)
 	s.UsageWindowsHidden = ids(s.UsageWindowsHidden)

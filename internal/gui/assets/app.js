@@ -18081,6 +18081,13 @@ function panelQuotaCard(q, first = false) {
   }
   who.append(el("span", "pq-user" + (q.alias && q.named ? " own-name" : ""), q.alias || q.user || q.name));
   if ((q.user || q.alias) && window.hideAccounts) who.append(hideAccounts.eye(q.user || q.alias, q.provider));
+  const price = q.user && !q.from && state.settings?.panelSubscriptionPrices?.[trayCardID(q)];
+  if (price && Number.isFinite(price.amount) && /^[A-Z]{3}$/.test(price.currency)) {
+    const amount = new Intl.NumberFormat(intlLang(), { style: "currency", currency: price.currency, minimumFractionDigits: 0 }).format(price.amount);
+    const fee = el("span", "pq-price", t("{price}/mo", { price: amount }));
+    fee.title = t("Monthly subscription cost");
+    who.append(fee);
+  }
   card.append(who);
   card.title = [q.name, q.alias, q.user, q.seat && q.seat !== q.alias && "≡ " + q.seat, planName(q.plan), q.until ? planTerm(q) : "", q.balance && t("Balance") + " " + q.balance].filter(Boolean).join(" · ");
   if (q.error) {
@@ -20905,8 +20912,9 @@ function renderTrayUsage(s, keep) {
   renderAgentPrefs();
   renderAgentPrefLinks();
   renderProvPrefLinks();
-  $("#trayUsageRow").hidden = web;
+  $("#trayUsageRow").hidden = $("#panelPriceRow").hidden = web;
   if (web) return;
+  import("./panelprices.js").then(({ renderPanelPrices }) => renderPanelPrices(), statusErr);
   const mac = document.body.classList.contains("mac");
   $("#trayUsageSub").textContent = mac ? t("Show your subscriptions' allowances, or the tokens and cost of today or the last 7 days, beside magpie's icon in the menu bar, side by side, refreshed every few minutes")
     : t("Show your subscriptions' allowances, or the tokens and cost of today or the last 7 days, when pointing at magpie's tray icon, refreshed every few minutes");

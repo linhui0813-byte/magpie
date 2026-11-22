@@ -55,6 +55,19 @@ at once. Later openings reuse the settings and controls already loaded.
 `agent-details-ready.test.cjs` holds both responses and checks the final
 animation frame against the natural height in both engines and five languages.
 
+### Monthly subscription prices
+
+The tray's Allowances card can show a price beside a local account's
+name. `panelQuotaCard` uses `panelSubscriptionPrices` from
+[settings](../../internal/settings/settings.go), keyed by `provider|account`.
+The amount is a monthly charge entered by the user in a named currency.
+It is formatted in the panel's language and stays on this computer.
+It does not contribute to usage costs or affect routing. An account
+without an entry has no price. Edit or clear a price under Settings → Usage
+→ Monthly subscription cost. The same map can be edited with
+`magpie settings set panelSubscriptionPrices` and a JSON object such as
+`{"codex|account@example.com":{"amount":100,"currency":"USD"}}`.
+
 ### Allowance card refreshes
 
 A card refresh applies only the requested account from the API's full

@@ -4,6 +4,8 @@
 // works. {name} slots are filled by t(str, vars).
 const I18N = {
   zh: {
+    "Monthly subscription cost": "每月订阅费用",
+    "{price}/mo": "{price}/月",
     "Estimated balance": "估算余额",
     "Credit estimate": "余额估算",
     "Estimate Gemini credits from billing data": "根据账单数据估算 Gemini 余额",
@@ -5591,6 +5593,8 @@ const I18N = {
     "taken out of this agent's model list": "已从这个 Agent 的模型列表中移除",
   },
   "zh-TW": {
+    "Monthly subscription cost": "每月訂閱費用",
+    "{price}/mo": "{price}/月",
     "Estimated balance": "預估餘額",
     "Credit estimate": "餘額估算",
     "Estimate Gemini credits from billing data": "根據帳單資料估算 Gemini 餘額",
@@ -11162,6 +11166,8 @@ const I18N = {
     "taken out of this agent's model list": "已從這個 Agent 的模型列表中移除",
   },
   ja: {
+    "Monthly subscription cost": "月額サブスクリプション料金",
+    "{price}/mo": "月額 {price}",
     "Estimated balance": "推定残高",
     "Credit estimate": "残高の推定",
     "Estimate Gemini credits from billing data": "請求データから Gemini の残高を推定",
@@ -16735,6 +16741,8 @@ const I18N = {
     "taken out of this agent's model list": "このエージェントのモデル一覧から外されています",
   },
   de: {
+    "Monthly subscription cost": "Monatliche Abokosten",
+    "{price}/mo": "{price}/Monat",
     "Estimated balance": "Geschätztes Guthaben",
     "Credit estimate": "Guthabenschätzung",
     "Estimate Gemini credits from billing data": "Gemini-Guthaben aus Abrechnungsdaten schätzen",

@@ -400,3 +400,44 @@ func TestRedactModelDirIsNotASettingsSave(t *testing.T) {
 		t.Errorf("a save changed the models folder: %q", in.RedactModelDir)
 	}
 }
+
+func TestPanelSubscriptionPrices(t *testing.T) {
+	home(t)
+	const key = "codex|account@example.com"
+	current := settings.Load()
+	body, err := Body(current, "panelSubscriptionPrices", json.RawMessage(`{"codex|account@example.com":{"amount":100,"currency":"usd"}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err = Apply(body, false); err != nil {
+		t.Fatal(err)
+	}
+	want := settings.SubscriptionPrice{Amount: 100, Currency: "USD"}
+	if got := settings.Load().PanelSubscriptionPrices[key]; got != want {
+		t.Fatalf("saved price = %+v, want %+v", got, want)
+	}
+	if _, _, err = Apply([]byte(`{"theme":"dark"}`), false); err != nil {
+		t.Fatal(err)
+	}
+	if got := settings.Load().PanelSubscriptionPrices[key]; got != want {
+		t.Fatalf("ordinary settings save lost the price: %+v", got)
+	}
+	for _, invalid := range []string{
+		`{"panelSubscriptionPrices":{"codex":{"amount":100,"currency":"USD"}}}`,
+		`{"panelSubscriptionPrices":{"codex|account@example.com":{"amount":-1,"currency":"USD"}}}`,
+		`{"panelSubscriptionPrices":{"codex|account@example.com":{"amount":100,"currency":"not a currency"}}}`,
+	} {
+		if _, _, err := Apply([]byte(invalid), false); err == nil {
+			t.Errorf("accepted invalid price %s", invalid)
+		}
+		if got := settings.Load().PanelSubscriptionPrices[key]; got != want {
+			t.Fatalf("invalid edit replaced the saved price: %+v", got)
+		}
+	}
+	if _, _, err = Apply([]byte(`{"panelSubscriptionPrices":{}}`), false); err != nil {
+		t.Fatal(err)
+	}
+	if got := settings.Load().PanelSubscriptionPrices; len(got) != 0 {
+		t.Fatalf("prices were not cleared: %+v", got)
+	}
+}

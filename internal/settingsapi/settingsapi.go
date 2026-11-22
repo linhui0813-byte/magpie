@@ -34,6 +34,8 @@ var Keys = []string{
 	"noWSLAgents", "sessionTerminal", "signInLinkOnly", "quitNoAsk", "restoreOnQuit", "name",
 	// the menu bar's allowance cards
 	"trayUsages", "trayUsage", "trayUsageEvery", "trayNoLogos", "trayAnthropicMark", "trayNoBird", "trayNoNumber", "trayPace", "trayNoCost", "trayWindows",
+	// monthly prices shown on the panel cards
+	"panelSubscriptionPrices",
 	// usage and alerts
 	"currency", "totalCurrency", "trayCurrency", "chineseUnits", "dayStart", "usageAlert", "balanceAlert", "resetReminder", "turnDoneAlert", "maskAlert",
 	// network
@@ -353,6 +355,10 @@ func Merge(body []byte, cur settings.Settings, web bool) (settings.Settings, err
 	in.PluginPageOrder = cur.PluginPageOrder // the sidebar plugin pages, dragged there
 	// and what the tray panel's Allowances tab leaves out, set there
 	in.PanelUsageHidden = cur.PanelUsageHidden
+	// A normal Settings save leaves manual per-account prices alone.
+	if _, sent := fields["panelSubscriptionPrices"]; !sent {
+		in.PanelSubscriptionPrices = cur.PanelSubscriptionPrices
+	}
 	// and the clients the Usage page's Agents list leaves out, set there
 	in.UsageAgentsHidden = cur.UsageAgentsHidden
 	// and the allowance cards the Usage page's Overview leaves out, set there
